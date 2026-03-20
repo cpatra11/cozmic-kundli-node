@@ -1,0 +1,34 @@
+import type { Request, Response, NextFunction } from 'express';
+import { getFirebaseClients } from '../firebase/admin.js';
+
+declare module 'express-serve-static-core' {
+  interface Request {
+    user?: {
+      uid: string;
+      email?: string;
+    };
+  }
+}
+
+export async function requireFirebaseAuth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({ error: 'Missing Bearer token' });
+    }
+
+    const { auth } = getFirebaseClients();
+    const decoded = await auth.verifyIdToken(token);
+
+    req.user = {
+      uid: decoded.uid,
+      email: decoded.email,
+    };
+
+    return next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid Firebase token', details: String(error) });
+  }
+}
