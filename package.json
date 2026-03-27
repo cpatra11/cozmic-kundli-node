@@ -10,18 +10,24 @@
     "check": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@google/adk": "^0.5.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1018.0",
+    "@langchain/core": "^0.3.65",
+    "@langchain/google-genai": "^0.1.8",
+    "@langchain/langgraph": "^0.2.56",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "firebase-admin": "^13.1.0",
     "google-auth-library": "^10.6.2",
+    "jose": "^6.2.2",
+    "pg": "^8.13.3",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.10",
+    "@types/pg": "^8.20.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2"
   }

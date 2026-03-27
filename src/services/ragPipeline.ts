@@ -2,18 +2,23 @@ import { env } from '../config/env.js';
 import { COLLECTIONS, type RagApiSourceDocument, type RagChunkDocument, type RagChunkResult, type RagProfileDocument } from '../models/firestoreModels.js';
 import { fetchKundliSnapshot, type KundliSnapshotInput } from './be1Client.js';
 import { cosineSimilarity, embedTextDeterministic } from './embeddings.js';
-import { getFirestoreStore } from './firestoreStore.js';
+import { getPostgresStore } from './postgresStore.js';
 import { stableHash, toDocId } from './hash.js';
+import { buildChartSnapshot } from './chartSnapshot.js';
 
 interface IngestInput {
   ownerId: string;
   profileId: string;
+  displayName?: string;
+  place?: string;
   kundli: KundliSnapshotInput;
 }
 
 interface IngestChartPayloadInput {
   ownerId: string;
   profileId: string;
+  displayName?: string;
+  place?: string;
   kundli: KundliSnapshotInput;
   payload: unknown;
   endpoint?: string;
@@ -129,6 +134,8 @@ export async function ingestKundliForProfile(input: IngestInput): Promise<Ingest
   return ingestChartPayloadForProfile({
     ownerId: input.ownerId,
     profileId: input.profileId,
+    displayName: input.displayName,
+    place: input.place,
     kundli: input.kundli,
     payload,
     endpoint: 'calculate',
@@ -137,7 +144,7 @@ export async function ingestKundliForProfile(input: IngestInput): Promise<Ingest
 }
 
 export async function ingestChartPayloadForProfile(input: IngestChartPayloadInput): Promise<IngestResult> {
-  const store = getFirestoreStore();
+  const store = getPostgresStore();
   const now = Date.now();
   const endpoint = input.endpoint ?? 'calculate';
 
@@ -151,10 +158,14 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
   const sourceDoc: RagApiSourceDocument = {
     ownerId: input.ownerId,
     profileId: input.profileId,
+    displayName: input.displayName,
+    place: input.place,
     sourceType: 'be1',
     endpoint,
     requestKey,
     payloadHash,
+    rawPayload: input.payload,
+    chartSnapshot: buildChartSnapshot(input.payload),
     preview: payloadRaw.slice(0, 1800),
     tags: input.tags ?? ['kundli', 'be1', endpoint],
     createdAt: now,
@@ -197,7 +208,10 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
   const profileDoc: RagProfileDocument = {
     ownerId: input.ownerId,
     profileId: input.profileId,
+    displayName: input.displayName,
+    place: input.place,
     kundliSignature: makeKundliSignature(input.kundli),
+    chartVersion: payloadHash,
     kundliInput: toKundliInputDocument(input.kundli),
     latestSourceDocId: sourceDocId,
     sourceCount: (existingProfile?.data.sourceCount ?? 0) + 1,
@@ -216,7 +230,7 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
 }
 
 export async function queryRagChunks(input: QueryInput): Promise<RagChunkResult[]> {
-  const store = getFirestoreStore();
+  const store = getPostgresStore();
   const topK = Math.min(Math.max(input.topK ?? 8, 1), 20);
   const candidateWindow = Math.max(topK * 8, 40);
 

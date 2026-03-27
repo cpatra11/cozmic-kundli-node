@@ -3,6 +3,8 @@ import cors from 'cors';
 import { allowedOrigins, env } from './config/env.js';
 import healthRoutes from './routes/health.js';
 import chatRoutes from './routes/chat.js';
+import meRoutes from './routes/me.js';
+import kundaliRoutes from './routes/kundalis.js';
 import voiceRoutes from './routes/voice.js';
 import ragRoutes from './routes/rag.js';
 
@@ -24,6 +26,8 @@ app.use(express.json({ limit: '8mb' }));
 
 app.use(healthRoutes);
 app.use(chatRoutes);
+app.use(meRoutes);
+app.use(kundaliRoutes);
 app.use(voiceRoutes);
 app.use(ragRoutes);
 

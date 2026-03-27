@@ -1,15 +1,15 @@
 # cozmic-rag-agents
 
-Standalone backend service for horoscope chat/voice, using Firebase for identity + persistence and a Google ADK TypeScript-ready agent layer.
+Standalone backend service for horoscope chat/voice, using Firebase Authentication for identity, Postgres for canonical persistence, and a LangGraph-based grounded agent layer.
 
 ## What is implemented now
 
 - Express TypeScript server scaffold
-- Firebase Admin token middleware (`Bearer <Firebase ID token>`)
+- Firebase ID token middleware via JWKS (`Bearer <Firebase ID token>`)
 - Chat session APIs (create/list/send-message)
 - Voice APIs (transcribe/synthesize) as contract-first stubs
 - `be1` grounding client for `/api/calculate`
-- Agent runtime adapter scaffold (`runKundliAgent`)
+- LangGraph grounded-answer runtime (`runKundliAgent`)
 
 ## API endpoints
 
@@ -25,7 +25,7 @@ Standalone backend service for horoscope chat/voice, using Firebase for identity
 
 ## Local setup
 
-1. Copy `.env.example` into `.env` and fill Firebase Admin credentials.
+1. Copy `.env.example` into `.env` and fill `FIREBASE_PROJECT_ID` + `DATABASE_URL`.
 2. Install dependencies and run dev server.
 
 Optional commands:
@@ -36,22 +36,31 @@ Server default URL: `http://localhost:8787`
 
 ## Firebase requirements
 
-Set one credential source:
+Default auth verification mode is JWKS-based and does not require a service-account JSON file.
+
+Set:
+- `FIREBASE_PROJECT_ID`
+- optional `FIREBASE_JWKS_URL` (defaults to Google Secure Token JWKS)
+- optional `JWT_CLOCK_SKEW_SECONDS`
+
+Optional fallback (if you choose Firebase Admin verification):
 - `FIREBASE_SERVICE_ACCOUNT_JSON`, or
 - `FIREBASE_SERVICE_ACCOUNT_PATH`
 
-And set:
-- `FIREBASE_PROJECT_ID`
-- `FIREBASE_STORAGE_BUCKET`
+## Postgres / LangGraph runtime
 
-## ADK / Gemini runtime
+Set:
 
-For Google ADK TypeScript runtime:
+- `DATABASE_URL`
+- optional `DATABASE_SSL_CA_PATH` if your database uses a private/self-signed CA bundle
+- optional `DATABASE_SSL_REJECT_UNAUTHORIZED=false` only for local/dev debugging
 
-- Install dependency: `@google/adk` (already added in this service)
-- Set `GEMINI_API_KEY` (or compatible env used by your runtime)
+The Postgres database stores canonical chat sessions, messages, chart payloads, and grounding metadata as JSONB documents.
+
+For the grounded chart assistant:
+
+- Set `GEMINI_API_KEY` if you want Gemini-powered responses
 - Configure model with `GOOGLE_GENAI_MODEL`
 
-## Next implementation step
+The LangGraph agent uses the saved raw chart payload and selects only the relevant canonical sections for the user's question. It does not use client-side fallback chart details.
 
-Replace `src/services/kundliAgent.ts` internals with Google ADK TypeScript runtime calls and retrieval pipeline.

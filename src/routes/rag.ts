@@ -61,6 +61,8 @@ router.post('/v1/rag/ingest', requireFirebaseAuth, async (req, res) => {
     const result = await ingestKundliForProfile({
       ownerId: req.user!.uid,
       profileId: parsed.data.profileId,
+      displayName: parsed.data.name,
+      place: parsed.data.place,
       kundli: parsed.data.kundli,
     });
 
@@ -148,30 +150,43 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
       query.ayanamsha = parsed.data.ayanamsha;
     }
 
-    const chartData = await fetchBe1Json('calculate', query);
+    let chartData: unknown;
+    try {
+      chartData = await fetchBe1Json('calculate', query);
+    } catch (error) {
+      throw new Error(`Failed to fetch chart payload from BE1: ${String(error)}`);
+    }
 
-    const ingestion = await ingestChartPayloadForProfile({
-      ownerId: req.user!.uid,
-      profileId,
-      kundli: {
-        latitude: parsed.data.latitude,
-        longitude: parsed.data.longitude,
-        year: parsed.data.year,
-        month: parsed.data.month,
-        day: parsed.data.day,
-        hour: parsed.data.hour,
-        min: parsed.data.min,
-        sec: parsed.data.sec ?? 0,
-        time_zone: parsed.data.time_zone,
-      },
-      payload: chartData,
-      endpoint: 'calculate',
-      tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
-    });
+    let ingestion;
+    try {
+      ingestion = await ingestChartPayloadForProfile({
+        ownerId: req.user!.uid,
+        profileId,
+        displayName: parsed.data.name,
+        place: parsed.data.place,
+        kundli: {
+          latitude: parsed.data.latitude,
+          longitude: parsed.data.longitude,
+          year: parsed.data.year,
+          month: parsed.data.month,
+          day: parsed.data.day,
+          hour: parsed.data.hour,
+          min: parsed.data.min,
+          sec: parsed.data.sec ?? 0,
+          time_zone: parsed.data.time_zone,
+        },
+        payload: chartData,
+        endpoint: 'calculate',
+        tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
+      });
+    } catch (error) {
+      throw new Error(`Failed to persist chart payload to Postgres: ${String(error)}`);
+    }
 
     return res.status(201).json({
       ok: true,
       profileId,
+      kundaliId: profileId,
       chartData,
       ingestion,
     });

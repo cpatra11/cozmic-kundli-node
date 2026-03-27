@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import { getFirebaseClients } from '../firebase/admin.js';
+import { verifyFirebaseIdToken } from '../services/firebaseTokenVerifier.js';
 
 declare module 'express-serve-static-core' {
   interface Request {
@@ -19,8 +19,7 @@ export async function requireFirebaseAuth(req: Request, res: Response, next: Nex
       return res.status(401).json({ error: 'Missing Bearer token' });
     }
 
-    const { auth } = getFirebaseClients();
-    const decoded = await auth.verifyIdToken(token);
+    const decoded = await verifyFirebaseIdToken(token);
 
     req.user = {
       uid: decoded.uid,

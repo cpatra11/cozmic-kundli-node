@@ -1,0 +1,44 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "provision-cozmic-kb",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"scripts/provision-cozmic-kb.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "ingest-nadi-textbook",
+			"type": "shell",
+			"command": "node",
+			"args": [
+				"scripts/ingest-nadi-textbook.mjs"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "provision-rds-free-tier",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"scripts/provision-rds-free-tier.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$tsc"
+			],
+			"group": "build"
+		}
+	]
+}
