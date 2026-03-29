@@ -7,6 +7,8 @@ import meRoutes from './routes/me.js';
 import kundaliRoutes from './routes/kundalis.js';
 import voiceRoutes from './routes/voice.js';
 import ragRoutes from './routes/rag.js';
+import { expensiveEndpointRateLimit } from './middleware/rateLimit.js';
+import { disconnectValkey } from './services/valkeyCache.js';
 
 const app = express();
 
@@ -23,6 +25,20 @@ app.use(
 );
 
 app.use(express.json({ limit: '8mb' }));
+
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const end = process.hrtime.bigint();
+    const durationMs = Number(end - start) / 1_000_000;
+    // eslint-disable-next-line no-console
+    console.log(`[http] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${durationMs.toFixed(1)}ms)`);
+  });
+  next();
+});
+
+app.use('/v1/chart/generate', expensiveEndpointRateLimit);
+app.use('/v1/rag/query', expensiveEndpointRateLimit);
 
 app.use(healthRoutes);
 app.use(chatRoutes);
@@ -41,4 +57,17 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 app.listen(env.PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`cozmic-rag-agents listening on http://localhost:${env.PORT}`);
+});
+
+async function shutdown() {
+  await disconnectValkey();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => {
+  void shutdown();
+});
+
+process.on('SIGTERM', () => {
+  void shutdown();
 });

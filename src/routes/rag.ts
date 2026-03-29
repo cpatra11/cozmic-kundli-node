@@ -1,9 +1,12 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { fetchBe1Json } from '../services/be1Client.js';
+import { fetchBe1Json, fetchTransitChart } from '../services/be1Client.js';
 import { ingestChartPayloadForProfile, ingestKundliForProfile, queryRagChunks } from '../services/ragPipeline.js';
 import { stableHash } from '../services/hash.js';
+import { buildChartSnapshot } from '../services/chartSnapshot.js';
+import { COLLECTIONS, type ChartJobDocument } from '../models/firestoreModels.js';
+import { getPostgresStore } from '../services/postgresStore.js';
 
 const router = Router();
 
@@ -21,6 +24,8 @@ const KundliSchema = z.object({
 
 const IngestSchema = z.object({
   profileId: z.string().min(1).max(120),
+  name: z.string().min(1).max(120).optional(),
+  place: z.string().min(1).max(180).optional(),
   kundli: KundliSchema,
 });
 
@@ -50,6 +55,119 @@ const GenerateChartSchema = z.object({
   varga: z.string().optional(),
   ayanamsha: z.string().optional(),
 });
+
+const TransitChartSchema = z.object({
+  latitude: z.number(),
+  longitude: z.number(),
+  time_zone: z.string().optional(),
+  timezone: z.string().optional(),
+  timeZone: z.string().optional(),
+  year: z.number().optional(),
+  month: z.number().optional(),
+  day: z.number().optional(),
+  hour: z.number().optional(),
+  min: z.number().optional(),
+  sec: z.number().optional(),
+  t_year: z.number().optional(),
+  t_month: z.number().optional(),
+  t_day: z.number().optional(),
+  t_hour: z.number().optional(),
+  t_min: z.number().optional(),
+  t_sec: z.number().optional(),
+  nesting: z.number().int().min(1).max(6).optional(),
+});
+
+function shouldRunAsync(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === '1' || normalized === 'true' || normalized === 'yes';
+  }
+  return false;
+}
+
+async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeof GenerateChartSchema>) {
+  const profileId =
+    parsedData.profileId ??
+    `p_${stableHash(
+      JSON.stringify({
+        uid: ownerId,
+        lat: parsedData.latitude,
+        lon: parsedData.longitude,
+        y: parsedData.year,
+        m: parsedData.month,
+        d: parsedData.day,
+        h: parsedData.hour,
+        min: parsedData.min,
+        sec: parsedData.sec ?? 0,
+      })
+    ).slice(0, 12)}`;
+
+  const query: Record<string, number | string> = {
+    latitude: parsedData.latitude,
+    longitude: parsedData.longitude,
+    year: parsedData.year,
+    month: parsedData.month,
+    day: parsedData.day,
+    hour: parsedData.hour,
+    min: parsedData.min,
+    sec: parsedData.sec ?? 0,
+    time_zone: parsedData.time_zone,
+    dst_hour: parsedData.dst_hour ?? 0,
+    dst_min: parsedData.dst_min ?? 0,
+    nesting: parsedData.nesting ?? 5,
+    infolevel:
+      parsedData.infolevel ??
+      'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
+    varga: parsedData.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
+  };
+
+  if (parsedData.ayanamsha) {
+    query.ayanamsha = parsedData.ayanamsha;
+  }
+
+  let chartData: unknown;
+  try {
+    chartData = await fetchBe1Json('calculate', query);
+  } catch (error) {
+    throw new Error(`Failed to fetch chart payload from BE1: ${String(error)}`);
+  }
+
+  const chartSnapshot = buildChartSnapshot(chartData);
+
+  let ingestion;
+  try {
+    ingestion = await ingestChartPayloadForProfile({
+      ownerId,
+      profileId,
+      displayName: parsedData.name,
+      place: parsedData.place,
+      kundli: {
+        latitude: parsedData.latitude,
+        longitude: parsedData.longitude,
+        year: parsedData.year,
+        month: parsedData.month,
+        day: parsedData.day,
+        hour: parsedData.hour,
+        min: parsedData.min,
+        sec: parsedData.sec ?? 0,
+        time_zone: parsedData.time_zone,
+      },
+      payload: chartData,
+      endpoint: 'calculate',
+      tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
+    });
+  } catch (error) {
+    throw new Error(`Failed to persist chart payload to Postgres: ${String(error)}`);
+  }
+
+  return {
+    profileId,
+    kundaliId: profileId,
+    chartData: chartSnapshot,
+    ingestion,
+  };
+}
 
 router.post('/v1/rag/ingest', requireFirebaseAuth, async (req, res) => {
   try {
@@ -111,87 +229,133 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
     }
 
-    const profileId =
-      parsed.data.profileId ??
-      `p_${stableHash(
-        JSON.stringify({
-          uid: req.user!.uid,
-          lat: parsed.data.latitude,
-          lon: parsed.data.longitude,
-          y: parsed.data.year,
-          m: parsed.data.month,
-          d: parsed.data.day,
-          h: parsed.data.hour,
-          min: parsed.data.min,
-          sec: parsed.data.sec ?? 0,
-        })
-      ).slice(0, 12)}`;
+    const runAsync = shouldRunAsync((req.query as Record<string, unknown>)?.async ?? (req.body as Record<string, unknown>)?.async);
 
-    const query: Record<string, number | string> = {
-      latitude: parsed.data.latitude,
-      longitude: parsed.data.longitude,
-      year: parsed.data.year,
-      month: parsed.data.month,
-      day: parsed.data.day,
-      hour: parsed.data.hour,
-      min: parsed.data.min,
-      sec: parsed.data.sec ?? 0,
-      time_zone: parsed.data.time_zone,
-      dst_hour: parsed.data.dst_hour ?? 0,
-      dst_min: parsed.data.dst_min ?? 0,
-      nesting: parsed.data.nesting ?? 5,
-      infolevel:
-        parsed.data.infolevel ??
-        'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
-      varga: parsed.data.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
-    };
+    if (runAsync) {
+      const store = getPostgresStore();
+      const now = Date.now();
+      const profileIdHint = parsed.data.profileId ?? 'pending';
+      const jobId = `job_${stableHash(JSON.stringify({ ownerId: req.user!.uid, profileIdHint, now, request: parsed.data })).slice(0, 16)}`;
+      const jobPath = `${COLLECTIONS.chartJobs}/${req.user!.uid}__${jobId}`;
 
-    if (parsed.data.ayanamsha) {
-      query.ayanamsha = parsed.data.ayanamsha;
-    }
-
-    let chartData: unknown;
-    try {
-      chartData = await fetchBe1Json('calculate', query);
-    } catch (error) {
-      throw new Error(`Failed to fetch chart payload from BE1: ${String(error)}`);
-    }
-
-    let ingestion;
-    try {
-      ingestion = await ingestChartPayloadForProfile({
+      const initialJob: ChartJobDocument = {
         ownerId: req.user!.uid,
-        profileId,
-        displayName: parsed.data.name,
-        place: parsed.data.place,
-        kundli: {
-          latitude: parsed.data.latitude,
-          longitude: parsed.data.longitude,
-          year: parsed.data.year,
-          month: parsed.data.month,
-          day: parsed.data.day,
-          hour: parsed.data.hour,
-          min: parsed.data.min,
-          sec: parsed.data.sec ?? 0,
-          time_zone: parsed.data.time_zone,
-        },
-        payload: chartData,
-        endpoint: 'calculate',
-        tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
+        profileId: profileIdHint,
+        status: 'queued',
+        request: parsed.data as unknown as Record<string, unknown>,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await store.setDocument(jobPath, initialJob, false);
+
+      setImmediate(async () => {
+        try {
+          await store.setDocument(jobPath, { status: 'running', updatedAt: Date.now() }, true);
+          const result = await generateAndIngestChart(req.user!.uid, parsed.data);
+          await store.setDocument(jobPath, {
+            status: 'completed',
+            profileId: result.profileId,
+            result,
+            updatedAt: Date.now(),
+          }, true);
+        } catch (error) {
+          await store.setDocument(jobPath, {
+            status: 'failed',
+            error: String(error),
+            updatedAt: Date.now(),
+          }, true);
+        }
       });
-    } catch (error) {
-      throw new Error(`Failed to persist chart payload to Postgres: ${String(error)}`);
+
+      return res.status(202).json({
+        ok: true,
+        async: true,
+        jobId,
+        status: 'queued',
+      });
     }
+
+    const result = await generateAndIngestChart(req.user!.uid, parsed.data);
 
     return res.status(201).json({
       ok: true,
-      profileId,
-      kundaliId: profileId,
-      chartData,
-      ingestion,
+      ...result,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to generate and ingest chart', details: String(error) });
+  }
+});
+
+router.get('/v1/chart/jobs/:jobId', requireFirebaseAuth, async (req, res) => {
+  try {
+    const jobId = String(req.params.jobId ?? '').trim();
+    if (!jobId) {
+      return res.status(400).json({ error: 'Missing jobId path parameter' });
+    }
+
+    const store = getPostgresStore();
+    const doc = await store.getDocument<ChartJobDocument>(`${COLLECTIONS.chartJobs}/${req.user!.uid}__${jobId}`);
+    if (!doc) {
+      return res.status(404).json({ error: 'Chart job not found' });
+    }
+
+    return res.json({
+      jobId,
+      ...doc.data,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load chart job', details: String(error) });
+  }
+});
+
+router.post('/v1/transit-chart', requireFirebaseAuth, async (req, res) => {
+  try {
+    const parsed = TransitChartSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
+    }
+
+    const timeZone = parsed.data.time_zone ?? parsed.data.timezone ?? parsed.data.timeZone;
+    if (!timeZone) {
+      return res.status(400).json({ error: 'Invalid body', details: { time_zone: ['Required time_zone/timezone/timeZone'] } });
+    }
+
+    const natalYear = parsed.data.year ?? parsed.data.t_year;
+    const natalMonth = parsed.data.month ?? parsed.data.t_month;
+    const natalDay = parsed.data.day ?? parsed.data.t_day;
+    const natalHour = parsed.data.hour ?? parsed.data.t_hour;
+    const natalMin = parsed.data.min ?? parsed.data.t_min;
+    const natalSec = parsed.data.sec ?? 0;
+
+    if (
+      natalYear === undefined ||
+      natalMonth === undefined ||
+      natalDay === undefined ||
+      natalHour === undefined ||
+      natalMin === undefined
+    ) {
+      return res.status(400).json({ error: 'Invalid body', details: { year: ['Required natal date/time fields'] } });
+    }
+
+    const data = await fetchTransitChart(
+      {
+        latitude: parsed.data.latitude,
+        longitude: parsed.data.longitude,
+        year: natalYear,
+        month: natalMonth,
+        day: natalDay,
+        hour: natalHour,
+        min: natalMin,
+        sec: natalSec,
+        time_zone: timeZone,
+      },
+      { nesting: parsed.data.nesting ?? 4 }
+    );
+
+    return res.json(data);
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch transit chart', details: String(error) });
   }
 });
 

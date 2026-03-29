@@ -3,6 +3,7 @@ export const COLLECTIONS = {
   ragProfiles: 'rag_profiles',
   ragApiSources: 'rag_api_sources',
   ragChunks: 'rag_chunks',
+  chartJobs: 'chart_jobs',
 } as const;
 
 export interface AuthUserDocument {
@@ -74,4 +75,15 @@ export interface RagChunkDocument {
 export interface RagChunkResult extends RagChunkDocument {
   id: string;
   similarity: number;
+}
+
+export interface ChartJobDocument {
+  ownerId: string;
+  profileId: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  request: Record<string, unknown>;
+  result?: unknown;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
 }

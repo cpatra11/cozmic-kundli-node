@@ -12,6 +12,8 @@ export function getPostgresPool(): Pool | null {
   if (!singletonPool) {
     singletonPool = new Pool({
       connectionString: withPostgresSslOverrides(env.DATABASE_URL),
+      query_timeout: env.PG_QUERY_TIMEOUT_MS,
+      connectionTimeoutMillis: env.PG_CONNECTION_TIMEOUT_MS,
       ...buildPostgresSslConfig(),
     });
   }

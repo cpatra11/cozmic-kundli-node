@@ -19,6 +19,7 @@ const VoiceSynthesisSchema = z.object({
 
 const VoiceTurnSchema = z.object({
   message: z.string().min(1).max(4000),
+  mode: z.enum(['mini', 'pro']).optional(),
   profileId: z.string().min(1).max(120).optional(),
   kundli: z.any().optional(),
   clientTimestamp: z.number().optional(),
@@ -65,6 +66,7 @@ router.post('/v1/voice/turn', requireFirebaseAuth, async (req, res) => {
     const answer = await runKundliAgent({
       ownerId: req.user!.uid,
       message: parsed.data.message,
+      mode: parsed.data.mode ?? 'mini',
       profileId: parsed.data.profileId,
       kundli: parsed.data.kundli,
       clientTimestamp: parsed.data.clientTimestamp,
@@ -80,6 +82,8 @@ router.post('/v1/voice/turn', requireFirebaseAuth, async (req, res) => {
     return res.json({
       answer: answer.answer,
       model: answer.model,
+      executionPlan: answer.executionPlan,
+      analysisStages: answer.analysisStages,
       grounding: answer.grounding,
       voiceModel: speech.model || NOVA_SONIC_MODEL_ID,
       audioBase64: speech.audioBase64,

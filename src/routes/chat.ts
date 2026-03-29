@@ -1,10 +1,11 @@
-import { Router } from 'express';
+import { Router, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import { runKundliAgent } from '../services/kundliAgent.js';
 import { getPostgresStore } from '../services/postgresStore.js';
 import { COLLECTIONS, type RagProfileDocument } from '../models/firestoreModels.js';
+import { buildChatMessageEmbedding, queryRelevantSessionMemories } from '../services/chatMemory.js';
 
 const CreateSessionSchema = z.object({
   title: z.string().min(1).max(120).optional(),
@@ -13,6 +14,7 @@ const CreateSessionSchema = z.object({
 
 const SendMessageSchema = z.object({
   message: z.string().min(1).max(4000),
+  mode: z.enum(['mini', 'pro']).optional(),
   profileId: z.string().min(1).max(120).optional(),
   kundaliId: z.string().min(1).max(120).optional(),
   requestId: z.string().min(1).max(120).optional(),
@@ -49,6 +51,7 @@ interface ChatMessageDoc {
   sessionId: string;
   role: 'user' | 'assistant';
   message: string;
+  mode?: 'mini' | 'pro';
   model?: string;
   requestId?: string;
   kundaliId?: string;
@@ -56,7 +59,15 @@ interface ChatMessageDoc {
   bindingTurn?: number;
   bindingChartVersion?: string;
   bindingKundliSignature?: string;
+  embedding?: number[];
+  embeddingModel?: string;
+  embeddingDim?: number;
   createdAt: number;
+}
+
+function writeSseEvent(res: Response, event: string, payload: unknown): void {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 router.post('/v1/chat/sessions', requireFirebaseAuth, async (req, res) => {
@@ -142,6 +153,172 @@ router.get('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async (
   }
 });
 
+router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth, async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let closed = false;
+  req.on('close', () => {
+    closed = true;
+  });
+
+  try {
+    const parsed = SendMessageSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      writeSseEvent(res, 'error', { error: 'Invalid body', details: parsed.error.flatten() });
+      res.end();
+      return;
+    }
+
+    const store = getPostgresStore();
+    const sessionIdParam = req.params.sessionId;
+    const sessionId = Array.isArray(sessionIdParam) ? sessionIdParam[0] : sessionIdParam;
+
+    if (!sessionId) {
+      writeSseEvent(res, 'error', { error: 'Missing sessionId path parameter' });
+      res.end();
+      return;
+    }
+
+    const sessionPath = `chat_sessions/${sessionId}`;
+    const session = await store.getDocument<ChatSessionDoc>(sessionPath);
+
+    if (!session) {
+      writeSseEvent(res, 'error', { error: 'Session not found' });
+      res.end();
+      return;
+    }
+
+    if (session.data.ownerId !== req.user!.uid) {
+      writeSseEvent(res, 'error', { error: 'Forbidden' });
+      res.end();
+      return;
+    }
+
+    let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.data.kundaliId;
+
+    if (!effectiveProfileId) {
+      const latestProfiles = await store.runQuery<RagProfileDocument>(
+        COLLECTIONS.ragProfiles,
+        [{ field: 'ownerId', op: 'EQUAL', value: req.user!.uid }],
+        {
+          orderBy: [{ field: 'updatedAt', direction: 'DESCENDING' }],
+          limit: 1,
+        }
+      );
+
+      effectiveProfileId = latestProfiles[0]?.data.profileId;
+    }
+
+    if (!effectiveProfileId) {
+      writeSseEvent(res, 'error', {
+        error: 'Missing canonical chart identity',
+        details: 'Open or save a Kundli first so chat can load canonical payload.',
+      });
+      res.end();
+      return;
+    }
+
+    const now = Date.now();
+    const requestId = parsed.data.requestId ?? randomUUID();
+
+    const userMessage: ChatMessageDoc = {
+      ownerId: req.user!.uid,
+      sessionId,
+      role: 'user',
+      message: parsed.data.message,
+      mode: parsed.data.mode ?? 'mini',
+      requestId,
+      kundaliId: effectiveProfileId,
+      createdAt: now,
+      ...buildChatMessageEmbedding(parsed.data.message),
+    };
+
+    await store.createDocument('chat_messages', userMessage);
+
+    const relevantMemories = await queryRelevantSessionMemories({
+      ownerId: req.user!.uid,
+      sessionId,
+      message: parsed.data.message,
+      excludeRequestId: requestId,
+      topK: 6,
+    });
+
+    writeSseEvent(res, 'ack', {
+      requestId,
+      sessionId,
+      mode: parsed.data.mode ?? 'mini',
+      kundaliId: effectiveProfileId,
+    });
+
+    const agent = await runKundliAgent({
+      ownerId: req.user!.uid,
+      message: parsed.data.message,
+      mode: parsed.data.mode ?? 'mini',
+      profileId: effectiveProfileId,
+      kundli: parsed.data.kundli,
+      clientTimestamp: parsed.data.clientTimestamp,
+      conversationContext: relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`),
+      onStage: (stage) => {
+        if (!closed) {
+          writeSseEvent(res, 'stage', stage);
+        }
+      },
+    });
+
+    const assistantMessage: ChatMessageDoc = {
+      ownerId: req.user!.uid,
+      sessionId,
+      role: 'assistant',
+      message: agent.answer,
+      mode: parsed.data.mode ?? 'mini',
+      model: agent.model,
+      requestId,
+      kundaliId: effectiveProfileId,
+      bindingId: agent.grounding?.sourceDocId,
+      bindingChartVersion: agent.grounding?.chartVersion,
+      bindingKundliSignature: agent.grounding?.kundliSignature,
+      createdAt: Date.now(),
+      ...buildChatMessageEmbedding(agent.answer),
+    };
+
+    await store.createDocument('chat_messages', assistantMessage);
+
+    await store.setDocument(
+      sessionPath,
+      {
+        updatedAt: Date.now(),
+        lastMessagePreview: parsed.data.message.slice(0, 180),
+        kundaliId: effectiveProfileId,
+        chartVersion: agent.grounding?.chartVersion,
+      },
+      true
+    );
+
+    writeSseEvent(res, 'done', {
+      answer: agent.answer,
+      model: agent.model,
+      mode: parsed.data.mode ?? 'mini',
+      executionPlan: agent.executionPlan,
+      analysisStages: agent.analysisStages,
+      grounding: agent.grounding,
+      memoryContextUsed: relevantMemories,
+      sessionId,
+      kundaliId: effectiveProfileId,
+      chartVersion: agent.grounding?.chartVersion,
+      requestId,
+    });
+
+    res.end();
+  } catch (error) {
+    writeSseEvent(res, 'error', { error: 'Failed to process streamed message', details: String(error) });
+    res.end();
+  }
+});
+
 router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async (req, res) => {
   try {
     const parsed = SendMessageSchema.safeParse(req.body ?? {});
@@ -199,19 +376,31 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       sessionId,
       role: 'user',
       message: parsed.data.message,
+      mode: parsed.data.mode ?? 'mini',
       requestId,
       kundaliId: effectiveProfileId,
       createdAt: now,
+      ...buildChatMessageEmbedding(parsed.data.message),
     };
 
     await store.createDocument('chat_messages', userMessage);
 
+    const relevantMemories = await queryRelevantSessionMemories({
+      ownerId: req.user!.uid,
+      sessionId,
+      message: parsed.data.message,
+      excludeRequestId: requestId,
+      topK: 6,
+    });
+
     const agent = await runKundliAgent({
       ownerId: req.user!.uid,
       message: parsed.data.message,
+      mode: parsed.data.mode ?? 'mini',
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
       clientTimestamp: parsed.data.clientTimestamp,
+      conversationContext: relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`),
     });
 
     const assistantMessage: ChatMessageDoc = {
@@ -219,6 +408,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       sessionId,
       role: 'assistant',
       message: agent.answer,
+      mode: parsed.data.mode ?? 'mini',
       model: agent.model,
       requestId,
       kundaliId: effectiveProfileId,
@@ -226,6 +416,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       bindingChartVersion: agent.grounding?.chartVersion,
       bindingKundliSignature: agent.grounding?.kundliSignature,
       createdAt: Date.now(),
+      ...buildChatMessageEmbedding(agent.answer),
     };
 
     await store.createDocument('chat_messages', assistantMessage);
@@ -244,7 +435,11 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
     return res.json({
       answer: agent.answer,
       model: agent.model,
+      mode: parsed.data.mode ?? 'mini',
+      executionPlan: agent.executionPlan,
+      analysisStages: agent.analysisStages,
       grounding: agent.grounding,
+      memoryContextUsed: relevantMemories,
       sessionId,
       kundaliId: effectiveProfileId,
       chartVersion: agent.grounding?.chartVersion,

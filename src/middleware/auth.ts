@@ -6,6 +6,9 @@ declare module 'express-serve-static-core' {
     user?: {
       uid: string;
       email?: string;
+      phoneNumber?: string;
+      name?: string;
+      signInProvider?: string;
     };
   }
 }
@@ -24,6 +27,9 @@ export async function requireFirebaseAuth(req: Request, res: Response, next: Nex
     req.user = {
       uid: decoded.uid,
       email: decoded.email,
+      phoneNumber: decoded.phoneNumber,
+      name: decoded.name,
+      signInProvider: decoded.signInProvider,
     };
 
     return next();

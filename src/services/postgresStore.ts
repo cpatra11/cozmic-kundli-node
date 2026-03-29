@@ -122,6 +122,33 @@ function compareValues(left: unknown, op: FieldFilterOperator, right: unknown): 
   }
 }
 
+function toJsonPathLiteral(fieldPath: string): string {
+  const parts = fieldPath.split('.').map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error(`Invalid field path: ${fieldPath}`);
+  }
+
+  for (const part of parts) {
+    if (!/^[A-Za-z0-9_]+$/.test(part)) {
+      throw new Error(`Unsafe field path segment: ${part}`);
+    }
+  }
+
+  return `{${parts.join(',')}}`;
+}
+
+function buildJsonTextExpr(fieldPath: string): string {
+  return `data #>> '${toJsonPathLiteral(fieldPath)}'`;
+}
+
+function isScalarComparable(value: PostgresDocumentValue): value is string | number | boolean | null {
+  return value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+function canUseSqlPushdown(filters: StructuredFieldFilter[]): boolean {
+  return filters.every((filter) => filter.op === 'EQUAL' && isScalarComparable(filter.value));
+}
+
 class PostgresStore {
   private readonly pool: Pool;
   private ready: Promise<void> | null = null;
@@ -129,14 +156,53 @@ class PostgresStore {
   constructor(databaseUrl: string) {
     this.pool = new Pool({
       connectionString: withPostgresSslOverrides(databaseUrl),
+      query_timeout: env.PG_QUERY_TIMEOUT_MS,
+      connectionTimeoutMillis: env.PG_CONNECTION_TIMEOUT_MS,
       ...buildPostgresSslConfig(),
     });
+  }
+
+  private isTransientQueryTimeout(error: unknown): boolean {
+    const message = String(error ?? '').toLowerCase();
+    return (
+      message.includes('query read timeout') ||
+      message.includes('query timeout') ||
+      message.includes('timeout') ||
+      message.includes('etimedout')
+    );
+  }
+
+  private async executeQuery(text: string, values: unknown[] = [], options?: { disableTimeout?: boolean; retries?: number }): Promise<{ rows: unknown[] }> {
+    const retries = Math.max(0, options?.retries ?? 1);
+    let attempt = 0;
+
+    while (true) {
+      try {
+        if (options?.disableTimeout) {
+          return (await (this.pool as any).query({
+            text,
+            values,
+            query_timeout: 0,
+          })) as { rows: unknown[] };
+        }
+
+        return (await this.pool.query(text, values)) as { rows: unknown[] };
+      } catch (error) {
+        if (attempt >= retries || !this.isTransientQueryTimeout(error)) {
+          throw error;
+        }
+
+        attempt += 1;
+        const delayMs = 150 * attempt;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
   }
 
   private async ensureSchema(): Promise<void> {
     if (!this.ready) {
       this.ready = (async () => {
-        await this.pool.query(`
+        await this.executeQuery(`
           CREATE TABLE IF NOT EXISTS documents (
             path TEXT PRIMARY KEY,
             collection TEXT NOT NULL,
@@ -145,11 +211,16 @@ class PostgresStore {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
           );
-        `);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS documents_collection_idx ON documents (collection);`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS documents_collection_owner_idx ON documents (collection, ((data->>'ownerId')));`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS documents_collection_profile_idx ON documents (collection, ((data->>'profileId')));`);
-        await this.pool.query(`CREATE INDEX IF NOT EXISTS documents_collection_updated_idx ON documents (collection, updated_at DESC);`);
+        `, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_idx ON documents (collection);`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_owner_idx ON documents (collection, ((data->>'ownerId')));`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_profile_idx ON documents (collection, ((data->>'profileId')));`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_updated_idx ON documents (collection, updated_at DESC);`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_owner_profile_idx ON documents (collection, ((data->>'ownerId')), ((data->>'profileId')));`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_latest_source_idx ON documents (collection, ((data->>'latestSourceDocId')));`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_chart_version_idx ON documents (collection, ((data->>'chartVersion')));`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_chat_sessions_owner_updated_idx ON documents (((data->>'ownerId')), ((data->>'updatedAt')) DESC) WHERE collection = 'chat_sessions';`, [], { disableTimeout: true, retries: 0 });
+        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_chat_messages_owner_session_created_idx ON documents (((data->>'ownerId')), ((data->>'sessionId')), ((data->>'createdAt'))) WHERE collection = 'chat_messages';`, [], { disableTimeout: true, retries: 0 });
       })();
     }
 
@@ -178,7 +249,7 @@ class PostgresStore {
     const existing = merge ? await this.readRow(path) : null;
     const nextData = merge && existing ? deepMerge(existing.data, data) : (data as PostgresDocumentData);
 
-    await this.pool.query(
+    await this.executeQuery(
       `
       INSERT INTO documents (path, collection, doc_id, data, created_at, updated_at)
       VALUES ($1, $2, $3, $4::jsonb, NOW(), NOW())
@@ -189,7 +260,8 @@ class PostgresStore {
         data = EXCLUDED.data,
         updated_at = NOW();
       `,
-      [path, collection, docId, JSON.stringify(nextData)]
+      [path, collection, docId, JSON.stringify(nextData)],
+      { retries: 1 }
     );
   }
 
@@ -201,7 +273,7 @@ class PostgresStore {
 
   async deleteDocument(path: string): Promise<void> {
     await this.ensureSchema();
-    await this.pool.query(`DELETE FROM documents WHERE path = $1`, [path]);
+    await this.executeQuery(`DELETE FROM documents WHERE path = $1`, [path], { retries: 1 });
   }
 
   async getDocument<T extends object>(path: string): Promise<QueryResult<T> | null> {
@@ -219,9 +291,55 @@ class PostgresStore {
     }
   ): Promise<QueryResult<T>[]> {
     await this.ensureSchema();
-    const response = await this.pool.query(
+
+    if (canUseSqlPushdown(filters)) {
+      const params: Array<string | number> = [collection];
+      const whereParts: string[] = ['collection = $1'];
+
+      for (const filter of filters) {
+        const fieldExpr = buildJsonTextExpr(filter.field);
+        if (filter.value === null) {
+          whereParts.push(`${fieldExpr} IS NULL`);
+          continue;
+        }
+
+        params.push(String(filter.value));
+        whereParts.push(`${fieldExpr} = $${params.length}`);
+      }
+
+      const orderBy = options?.orderBy ?? [];
+      const orderBySql = orderBy
+        .map((clause) => {
+          const direction = clause.direction === 'ASCENDING' ? 'ASC' : 'DESC';
+          const fieldExpr = buildJsonTextExpr(clause.field);
+          return `${fieldExpr} ${direction}`;
+        })
+        .join(', ');
+
+      let limitSql = '';
+      if (typeof options?.limit === 'number' && Number.isFinite(options.limit) && options.limit > 0) {
+        params.push(Math.floor(options.limit));
+        limitSql = ` LIMIT $${params.length}`;
+      }
+
+      const sql = [
+        'SELECT path, collection, doc_id, data, created_at, updated_at',
+        'FROM documents',
+        `WHERE ${whereParts.join(' AND ')}`,
+        orderBySql ? `ORDER BY ${orderBySql}` : '',
+        limitSql,
+      ]
+        .filter(Boolean)
+        .join(' ');
+
+      const response = await this.executeQuery(sql, params, { retries: 1 });
+      return (response.rows as StoredDocumentRow[]).map((row) => PostgresStore.rowToQueryResult<T>(row));
+    }
+
+    const response = await this.executeQuery(
       `SELECT path, collection, doc_id, data, created_at, updated_at FROM documents WHERE collection = $1`,
-      [collection]
+      [collection],
+      { retries: 1 }
     );
 
     const rows = response.rows as StoredDocumentRow[];

@@ -5,21 +5,74 @@ import { COLLECTIONS, type RagApiSourceDocument, type RagProfileDocument } from 
 import { getPostgresStore } from './postgresStore.js';
 import { stableHash } from './hash.js';
 import { invokeDeepSeekBedrock } from './deepseekBedrock.js';
+import { buildTransitToolFinding, type ToolFinding } from './astrologyTools.js';
 
 export interface AgentAnswerInput {
   ownerId?: string;
   message: string;
+  mode?: 'mini' | 'pro';
   kundli?: KundliSnapshotInput;
   profileId?: string;
   clientTimestamp?: number;
+  conversationContext?: string[];
+  onStage?: (stage: AnalysisStage) => void;
 }
 
+type AgentMode = 'mini' | 'pro';
+
 type IntentPrimary = 'd9' | 'dasha' | 'transit' | 'general';
+type QuestionFamily =
+  | 'general'
+  | 'career'
+  | 'marriage'
+  | 'relationship'
+  | 'finance'
+  | 'health'
+  | 'longevity'
+  | 'education'
+  | 'children'
+  | 'property'
+  | 'travel'
+  | 'spirituality'
+  | 'timing'
+  | 'yoga'
+  | 'family';
+type ChartLayer = 'D1' | 'D9' | 'D10' | 'D8' | 'D30' | 'D7' | 'D4' | 'D12' | 'D20';
+type MicroSignal = 'nakshatra' | 'nakshatra_lord' | 'sign_lord' | 'drishti' | 'degree';
 type TimeSource = 'client' | 'server';
+type TimeDirection = 'past' | 'future' | 'present';
+type TimeUnit = 'day' | 'week' | 'month' | 'year';
+
+type AnalysisStage = {
+  id: string;
+  label: string;
+  status: 'completed';
+  details?: string;
+};
+
+type DynamicExecutionPlan = {
+  family: QuestionFamily;
+  chartLayers: ChartLayer[];
+  includeTiming: boolean;
+  includeTransit: boolean;
+  includeDasha: boolean;
+  includeCareer: boolean;
+  includeRelationship: boolean;
+  includeMicroSignals: MicroSignal[];
+  seriesNodes: string[];
+  parallelBatches: string[][];
+};
+
+type CoverageGap = 'varga' | 'd9' | 'dasha' | 'transit' | 'career' | 'longevity';
 
 type QuestionIntent = {
   primary: IntentPrimary;
   flags: string[];
+  topics: string[];
+  timeDirection: TimeDirection;
+  timeValue?: number;
+  timeUnit?: TimeUnit;
+  timeLabel?: string;
 };
 
 type SelectedSection = {
@@ -34,21 +87,13 @@ type AtlasItem = {
   sampleKeys?: string[];
 };
 
-type ToolFinding = {
-  name: string;
-  status: 'ok' | 'partial' | 'unavailable';
-  facts: string[];
-  evidencePaths: string[];
-  missing?: string[];
-  snippets?: string[];
-};
-
 type GroundingContext = {
   ownerId: string;
   profileId: string;
   sourceDocId: string;
   chartVersion: string;
   kundliSignature: string;
+  kundli: KundliSnapshotInput;
   requestKey: string;
   payloadHash: string;
   referenceTimestamp: number;
@@ -61,12 +106,16 @@ type GroundingContext = {
 export interface AgentAnswer {
   answer: string;
   model: string;
-  grounding: {
+  mode: AgentMode;
+  executionPlan?: DynamicExecutionPlan;
+  analysisStages?: AnalysisStage[];
+  grounding?: {
     ownerId: string;
     profileId: string;
     sourceDocId: string;
     chartVersion: string;
     kundliSignature: string;
+    kundli: KundliSnapshotInput;
     requestKey: string;
     payloadHash: string;
     referenceTimestamp: number;
@@ -78,11 +127,20 @@ export interface AgentAnswer {
 const AgentState = Annotation.Root({
   ownerId: Annotation<string>,
   profileId: Annotation<string>,
+  mode: Annotation<AgentMode>,
   question: Annotation<string>,
+  kundliInput: Annotation<KundliSnapshotInput | null>,
   referenceTimestamp: Annotation<number | null>,
   referenceTimeSource: Annotation<TimeSource | null>,
+  conversationContext: Annotation<string[]>,
+  stageReporter: Annotation<((stage: AnalysisStage) => void) | null>,
+  toolIteration: Annotation<number>,
+  maxToolIterations: Annotation<number>,
   intent: Annotation<QuestionIntent | null>,
+  executionPlan: Annotation<DynamicExecutionPlan | null>,
+  coverageGaps: Annotation<CoverageGap[]>,
   grounding: Annotation<GroundingContext | null>,
+  analysisStages: Annotation<AnalysisStage[]>,
   toolFindings: Annotation<ToolFinding[]>,
   prompt: Annotation<string | null>,
   answer: Annotation<string | null>,
@@ -286,6 +344,51 @@ function extractRequestedVargaKeys(question: string): string[] {
   return [...keys];
 }
 
+function evaluateMiniScope(question: string): { allowed: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  const q = question.toLowerCase();
+
+  const vargaKeys = extractRequestedVargaKeys(question);
+  if (vargaKeys.some((key) => key !== 'D1' && key !== 'D9')) {
+    reasons.push('This asks for advanced divisional charts beyond D1/D9.');
+  }
+
+  const intent = classifyQuestionIntent(question);
+  const family = determineQuestionFamily(question, intent);
+  const allowedFamilies = new Set<QuestionFamily>(['general', 'relationship', 'marriage']);
+
+  if (!allowedFamilies.has(family)) {
+    reasons.push(`This falls under ${family} analysis, which is Pro scope.`);
+  }
+
+  const proTimingFlags = new Set(['timing', 'dasha', 'transit', 'forecast', 'history', 'career_timing']);
+  if (intent.flags.some((flag) => proTimingFlags.has(flag))) {
+    reasons.push('This requires timing/predictive analysis (dasha/transit/forecast).');
+  }
+
+  if (/(\bashtakavarga\b|\barudha\b|\baruda\b|\bshadbala\b|\bkp\b|\bjaimini\b|\bnadi\b)/.test(q)) {
+    reasons.push('This requests advanced systems reserved for Pro mode.');
+  }
+
+  return { allowed: reasons.length === 0, reasons };
+}
+
+function buildMiniUpgradeResponse(question: string, reasons: string[] = []): string {
+  const why = reasons.length > 0
+    ? [``, 'Why this is Pro:', ...reasons.slice(0, 3).map((reason) => `- ${reason}`)]
+    : [];
+
+  return [
+    'You are currently in **Cozmic Mini** mode.',
+    'This request needs advanced analysis that is available in **Cozmic Pro**.',
+    '',
+    'Mini supports: **D1, D9, and basic non-predictive astrology insights**.',
+    ...why,
+    '',
+    `Please switch to **Cozmic Pro** and ask again: "${question.trim()}"`,
+  ].join('\n');
+}
+
 function summarizeVargaSection(vargaKey: string, value: unknown, question: string): string[] {
   const facts: string[] = [];
 
@@ -327,7 +430,7 @@ function summarizeVargaSection(vargaKey: string, value: unknown, question: strin
   return facts.length > 0 ? facts : [`${vargaKey}: ${formatValue(value)}`];
 }
 
-function makeVargaToolFinding(rawPayload: unknown, question: string): ToolFinding {
+function makeVargaToolFinding(rawPayload: unknown, question: string, mode: AgentMode): ToolFinding {
   const varga = getFirstPathValue(rawPayload, ['chart.varga', 'varga']);
   if (!varga || !isPlainObject(varga.value)) {
     return {
@@ -343,9 +446,12 @@ function makeVargaToolFinding(rawPayload: unknown, question: string): ToolFindin
     .filter((key) => /^D\d{1,2}$/.test(key))
     .sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
 
+  const modeAllowedKeys = mode === 'mini' ? ['D1', 'D9'] : availableKeys;
+  const filteredAvailableKeys = availableKeys.filter((key) => modeAllowedKeys.includes(key));
+
   const requestedKeys = extractRequestedVargaKeys(question);
-  const selectedKeys = [...new Set(['D1', ...requestedKeys].filter((key) => availableKeys.includes(key)))].slice(0, 8);
-  const effectiveKeys = selectedKeys.length > 0 ? selectedKeys : availableKeys.slice(0, 8);
+  const selectedKeys = [...new Set(['D1', ...requestedKeys].filter((key) => filteredAvailableKeys.includes(key)))].slice(0, 8);
+  const effectiveKeys = selectedKeys.length > 0 ? selectedKeys : filteredAvailableKeys.slice(0, 8);
 
   const facts: string[] = [];
   const evidencePaths: string[] = [];
@@ -357,9 +463,13 @@ function makeVargaToolFinding(rawPayload: unknown, question: string): ToolFindin
     facts.push(...summarizeVargaSection(key, section, question).slice(0, 8));
   }
 
-  const remaining = availableKeys.filter((key) => !effectiveKeys.includes(key));
+  const remaining = filteredAvailableKeys.filter((key) => !effectiveKeys.includes(key));
   if (remaining.length > 0) {
     facts.push(`Additional vargas available: ${remaining.join(', ')}.`);
+  }
+
+  if (mode === 'mini') {
+    facts.push('Mini mode scope enforced: only D1 and D9 are considered.');
   }
 
   return {
@@ -460,6 +570,9 @@ function pickQuestionScope(question: string): string[] {
   if (/\b(d9|navamsha|navamsa|marriage|relationship|partner|spouse|love|compatibility)\b/.test(q)) add('chart.varga.D9');
   if (/\b(d10|career|job|profession|business|work|promotion)\b/.test(q)) add('chart.varga.D10');
   if (/\b(dasha|dasa|mahadasha|antardasha|vimshottari|period|timing|when)\b/.test(q)) add('chart.dasha');
+  if (/\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/.test(q)) {
+    add('chart.varga.D8', 'chart.varga.D30', 'chart.dasha', 'chart.varga.D1', 'chart.graha', 'chart.bhava');
+  }
   if (/\b(transit|gochar|sun transit|current transit|today|now)\b/.test(q)) add('chart.transit', 'chart.transits', 'chart.gochar');
   if (/\b(yoga|yogas)\b/.test(q)) add('chart.yogas');
   if (/\b(ashtakavarga)\b/.test(q)) add('chart.ashtakavarga');
@@ -488,6 +601,21 @@ const PLANET_LABELS: Record<string, string> = {
   Ke: 'Ketu',
 };
 
+const RASHI_LORDS: Record<number, keyof typeof PLANET_LABELS> = {
+  1: 'Ma',
+  2: 'Ve',
+  3: 'Me',
+  4: 'Mo',
+  5: 'Su',
+  6: 'Me',
+  7: 'Ve',
+  8: 'Ma',
+  9: 'Ju',
+  10: 'Sa',
+  11: 'Sa',
+  12: 'Ju',
+};
+
 const RASHI_NAMES: Record<number, string> = {
   1: 'Aries',
   2: 'Taurus',
@@ -511,22 +639,109 @@ function rashiName(value: unknown): string {
   return String(value ?? 'unknown');
 }
 
+function parseTemporalWindow(question: string): { direction: TimeDirection; value?: number; unit?: TimeUnit; label?: string } {
+  const q = question.toLowerCase();
+
+  const explicitPast = q.match(/\b(?:last|past|previous|earlier|ago)\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b/);
+  if (explicitPast) {
+    const value = Number(explicitPast[1]);
+    const unit = explicitPast[2].replace(/s$/, '') as TimeUnit;
+    return { direction: 'past', value, unit, label: `past ${value} ${unit}${value === 1 ? '' : 's'}` };
+  }
+
+  const explicitFuture = q.match(/\b(?:next|upcoming|coming|in)\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)\b/);
+  if (explicitFuture) {
+    const value = Number(explicitFuture[1]);
+    const unit = explicitFuture[2].replace(/s$/, '') as TimeUnit;
+    return { direction: 'future', value, unit, label: `next ${value} ${unit}${value === 1 ? '' : 's'}` };
+  }
+
+  if (/\b(10|ten)\s+years?\s+ago\b/.test(q) || /\bpast\s+10\s+years?\b/.test(q) || /\blast\s+10\s+years?\b/.test(q)) {
+    return { direction: 'past', value: 10, unit: 'year', label: 'past 10 years' };
+  }
+
+  if (/\bnext\s+10\s+years?\b/.test(q) || /\bin\s+10\s+years?\b/.test(q)) {
+    return { direction: 'future', value: 10, unit: 'year', label: 'next 10 years' };
+  }
+
+  if (/\b(tomorrow|next week|next month|next year|upcoming|future|later|after)\b/.test(q)) {
+    return { direction: 'future', label: 'future-oriented' };
+  }
+
+  if (/\b(past|last|previous|earlier|before|history|retrospective|back then)\b/.test(q)) {
+    return { direction: 'past', label: 'past-oriented' };
+  }
+
+  return { direction: 'present', label: 'present' };
+}
+
 function classifyQuestionIntent(question: string): QuestionIntent {
   const q = question.toLowerCase();
   const flags = new Set<string>();
+  const topics = new Set<string>();
+  const temporal = parseTemporalWindow(question);
 
   if (/\b(d9|navamsha|navamsa)\b/.test(q)) flags.add('d9');
-  if (/\b(dasha|dasa|mahadasha|antardasha|vimshottari|period)\b/.test(q)) flags.add('dasha');
-  if (/\b(transit|gochar|current transit|current sun|sun transit|today|now)\b/.test(q)) flags.add('transit');
+  if (/\b(dasha|dasa|mahadasha|antardasha|vimshottari|period|timing|timeline|when)\b/.test(q)) flags.add('dasha');
+  if (/\b(transit|gochar|current transit|current sun|sun transit|today|now|tomorrow|next week|next month|next year|future|past|last|previous|ago)\b/.test(q)) flags.add('transit');
 
-  if (/\b(career|job|profession|business|promotion|work)\b/.test(q)) flags.add('career');
-  if (/\b(marriage|relationship|partner|spouse|love|compatibility)\b/.test(q)) flags.add('relationship');
-  if (/\b(wealth|money|income|finance|assets|property)\b/.test(q)) flags.add('finance');
-  if (/\b(health|disease|illness|medical)\b/.test(q)) flags.add('health');
+  if (/\b(career|job|profession|business|promotion|work|office|employment|salary|resume|interview)\b/.test(q)) {
+    flags.add('career');
+    topics.add('career');
+  }
+  if (/\b(marriage|relationship|partner|spouse|love|compatibility|romance|dating)\b/.test(q)) {
+    flags.add('relationship');
+    topics.add('relationship');
+  }
+  if (/\b(wealth|money|income|finance|assets|property|investment|profits|revenue)\b/.test(q)) {
+    flags.add('finance');
+    topics.add('finance');
+  }
+  if (/\b(health|disease|illness|medical|surgery|recovery|fitness|stress)\b/.test(q)) {
+    flags.add('health');
+    topics.add('health');
+  }
+  if (/\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/.test(q)) {
+    flags.add('longevity');
+    flags.add('timing');
+    topics.add('health');
+  }
+  if (/\b(education|study|studies|exam|exams|degree|college|school|learning|research)\b/.test(q)) {
+    topics.add('education');
+  }
+  if (/\b(children|child|kids|pregnancy|pregnant|pregnancy)\b/.test(q)) {
+    topics.add('children');
+  }
+  if (/\b(property|house|home|land|real estate|vehicle|car|asset)\b/.test(q)) {
+    topics.add('property');
+  }
+  if (/\b(travel|traveling|foreign|abroad|visa|relocation|migration|move)\b/.test(q)) {
+    topics.add('travel');
+  }
+  if (/\b(spiritual|spirituality|moksha|meditation|religion|faith|guru)\b/.test(q)) {
+    topics.add('spirituality');
+  }
+  if (/\b(communication|writing|speech|speaking|media|marketing|technology|coding|tech)\b/.test(q)) {
+    topics.add('communication');
+  }
+
+  if (temporal.direction !== 'present') {
+    flags.add('timing');
+  }
+
+  if (topics.has('career') && temporal.direction !== 'present') {
+    flags.add('career_timing');
+  }
+
+  if (temporal.direction === 'future') {
+    flags.add('forecast');
+  } else if (temporal.direction === 'past') {
+    flags.add('history');
+  }
 
   const primary: IntentPrimary = flags.has('d9')
     ? 'd9'
-    : flags.has('dasha')
+    : flags.has('dasha') || flags.has('timing') || topics.has('career') || topics.has('finance') || topics.has('education')
       ? 'dasha'
       : flags.has('transit')
         ? 'transit'
@@ -535,7 +750,175 @@ function classifyQuestionIntent(question: string): QuestionIntent {
   return {
     primary,
     flags: [...flags],
+    topics: [...topics],
+    timeDirection: temporal.direction,
+    timeValue: temporal.value,
+    timeUnit: temporal.unit,
+    timeLabel: temporal.label,
   };
+}
+
+function determineQuestionFamily(question: string, intent: QuestionIntent): QuestionFamily {
+  const q = question.toLowerCase();
+
+  if (intent.flags.includes('longevity') || /\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/.test(q)) {
+    return 'longevity';
+  }
+
+  if (intent.flags.includes('career') || intent.flags.includes('career_timing') || /\b(career|job|profession|business|work|promotion)\b/.test(q)) {
+    return 'career';
+  }
+  if (/\b(marriage|spouse|compatibility|wedding)\b/.test(q)) {
+    return 'marriage';
+  }
+  if (intent.flags.includes('relationship') || /\b(relationship|love|romance|dating|partner)\b/.test(q)) {
+    return 'relationship';
+  }
+  if (intent.flags.includes('finance') || /\b(wealth|money|income|finance|investment|assets)\b/.test(q)) {
+    return 'finance';
+  }
+  if (intent.flags.includes('health') || /\b(health|disease|illness|medical|recovery|fitness)\b/.test(q)) {
+    return 'health';
+  }
+  if (intent.topics.includes('education')) return 'education';
+  if (intent.topics.includes('children')) return 'children';
+  if (intent.topics.includes('property')) return 'property';
+  if (intent.topics.includes('travel')) return 'travel';
+  if (intent.topics.includes('spirituality')) return 'spirituality';
+  if (intent.flags.includes('dasha') || intent.flags.includes('transit') || intent.flags.includes('timing')) return 'timing';
+  if (/\b(yoga|yogas|raja yoga|mahapurusha)\b/.test(q)) return 'yoga';
+  if (/\b(family|father|mother|siblings|parents)\b/.test(q)) return 'family';
+
+  return 'general';
+}
+
+function buildDynamicExecutionPlan(question: string, intent: QuestionIntent, mode: AgentMode): DynamicExecutionPlan {
+  const family = determineQuestionFamily(question, intent);
+  const chartLayers = new Set<ChartLayer>(['D1']);
+
+  if (family === 'marriage' || family === 'relationship') chartLayers.add('D9');
+  if (family === 'career') chartLayers.add('D10');
+  if (family === 'children') chartLayers.add('D7');
+  if (family === 'property') chartLayers.add('D4');
+  if (family === 'travel') chartLayers.add('D12');
+  if (family === 'spirituality') chartLayers.add('D20');
+  if (family === 'longevity') {
+    chartLayers.add('D8');
+    chartLayers.add('D30');
+  }
+  if (intent.flags.includes('d9')) chartLayers.add('D9');
+
+  const includeTiming = intent.flags.includes('timing') || intent.flags.includes('dasha') || intent.flags.includes('transit') || family === 'timing' || family === 'longevity';
+  const includeTransit = mode === 'pro' && (intent.flags.includes('transit') || includeTiming);
+  const dashaDrivenFamilies = new Set<QuestionFamily>(['career', 'marriage', 'longevity', 'health', 'timing']);
+  const includeDasha = mode === 'pro' && (intent.flags.includes('dasha') || includeTiming || dashaDrivenFamilies.has(family));
+  const includeCareer = family === 'career' && mode === 'pro';
+  const includeRelationship = family === 'marriage' || family === 'relationship';
+
+  const includeMicroSignals: MicroSignal[] = ['nakshatra', 'nakshatra_lord', 'sign_lord', 'drishti', 'degree'];
+
+  const seriesNodes = ['load_grounding', 'classify_intent', 'plan_execution', 'run_specialized_tools', 'run_general_tools', 'build_prompt', 'answer_with_deepseek', 'condense_answer'];
+  const parallelBatches = [
+    ['atlas', 'varga', 'placement'],
+    [includeDasha ? 'dasha' : '', includeTransit ? 'transit' : '', includeCareer ? 'career' : ''].filter(Boolean),
+    ['nakshatra', 'lordship', 'drishti_degree'],
+  ].filter((batch) => batch.length > 0);
+
+  return {
+    family,
+    chartLayers: [...chartLayers],
+    includeTiming,
+    includeTransit,
+    includeDasha,
+    includeCareer,
+    includeRelationship,
+    includeMicroSignals,
+    seriesNodes,
+    parallelBatches,
+  };
+}
+
+function appendStage(state: AgentStateType, id: string, label: string, details?: string): AnalysisStage[] {
+  const stages = state.analysisStages ?? [];
+  const stage: AnalysisStage = { id, label, status: 'completed', details };
+  if (state.stageReporter) {
+    try {
+      state.stageReporter(stage);
+    } catch {
+      // best effort stage emission; never break analysis flow
+    }
+  }
+  return [...stages, stage];
+}
+
+function mergeFindings(existing: ToolFinding[], incoming: ToolFinding[]): ToolFinding[] {
+  const rank: Record<ToolFinding['status'], number> = {
+    ok: 3,
+    partial: 2,
+    unavailable: 1,
+  };
+
+  const merged = new Map<string, ToolFinding>();
+
+  for (const finding of existing) {
+    merged.set(finding.name, finding);
+  }
+
+  for (const finding of incoming) {
+    const current = merged.get(finding.name);
+    if (!current || rank[finding.status] >= rank[current.status]) {
+      merged.set(finding.name, finding);
+    }
+  }
+
+  return [...merged.values()];
+}
+
+function getFindingStatus(findings: ToolFinding[], name: string): ToolFinding['status'] | null {
+  const found = findings.find((f) => f.name === name);
+  return found?.status ?? null;
+}
+
+function isCoverageWeak(status: ToolFinding['status'] | null, strict = false): boolean {
+  if (status === null) return true;
+  if (status === 'unavailable') return true;
+  if (strict && status === 'partial') return true;
+  return false;
+}
+
+function determineCoverageGaps(state: AgentStateType): CoverageGap[] {
+  const executionPlan = state.executionPlan ?? (state.intent ? buildDynamicExecutionPlan(state.question, state.intent, state.mode) : null);
+  if (!executionPlan) return [];
+
+  const findings = state.toolFindings ?? [];
+  const strict = (state.toolIteration ?? 0) === 0;
+  const gaps = new Set<CoverageGap>();
+
+  if (isCoverageWeak(getFindingStatus(findings, 'Varga analyzer'), strict)) {
+    gaps.add('varga');
+  }
+
+  if ((executionPlan.chartLayers.includes('D9') || state.intent?.primary === 'd9') && isCoverageWeak(getFindingStatus(findings, 'D9 analyzer'), strict)) {
+    gaps.add('d9');
+  }
+
+  if (executionPlan.includeDasha && isCoverageWeak(getFindingStatus(findings, 'Dasha analyzer'), strict)) {
+    gaps.add('dasha');
+  }
+
+  if (executionPlan.includeTransit && isCoverageWeak(getFindingStatus(findings, 'Transit analyzer'), strict)) {
+    gaps.add('transit');
+  }
+
+  if (executionPlan.includeCareer && isCoverageWeak(getFindingStatus(findings, 'Career analyzer'), strict)) {
+    gaps.add('career');
+  }
+
+  if (executionPlan.family === 'longevity' && isCoverageWeak(getFindingStatus(findings, 'Longevity analyzer'), strict)) {
+    gaps.add('longevity');
+  }
+
+  return [...gaps];
 }
 
 function planetPathHints(question: string): string[] {
@@ -562,7 +945,7 @@ function planetPathHints(question: string): string[] {
   return hints;
 }
 
-function selectRelevantPaths(question: string, flags: string[] = []): string[] {
+function selectRelevantPaths(question: string, flags: string[] = [], mode: AgentMode = 'pro'): string[] {
   const q = question.toLowerCase();
   const paths = new Set<string>([
     'chart.user',
@@ -590,13 +973,63 @@ function selectRelevantPaths(question: string, flags: string[] = []): string[] {
   if (flags.includes('transit')) add('chart.transit', 'chart.transits', 'chart.gochar');
   if (flags.includes('career')) add('chart.varga.D10');
   if (flags.includes('relationship')) add('chart.varga.D9');
+  if (flags.includes('longevity')) add('chart.varga.D8', 'chart.varga.D30', 'chart.dasha', 'chart.bhava');
+
+  if (/\b(career|job|profession|business|promotion|work|employment|salary|interview|office)\b/.test(q)) {
+    add('chart.varga.D10', 'chart.varga.D1', 'chart.varga.D11');
+  }
+  if (/\b(marriage|relationship|partner|spouse|love|compatibility|romance|dating)\b/.test(q)) {
+    add('chart.varga.D9', 'chart.varga.D1', 'chart.varga.D7');
+  }
+  if (/\b(wealth|money|income|finance|assets|property|investment|profits|revenue)\b/.test(q)) {
+    add('chart.varga.D2', 'chart.varga.D11', 'chart.varga.D4');
+  }
+  if (/\b(education|study|studies|exam|exams|degree|college|school|learning|research)\b/.test(q)) {
+    add('chart.varga.D24', 'chart.varga.D4', 'chart.varga.D1');
+  }
+  if (/\b(children|child|kids|pregnancy|pregnant)\b/.test(q)) {
+    add('chart.varga.D7', 'chart.varga.D5', 'chart.varga.D1');
+  }
+  if (/\b(property|house|home|land|real estate|vehicle|car|asset)\b/.test(q)) {
+    add('chart.varga.D4', 'chart.varga.D2', 'chart.varga.D11');
+  }
+  if (/\b(travel|foreign|abroad|visa|relocation|migration|move)\b/.test(q)) {
+    add('chart.varga.D12', 'chart.varga.D9', 'chart.varga.D1');
+  }
+  if (/\b(spiritual|spirituality|moksha|meditation|religion|faith|guru)\b/.test(q)) {
+    add('chart.varga.D20', 'chart.varga.D9', 'chart.varga.D1');
+  }
+  if (/\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/.test(q)) {
+    add('chart.varga.D8', 'chart.varga.D30', 'chart.dasha', 'chart.varga.D1', 'chart.graha', 'chart.bhava');
+  }
+  if (/\b(communication|writing|speech|speaking|media|marketing|technology|coding|tech)\b/.test(q)) {
+    add('chart.varga.D1', 'chart.varga.D10', 'chart.varga.D2');
+  }
 
   add(...planetPathHints(question));
+
+  if (mode === 'mini') {
+    return [...paths].filter((path) => {
+      if (
+        path === 'chart.user' ||
+        path === 'chart.graha' ||
+        path === 'chart.lagna' ||
+        path === 'chart.houses' ||
+        path === 'chart.bhava' ||
+        path === 'chart.panchanga' ||
+        path === 'chart.yogas'
+      ) {
+        return true;
+      }
+      return path.startsWith('chart.varga.D1') || path.startsWith('chart.varga.D9');
+    });
+  }
+
   return [...paths];
 }
 
-function selectSections(rawPayload: unknown, question: string, flags: string[] = []): SelectedSection[] {
-  const selectedPaths = selectRelevantPaths(question, flags);
+function selectSections(rawPayload: unknown, question: string, flags: string[] = [], mode: AgentMode = 'pro'): SelectedSection[] {
+  const selectedPaths = selectRelevantPaths(question, flags, mode);
   return selectedPaths
     .map((path) => ({ path, value: getByPath(rawPayload, path) }))
     .filter((section) => section.value !== undefined);
@@ -628,8 +1061,9 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
 
   const rawPayload = normalizeRawPayload(sourceDoc.data.rawPayload);
   const atlas = summarizeChartAtlas(rawPayload);
-  const selectedSections = selectSections(rawPayload, state.question, []);
+  const selectedSections = selectSections(rawPayload, state.question, [], state.mode);
   const fallbackSections = selectedSections.length > 0 ? selectedSections : atlas.slice(0, 12).map((item) => ({ path: item.path, value: getByPath(rawPayload, item.path) }));
+  const kundli = state.kundliInput ?? profileDoc.data.kundliInput;
 
   return {
     grounding: {
@@ -638,6 +1072,7 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
       sourceDocId: profileDoc.data.latestSourceDocId,
       chartVersion: profileDoc.data.chartVersion,
       kundliSignature: profileDoc.data.kundliSignature,
+      kundli,
       requestKey: sourceDoc.data.requestKey,
       payloadHash: sourceDoc.data.payloadHash,
       referenceTimestamp: state.referenceTimestamp ?? Date.now(),
@@ -662,6 +1097,7 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
       evidencePaths: atlas.slice(0, 24).map((item) => item.path),
       snippets: atlas.slice(0, 18).map((item) => `${item.path}: ${item.summary}`),
     }],
+    analysisStages: appendStage(state, 'load_grounding', 'Analyzing canonical chart payload', `Selected ${fallbackSections.length} canonical section(s).`),
   };
 }
 
@@ -757,6 +1193,102 @@ function makeFeatureToolFinding(rawPayload: unknown): ToolFinding {
     facts,
     evidencePaths: sections.map((section) => section.path),
     snippets: sections.map((section) => truncateText(JSON.stringify(section.value, null, 2), 1200)),
+  };
+}
+
+function makeNakshatraLordToolFinding(rawPayload: unknown): ToolFinding {
+  const grahaSection = getFirstPathValue(rawPayload, ['chart.graha', 'chart.varga.D1.graha', 'graha']);
+  if (!grahaSection || !isPlainObject(grahaSection.value)) {
+    return {
+      name: 'Nakshatra/lord analyzer',
+      status: 'unavailable',
+      facts: ['Nakshatra-level planetary data is not available in the canonical payload.'],
+      evidencePaths: [],
+      missing: ['chart.graha'],
+    };
+  }
+
+  const facts: string[] = [];
+  for (const [code, data] of Object.entries(grahaSection.value as Record<string, unknown>)) {
+    if (!isPlainObject(data)) continue;
+    const nakshatra = data.nakshatra ?? data.nakshatra_name;
+    const nakshatraLord = data.nakshatra_lord ?? data.star_lord;
+    const sign = rashiName(data.rashi);
+    const signLord = data.sign_lord ?? data.rashi_lord;
+    if (nakshatra || nakshatraLord || signLord) {
+      facts.push(
+        `${PLANET_LABELS[code] ?? code}: ${nakshatra ? `nakshatra ${String(nakshatra)}` : 'nakshatra n/a'}${nakshatraLord ? ` (lord ${String(nakshatraLord)})` : ''}, sign ${sign}${signLord ? ` (lord ${String(signLord)})` : ''}.`
+      );
+    }
+  }
+
+  if (facts.length === 0) {
+    return {
+      name: 'Nakshatra/lord analyzer',
+      status: 'partial',
+      facts: ['Planet entries exist but nakshatra or lord fields are missing in this payload shape.'],
+      evidencePaths: [grahaSection.path],
+      snippets: [truncateText(JSON.stringify(grahaSection.value, null, 2), 1200)],
+    };
+  }
+
+  return {
+    name: 'Nakshatra/lord analyzer',
+    status: 'ok',
+    facts,
+    evidencePaths: [grahaSection.path],
+    snippets: [truncateText(JSON.stringify(grahaSection.value, null, 2), 1600)],
+  };
+}
+
+function makeDrishtiDegreeToolFinding(rawPayload: unknown): ToolFinding {
+  const grahaSection = getFirstPathValue(rawPayload, ['chart.graha', 'chart.varga.D1.graha', 'graha']);
+  if (!grahaSection || !isPlainObject(grahaSection.value)) {
+    return {
+      name: 'Drishti/degree analyzer',
+      status: 'unavailable',
+      facts: ['Planetary drishti/degree details are not available in the canonical payload.'],
+      evidencePaths: [],
+      missing: ['chart.graha'],
+    };
+  }
+
+  const graha = grahaSection.value as Record<string, unknown>;
+  const facts: string[] = [];
+
+  for (const [code, data] of Object.entries(graha)) {
+    if (!isPlainObject(data)) continue;
+    const degree = data.degree;
+    const drishti = data.drishti ?? data.aspects;
+    if (degree !== undefined) {
+      facts.push(`${PLANET_LABELS[code] ?? code}: degree ${formatNumber(degree)}°, sign ${rashiName(data.rashi)}${data.house_number !== undefined ? `, house ${String(data.house_number)}` : ''}.`);
+    }
+    if (drishti) {
+      facts.push(`${PLANET_LABELS[code] ?? code}: drishti/aspects ${formatValue(drishti)}.`);
+    }
+  }
+
+  const entries = Object.entries(graha)
+    .map(([code, data]) => ({
+      code,
+      longitude: isPlainObject(data) ? Number(data.longitude ?? data.degree) : Number.NaN,
+    }))
+    .filter((item) => Number.isFinite(item.longitude));
+
+  entries.sort((a, b) => a.longitude - b.longitude);
+  for (let i = 0; i < entries.length - 1; i += 1) {
+    const diff = Math.abs(entries[i + 1].longitude - entries[i].longitude);
+    if (diff <= 5) {
+      facts.push(`Degree-closeness: ${(PLANET_LABELS[entries[i].code] ?? entries[i].code)} and ${(PLANET_LABELS[entries[i + 1].code] ?? entries[i + 1].code)} within ${diff.toFixed(2)}°.`);
+    }
+  }
+
+  return {
+    name: 'Drishti/degree analyzer',
+    status: facts.length > 0 ? 'ok' : 'partial',
+    facts: facts.length > 0 ? facts : ['Planetary entries found, but no drishti/degree-rich details could be extracted.'],
+    evidencePaths: [grahaSection.path],
+    snippets: [truncateText(JSON.stringify(grahaSection.value, null, 2), 1800)],
   };
 }
 
@@ -912,6 +1444,211 @@ function makeReferenceTimeToolFinding(referenceTimestamp: number, source: TimeSo
       `Reference ISO: ${Number.isNaN(dt.getTime()) ? 'invalid' : dt.toISOString()}.`,
     ],
     evidencePaths: [],
+  };
+}
+
+function resolveAnalysisTimestamp(referenceTimestamp: number, intent: QuestionIntent | null): number {
+  const baseTimestamp = Number.isFinite(referenceTimestamp) ? referenceTimestamp : Date.now();
+  if (!intent || intent.timeDirection === 'present' || intent.timeValue === undefined || !intent.timeUnit) {
+    return baseTimestamp;
+  }
+
+  const date = new Date(baseTimestamp);
+  const amount = intent.timeValue;
+  const multiplier = intent.timeDirection === 'past' ? -1 : 1;
+
+  switch (intent.timeUnit) {
+    case 'day':
+      date.setDate(date.getDate() + amount * multiplier);
+      break;
+    case 'week':
+      date.setDate(date.getDate() + amount * 7 * multiplier);
+      break;
+    case 'month':
+      date.setMonth(date.getMonth() + amount * multiplier);
+      break;
+    case 'year':
+      date.setFullYear(date.getFullYear() + amount * multiplier);
+      break;
+  }
+
+  return date.getTime();
+}
+
+function makeCareerToolFinding(rawPayload: unknown, question: string, analysisTimestamp: number): ToolFinding {
+  const d10 = getFirstPathValue(rawPayload, ['chart.varga.D10', 'varga.D10']);
+  const d1 = getFirstPathValue(rawPayload, ['chart.varga.D1', 'varga.D1']);
+  const dashaSection = getFirstPathValue(rawPayload, ['chart.dasha', 'dasha']);
+
+  if (!d10 && !d1 && !dashaSection) {
+    return {
+      name: 'Career analyzer',
+      status: 'unavailable',
+      facts: ['Career-focused charts (D10/D1/dasha) are not present in the canonical payload.'],
+      evidencePaths: [],
+      missing: ['chart.varga.D10', 'chart.varga.D1', 'chart.dasha'],
+    };
+  }
+
+  const facts: string[] = [];
+
+  if (analysisTimestamp) {
+    facts.push(`Career time window evaluated at ${new Date(analysisTimestamp).toISOString()}.`);
+  }
+
+  if (d10) {
+    const d10Value = d10.value as Record<string, unknown>;
+    const lagna = getByPath(d10Value, 'lagna.Lg') ?? getByPath(d10Value, 'lagna');
+    const graha = getByPath(d10Value, 'graha');
+    const bhava = getByPath(d10Value, 'bhava');
+
+    if (lagna) facts.push(`D10 Lagna: ${formatPlacement(lagna)}.`);
+
+    const keyCareerPlanets = ['Su', 'Me', 'Ju', 'Sa', 'Ra'];
+    if (isPlainObject(graha)) {
+      for (const code of keyCareerPlanets) {
+        const planet = (graha as Record<string, unknown>)[code];
+        if (!planet) continue;
+        const label = PLANET_LABELS[code] ?? code;
+        facts.push(`${label} in D10: ${formatPlacement(planet)}.`);
+      }
+    }
+
+    if (isPlainObject(bhava)) {
+      const tenthHouse = (bhava as Record<string, unknown>)['10'];
+      const sixthHouse = (bhava as Record<string, unknown>)['6'];
+      const eleventhHouse = (bhava as Record<string, unknown>)['11'];
+      if (tenthHouse) facts.push(`10th house focus in D10: ${formatPlacement(tenthHouse)}.`);
+      if (sixthHouse) facts.push(`6th house work/service focus in D10: ${formatPlacement(sixthHouse)}.`);
+      if (eleventhHouse) facts.push(`11th house gains/networking focus in D10: ${formatPlacement(eleventhHouse)}.`);
+    }
+  }
+
+  if (d1) {
+    const d1Value = d1.value as Record<string, unknown>;
+    const sun = getByPath(d1Value, 'graha.Su');
+    const mercury = getByPath(d1Value, 'graha.Me');
+    const saturn = getByPath(d1Value, 'graha.Sa');
+    const jupiter = getByPath(d1Value, 'graha.Ju');
+    if (sun) facts.push(`Sun in D1: ${formatPlacement(sun)}.`);
+    if (mercury) facts.push(`Mercury in D1: ${formatPlacement(mercury)}.`);
+    if (saturn) facts.push(`Saturn in D1: ${formatPlacement(saturn)}.`);
+    if (jupiter) facts.push(`Jupiter in D1: ${formatPlacement(jupiter)}.`);
+  }
+
+  if (dashaSection) {
+    facts.push(`Dasha timeline available for ${question.toLowerCase().includes('past') ? 'retrospective' : 'career timing'} analysis.`);
+  }
+
+  return {
+    name: 'Career analyzer',
+    status: 'ok',
+    facts,
+    evidencePaths: [
+      ...(d10 ? [d10.path] : []),
+      ...(d1 ? [d1.path] : []),
+      ...(dashaSection ? [dashaSection.path] : []),
+    ],
+    snippets: [
+      ...(d10 ? [truncateText(JSON.stringify(d10.value, null, 2), 2000)] : []),
+      ...(dashaSection ? [truncateText(JSON.stringify(dashaSection.value, null, 2), 1600)] : []),
+    ],
+  };
+}
+
+function makeLongevityToolFinding(rawPayload: unknown, referenceTimestamp: number): ToolFinding {
+  const d1Section = getFirstPathValue(rawPayload, ['chart.varga.D1', 'varga.D1']);
+  const d8Section = getFirstPathValue(rawPayload, ['chart.varga.D8', 'varga.D8']);
+  const d30Section = getFirstPathValue(rawPayload, ['chart.varga.D30', 'varga.D30']);
+  const dashaSection = getFirstPathValue(rawPayload, ['chart.dasha', 'dasha']);
+
+  if (!d1Section && !d8Section && !dashaSection) {
+    return {
+      name: 'Longevity analyzer',
+      status: 'unavailable',
+      facts: ['Longevity-relevant sections (D1/D8/dasha) are not present in the canonical payload.'],
+      evidencePaths: [],
+      missing: ['chart.varga.D1', 'chart.varga.D8', 'chart.dasha'],
+    };
+  }
+
+  const facts: string[] = [];
+  const evidencePaths: string[] = [];
+
+  if (d1Section) {
+    evidencePaths.push(d1Section.path);
+    const d1 = d1Section.value as Record<string, unknown>;
+    const lagna = (getByPath(d1, 'lagna.Lg') ?? getByPath(d1, 'lagna')) as Record<string, unknown> | undefined;
+    const bhava = getByPath(d1, 'bhava') as Record<string, unknown> | undefined;
+    const graha = getByPath(d1, 'graha') as Record<string, unknown> | undefined;
+
+    if (lagna) {
+      facts.push(`D1 Lagna vitality baseline: ${formatPlacement(lagna)}.`);
+      const lagnaRashi = Number(lagna.rashi);
+      const lagnaLord = RASHI_LORDS[lagnaRashi];
+      if (lagnaLord && graha?.[lagnaLord]) {
+        facts.push(`Lagna lord (${PLANET_LABELS[lagnaLord]}) in D1: ${formatPlacement(graha[lagnaLord])}.`);
+      }
+    }
+
+    const eighthHouse = bhava?.['8'];
+    const secondHouse = bhava?.['2'];
+    const seventhHouse = bhava?.['7'];
+    if (eighthHouse) {
+      facts.push(`D1 8th-house (longevity axis): ${formatPlacement(eighthHouse)}.`);
+      const eighthRashi = Number((eighthHouse as Record<string, unknown>).rashi);
+      const eighthLord = RASHI_LORDS[eighthRashi];
+      if (eighthLord && graha?.[eighthLord]) {
+        facts.push(`8th-house lord (${PLANET_LABELS[eighthLord]}) in D1: ${formatPlacement(graha[eighthLord])}.`);
+      }
+    }
+    if (secondHouse) facts.push(`D1 maraka house (2nd): ${formatPlacement(secondHouse)}.`);
+    if (seventhHouse) facts.push(`D1 maraka house (7th): ${formatPlacement(seventhHouse)}.`);
+
+    if (graha?.Sa) facts.push(`Saturn in D1: ${formatPlacement(graha.Sa)}.`);
+    if (graha?.Ra) facts.push(`Rahu in D1: ${formatPlacement(graha.Ra)}.`);
+    if (graha?.Ke) facts.push(`Ketu in D1: ${formatPlacement(graha.Ke)}.`);
+  }
+
+  if (d8Section) {
+    evidencePaths.push(d8Section.path);
+    const d8 = d8Section.value as Record<string, unknown>;
+    const d8Lagna = getByPath(d8, 'lagna.Lg') ?? getByPath(d8, 'lagna');
+    const d8Graha = getByPath(d8, 'graha') as Record<string, unknown> | undefined;
+    if (d8Lagna) facts.push(`D8 Lagna: ${formatPlacement(d8Lagna)}.`);
+    if (d8Graha?.Sa) facts.push(`Saturn in D8: ${formatPlacement(d8Graha.Sa)}.`);
+    if (d8Graha?.Ma) facts.push(`Mars in D8: ${formatPlacement(d8Graha.Ma)}.`);
+    if (d8Graha?.Ra) facts.push(`Rahu in D8: ${formatPlacement(d8Graha.Ra)}.`);
+    if (d8Graha?.Ke) facts.push(`Ketu in D8: ${formatPlacement(d8Graha.Ke)}.`);
+  }
+
+  if (d30Section) {
+    evidencePaths.push(d30Section.path);
+    const d30 = d30Section.value as Record<string, unknown>;
+    const d30Lagna = getByPath(d30, 'lagna.Lg') ?? getByPath(d30, 'lagna');
+    if (d30Lagna) facts.push(`D30 stress/suffering profile Lagna: ${formatPlacement(d30Lagna)}.`);
+  }
+
+  if (dashaSection) {
+    evidencePaths.push(dashaSection.path);
+    const dashaFinding = makeDashaToolFinding(rawPayload, referenceTimestamp);
+    facts.push(...dashaFinding.facts.slice(0, 4));
+  }
+
+  if (facts.length > 0) {
+    facts.push('Longevity note: provide risk profile and health trajectory windows, not exact death timing.');
+  }
+
+  return {
+    name: 'Longevity analyzer',
+    status: facts.length > 0 ? 'ok' : 'partial',
+    facts: facts.length > 0 ? facts : ['Longevity sections detected but could not extract structured markers.'],
+    evidencePaths,
+    snippets: [
+      ...(d1Section ? [truncateText(JSON.stringify(d1Section.value, null, 2), 1800)] : []),
+      ...(d8Section ? [truncateText(JSON.stringify(d8Section.value, null, 2), 1800)] : []),
+      ...(dashaSection ? [truncateText(JSON.stringify(dashaSection.value, null, 2), 1400)] : []),
+    ],
   };
 }
 
@@ -1087,8 +1824,24 @@ function makeArudhaToolFinding(rawPayload: unknown): ToolFinding {
 }
 
 async function classifyIntentNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const intent = classifyQuestionIntent(state.question);
   return {
-    intent: classifyQuestionIntent(state.question),
+    intent,
+    analysisStages: appendStage(state, 'classify_intent', 'Classifying user question intent', `Primary=${intent.primary}; flags=${intent.flags.join(',') || 'none'}`),
+  };
+}
+
+async function planExecutionNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const intent = state.intent ?? classifyQuestionIntent(state.question);
+  const executionPlan = buildDynamicExecutionPlan(state.question, intent, state.mode);
+  return {
+    executionPlan,
+    analysisStages: appendStage(
+      state,
+      'plan_execution',
+      'Planning dynamic analysis path',
+      `Family=${executionPlan.family}; layers=${executionPlan.chartLayers.join(',')}; parallelBatches=${executionPlan.parallelBatches.length}`
+    ),
   };
 }
 
@@ -1096,23 +1849,58 @@ async function runSpecializedToolsNode(state: AgentStateType): Promise<AgentUpda
   const grounding = state.grounding;
   if (!grounding) throw new Error('Grounding context missing before specialized tools stage.');
   const intent = state.intent ?? classifyQuestionIntent(state.question);
+  const executionPlan = state.executionPlan ?? buildDynamicExecutionPlan(state.question, intent, state.mode);
+  const analysisTimestamp = resolveAnalysisTimestamp(grounding.referenceTimestamp, intent);
+  const isMini = state.mode === 'mini';
 
-  const findings: ToolFinding[] = [];
-  findings.push(makeReferenceTimeToolFinding(grounding.referenceTimestamp, grounding.referenceTimeSource));
-  findings.push(makeAtlasToolFinding(grounding.rawPayload));
-  findings.push(makeVargaToolFinding(grounding.rawPayload, state.question));
-  if (/\b(arudha|aruda)\b/i.test(state.question)) findings.push(makeArudhaToolFinding(grounding.rawPayload));
+  const includeTransit = executionPlan.includeTransit;
+  const includeD9 = executionPlan.chartLayers.includes('D9') || intent.flags.includes('d9') || intent.primary === 'd9';
+  const includeDasha = executionPlan.includeDasha;
+  const includePlacement = intent.flags.includes('relationship') || intent.flags.includes('career') || intent.flags.includes('health') || intent.flags.includes('finance') || executionPlan.family !== 'general';
+  const includeCareer = executionPlan.includeCareer || intent.topics.includes('career') || intent.flags.includes('career') || intent.flags.includes('career_timing');
+  const includeLongevity = executionPlan.family === 'longevity' || intent.flags.includes('longevity');
 
-  if (intent.flags.includes('d9') || intent.primary === 'd9') findings.push(makeD9ToolFinding(grounding.rawPayload, state.question));
-  if (intent.flags.includes('dasha') || intent.primary === 'dasha') findings.push(makeDashaToolFinding(grounding.rawPayload, grounding.referenceTimestamp));
-  if (intent.flags.includes('transit') || intent.primary === 'transit') findings.push(makeTransitToolFinding(grounding.rawPayload));
+  const baseTasks: Array<Promise<ToolFinding | null>> = [
+    Promise.resolve(makeReferenceTimeToolFinding(grounding.referenceTimestamp, grounding.referenceTimeSource)),
+    Promise.resolve(makeAtlasToolFinding(grounding.rawPayload)),
+    Promise.resolve(makeVargaToolFinding(grounding.rawPayload, state.question, state.mode)),
+  ];
 
-  if (intent.flags.includes('relationship') || intent.flags.includes('career') || intent.flags.includes('health') || intent.flags.includes('finance')) {
-    findings.push(makePlacementToolFinding(grounding.rawPayload, state.question));
-  }
+  const domainTasks: Array<Promise<ToolFinding | null>> = [
+    /\b(arudha|aruda)\b/i.test(state.question) && !isMini ? Promise.resolve(makeArudhaToolFinding(grounding.rawPayload)) : Promise.resolve(null),
+    includeD9 ? Promise.resolve(makeD9ToolFinding(grounding.rawPayload, state.question)) : Promise.resolve(null),
+    includeDasha && !isMini ? Promise.resolve(makeDashaToolFinding(grounding.rawPayload, analysisTimestamp)) : Promise.resolve(null),
+    includeTransit
+      && !isMini
+      ? buildTransitToolFinding({ kundli: grounding.kundli, question: state.question, referenceTimestamp: grounding.referenceTimestamp })
+      : Promise.resolve(null),
+    includeCareer && !isMini ? Promise.resolve(makeCareerToolFinding(grounding.rawPayload, state.question, analysisTimestamp)) : Promise.resolve(null),
+    includeLongevity && !isMini ? Promise.resolve(makeLongevityToolFinding(grounding.rawPayload, grounding.referenceTimestamp)) : Promise.resolve(null),
+    includePlacement ? Promise.resolve(makePlacementToolFinding(grounding.rawPayload, state.question)) : Promise.resolve(null),
+  ];
+
+  const microSignalTasks: Array<Promise<ToolFinding | null>> = [
+    executionPlan.includeMicroSignals.includes('nakshatra') || executionPlan.includeMicroSignals.includes('nakshatra_lord') || executionPlan.includeMicroSignals.includes('sign_lord')
+      ? Promise.resolve(makeNakshatraLordToolFinding(grounding.rawPayload))
+      : Promise.resolve(null),
+    executionPlan.includeMicroSignals.includes('drishti') || executionPlan.includeMicroSignals.includes('degree')
+      ? Promise.resolve(makeDrishtiDegreeToolFinding(grounding.rawPayload))
+      : Promise.resolve(null),
+  ];
+
+  const batch1 = (await Promise.all(baseTasks)).filter((item): item is ToolFinding => Boolean(item));
+  const batch2 = (await Promise.all(domainTasks)).filter((item): item is ToolFinding => Boolean(item));
+  const batch3 = (await Promise.all(microSignalTasks)).filter((item): item is ToolFinding => Boolean(item));
+  const findings = mergeFindings(state.toolFindings ?? [], [...batch1, ...batch2, ...batch3]);
 
   return {
-    toolFindings: [...(state.toolFindings ?? []), ...findings],
+    toolFindings: findings,
+    analysisStages: appendStage(
+      state,
+      'run_specialized_tools',
+      'Running specialized analyzers',
+      `Completed ${executionPlan.parallelBatches.length} parallel batch group(s); findings=${findings.length}`
+    ),
   };
 }
 
@@ -1120,39 +1908,154 @@ async function runGeneralToolsNode(state: AgentStateType): Promise<AgentUpdateTy
   const grounding = state.grounding;
   if (!grounding) throw new Error('Grounding context missing before general tools stage.');
   const intent = state.intent ?? classifyQuestionIntent(state.question);
+  const executionPlan = state.executionPlan ?? buildDynamicExecutionPlan(state.question, intent, state.mode);
+  const analysisTimestamp = resolveAnalysisTimestamp(grounding.referenceTimestamp, intent);
+  const isMini = state.mode === 'mini';
 
-  const findings = [...(state.toolFindings ?? [])];
-  findings.push(makeReferenceTimeToolFinding(grounding.referenceTimestamp, grounding.referenceTimeSource));
-  findings.push(makeGeneralToolFinding(grounding.rawPayload, state.question, intent.flags));
-  findings.push(makeVargaToolFinding(grounding.rawPayload, state.question));
-  if (/\b(arudha|aruda)\b/i.test(state.question)) findings.push(makeArudhaToolFinding(grounding.rawPayload));
-  findings.push(makePlacementToolFinding(grounding.rawPayload, state.question));
+  const includePanchanga = /\b(panchanga|tithi|nakshatra|karana|yoga)\b/i.test(state.question);
+  const includeFeature = /\b(yoga|yogas|ashtakavarga|arudha|aruda)\b/i.test(state.question) && !isMini;
+  const includeDasha = executionPlan.includeDasha && !intent.flags.includes('dasha') && !isMini;
+  const includeTransit = executionPlan.includeTransit && !intent.flags.includes('transit') && !isMini;
+  const includeCareer = (executionPlan.includeCareer || intent.topics.includes('career') || /\b(career|job|profession|business|promotion|work|employment|salary|interview)\b/i.test(state.question)) && !isMini;
+  const includeLongevity = (executionPlan.family === 'longevity' || intent.flags.includes('longevity') || /\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/i.test(state.question)) && !isMini;
 
-  if (/\b(panchanga|tithi|nakshatra|karana|yoga)\b/i.test(state.question)) {
-    findings.push(makePanchangaToolFinding(grounding.rawPayload));
-  }
+  const taskList: Array<Promise<ToolFinding | null>> = [
+    Promise.resolve(makeReferenceTimeToolFinding(grounding.referenceTimestamp, grounding.referenceTimeSource)),
+    Promise.resolve(makeGeneralToolFinding(grounding.rawPayload, state.question, intent.flags)),
+    Promise.resolve(makeVargaToolFinding(grounding.rawPayload, state.question, state.mode)),
+    /\b(arudha|aruda)\b/i.test(state.question) && !isMini ? Promise.resolve(makeArudhaToolFinding(grounding.rawPayload)) : Promise.resolve(null),
+    Promise.resolve(makePlacementToolFinding(grounding.rawPayload, state.question)),
+    includePanchanga ? Promise.resolve(makePanchangaToolFinding(grounding.rawPayload)) : Promise.resolve(null),
+    includeFeature ? Promise.resolve(makeFeatureToolFinding(grounding.rawPayload)) : Promise.resolve(null),
+    includeDasha ? Promise.resolve(makeDashaToolFinding(grounding.rawPayload, analysisTimestamp)) : Promise.resolve(null),
+    includeTransit
+      ? buildTransitToolFinding({ kundli: grounding.kundli, question: state.question, referenceTimestamp: grounding.referenceTimestamp })
+      : Promise.resolve(null),
+    includeCareer ? Promise.resolve(makeCareerToolFinding(grounding.rawPayload, state.question, analysisTimestamp)) : Promise.resolve(null),
+    includeLongevity ? Promise.resolve(makeLongevityToolFinding(grounding.rawPayload, grounding.referenceTimestamp)) : Promise.resolve(null),
+    executionPlan.includeMicroSignals.includes('nakshatra') || executionPlan.includeMicroSignals.includes('nakshatra_lord') || executionPlan.includeMicroSignals.includes('sign_lord')
+      ? Promise.resolve(makeNakshatraLordToolFinding(grounding.rawPayload))
+      : Promise.resolve(null),
+    executionPlan.includeMicroSignals.includes('drishti') || executionPlan.includeMicroSignals.includes('degree')
+      ? Promise.resolve(makeDrishtiDegreeToolFinding(grounding.rawPayload))
+      : Promise.resolve(null),
+  ];
 
-  if (/\b(yoga|yogas|ashtakavarga|arudha|aruda)\b/i.test(state.question)) {
-    findings.push(makeFeatureToolFinding(grounding.rawPayload));
-  }
-
-  if (!findings.some((item) => item.name === 'Dasha analyzer') && /\b(dasha|dasa|mahadasha|antardasha|period)\b/i.test(state.question)) {
-    findings.push(makeDashaToolFinding(grounding.rawPayload, grounding.referenceTimestamp));
-  }
-  if (!findings.some((item) => item.name === 'Transit analyzer') && /\b(transit|gochar|sun transit|today|now)\b/i.test(state.question)) {
-    findings.push(makeTransitToolFinding(grounding.rawPayload));
-  }
+  const findings = mergeFindings(
+    state.toolFindings ?? [],
+    (await Promise.all(taskList)).filter((item): item is ToolFinding => Boolean(item))
+  );
 
   return {
     toolFindings: findings,
+    analysisStages: appendStage(state, 'run_general_tools', 'Running general analyzers', `Findings total=${findings.length}`),
   };
+}
+
+async function evaluateCoverageNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const coverageGaps = determineCoverageGaps(state);
+
+  return {
+    coverageGaps,
+    analysisStages: appendStage(
+      state,
+      'evaluate_coverage',
+      'Evaluating tool coverage quality',
+      coverageGaps.length > 0
+        ? `Coverage gaps: ${coverageGaps.join(', ')}`
+        : 'Coverage is sufficient for answer generation.'
+    ),
+  };
+}
+
+async function refineToolsNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const grounding = state.grounding;
+  if (!grounding) throw new Error('Grounding context missing before refine-tools stage.');
+
+  const gaps = state.coverageGaps ?? [];
+  if (gaps.length === 0) {
+    return {
+      toolIteration: Math.min((state.toolIteration ?? 0) + 1, state.maxToolIterations ?? 2),
+      analysisStages: appendStage(state, 'refine_tools', 'Refining missing analyzers', 'No gaps found during refinement pass.'),
+    };
+  }
+
+  const intent = state.intent ?? classifyQuestionIntent(state.question);
+  const analysisTimestamp = resolveAnalysisTimestamp(grounding.referenceTimestamp, intent);
+  const tasks: Array<Promise<ToolFinding | null>> = [];
+
+  for (const gap of gaps) {
+    switch (gap) {
+      case 'varga':
+        tasks.push(Promise.resolve(makeVargaToolFinding(grounding.rawPayload, state.question, state.mode)));
+        break;
+      case 'd9':
+        tasks.push(Promise.resolve(makeD9ToolFinding(grounding.rawPayload, state.question)));
+        break;
+      case 'dasha':
+        tasks.push(Promise.resolve(makeDashaToolFinding(grounding.rawPayload, analysisTimestamp)));
+        break;
+      case 'transit':
+        tasks.push(
+          buildTransitToolFinding({
+            kundli: grounding.kundli,
+            question: state.question,
+            referenceTimestamp: grounding.referenceTimestamp,
+          })
+        );
+        break;
+      case 'career':
+        tasks.push(Promise.resolve(makeCareerToolFinding(grounding.rawPayload, state.question, analysisTimestamp)));
+        break;
+      case 'longevity':
+        tasks.push(Promise.resolve(makeLongevityToolFinding(grounding.rawPayload, grounding.referenceTimestamp)));
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Always include one broad grounding pass in refinement to capture missed paths.
+  tasks.push(Promise.resolve(makeGeneralToolFinding(grounding.rawPayload, state.question, intent.flags)));
+
+  const retryFindings = (await Promise.all(tasks)).filter((item): item is ToolFinding => Boolean(item));
+  const merged = mergeFindings(state.toolFindings ?? [], retryFindings);
+  const nextIteration = Math.min((state.toolIteration ?? 0) + 1, state.maxToolIterations ?? 2);
+
+  return {
+    toolFindings: merged,
+    toolIteration: nextIteration,
+    analysisStages: appendStage(
+      state,
+      'refine_tools',
+      'Refining missing analyzers',
+      `Iteration ${nextIteration}/${state.maxToolIterations ?? 2}; retried ${gaps.length} gap group(s).`
+    ),
+  };
+}
+
+function routeAfterCoverage(state: AgentStateType): 'refine_tools' | 'build_prompt' {
+  const gapCount = (state.coverageGaps ?? []).length;
+  const iteration = state.toolIteration ?? 0;
+  const maxIterations = state.maxToolIterations ?? 2;
+
+  if (gapCount > 0 && iteration < maxIterations) {
+    return 'refine_tools';
+  }
+
+  return 'build_prompt';
 }
 
 function buildPrompt(state: AgentStateType): string {
   const grounding = state.grounding;
   if (!grounding) throw new Error('Grounding context missing while building prompt.');
+  const executionPlan = state.executionPlan;
 
   const findings = state.toolFindings ?? [];
+  const conversationContext = (state.conversationContext ?? [])
+    .map((item) => String(item).trim())
+    .filter(Boolean)
+    .slice(-8);
 
   const findingBlock = findings
     .map((finding) => {
@@ -1200,9 +2103,13 @@ function buildPrompt(state: AgentStateType): string {
     'You are a Vedic astrology assistant grounded in canonical JSON payload data.',
     'Use the tool findings first; they are deterministic extracts from the JSON blob.',
     'Never invent chart facts. If dasha/transit details are missing in payload, explicitly say so.',
+    'For compound questions, separate the topic, the time window, and the chart layer before answering.',
     'For varga requests, prefer the specific Dxx chart named by the user and fall back to D1 only when needed.',
     'For dasha requests, report the active chain only when exact period boundaries are available, and include the current timestamp used.',
-    'For transit requests, only report current transit if a transit/gochar block exists in payload.',
+    'For transit requests, call the backend transit endpoint directly and report the requested forecast window.',
+    'If tool findings already include longevity/dasha/varga evidence, do not claim that a full analysis is still pending.',
+    'Never write generic lines like "a definitive assessment requires full divisional/dasha analysis" unless findings explicitly show those sections are missing.',
+    'Use relevant prior chat messages as soft context for continuity, but never override canonical chart facts.',
     '',
     `profileId: ${grounding.profileId}`,
     `sourceDocId: ${grounding.sourceDocId}`,
@@ -1210,9 +2117,22 @@ function buildPrompt(state: AgentStateType): string {
     `payloadHash: ${grounding.payloadHash}`,
     `referenceTimestamp: ${grounding.referenceTimestamp}`,
     `referenceTimeSource: ${grounding.referenceTimeSource}`,
+    ...(executionPlan
+      ? [
+          `questionFamily: ${executionPlan.family}`,
+          `chartLayers: ${executionPlan.chartLayers.join(', ')}`,
+          `includeTiming: ${executionPlan.includeTiming}`,
+          `includeTransit: ${executionPlan.includeTransit}`,
+          `includeDasha: ${executionPlan.includeDasha}`,
+          `microSignals: ${executionPlan.includeMicroSignals.join(', ')}`,
+        ]
+      : []),
     '',
     'Deterministic tool findings:',
     findingBlock || 'No tool findings available.',
+    '',
+    'Relevant prior chat context (same thread; semantic retrieval):',
+    conversationContext.length > 0 ? conversationContext.map((line) => `- ${line}`).join('\n') : 'None',
     '',
     'Canonical snippets:',
     snippets.join('\n\n') || 'No snippets available.',
@@ -1224,6 +2144,7 @@ function buildPrompt(state: AgentStateType): string {
 async function buildPromptNode(state: AgentStateType): Promise<AgentUpdateType> {
   return {
     prompt: buildPrompt(state),
+    analysisStages: appendStage(state, 'build_prompt', 'Synthesizing evidence for response prompt'),
   };
 }
 
@@ -1257,7 +2178,31 @@ function buildDeterministicFallback(state: AgentStateType): string {
   return lines.join('\n').trim();
 }
 
+function sanitizeGenericMissingAnalysisClaims(answer: string, findings: ToolFinding[]): string {
+  const hasVarga = findings.some((f) => f.name === 'Varga analyzer' && f.status !== 'unavailable');
+  const hasDasha = findings.some((f) => f.name === 'Dasha analyzer' && f.status !== 'unavailable');
+  const hasLongevity = findings.some((f) => f.name === 'Longevity analyzer' && f.status !== 'unavailable');
+
+  if (!(hasVarga && (hasDasha || hasLongevity))) {
+    return answer;
+  }
+
+  return answer
+    .replace(/A\s+definitive\s+longevity\s+assessment\s+requires\s+a\s+full\s+analysis\s+of\s+divisional\s+charts\s+and\s+dashas\.?/gi, '')
+    .replace(/A\s+definitive\s+assessment\s+requires\s+a\s+full\s+analysis\s+of\s+divisional\s+charts\s+and\s+dashas\.?/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function routeIntent(state: AgentStateType): 'run_specialized_tools' | 'run_general_tools' {
+  if (state.mode === 'mini') {
+    return 'run_general_tools';
+  }
+
+  if (state.executionPlan && state.executionPlan.family !== 'general') {
+    return 'run_specialized_tools';
+  }
+
   const primary = state.intent?.primary ?? 'general';
   return primary === 'general' ? 'run_general_tools' : 'run_specialized_tools';
 }
@@ -1278,14 +2223,18 @@ async function answerWithDeepSeekNode(state: AgentStateType): Promise<AgentUpdat
       userPrompt: 'Answer using deterministic tool findings and canonical snippets. Be decisive, specific, and avoid generic disclaimers unless payload data is actually missing.',
     });
 
+    const sanitized = sanitizeGenericMissingAnalysisClaims(deepSeek.text, state.toolFindings ?? []);
+
     return {
-      answer: deepSeek.text,
+      answer: sanitized,
       model: deepSeek.model,
+      analysisStages: appendStage(state, 'answer_with_deepseek', 'Generating grounded response text'),
     };
   } catch (error) {
     return {
       answer: `${buildDeterministicFallback(state)}\n\nModel error: ${String(error)}`,
       model: 'deepseek-bedrock-fallback',
+      analysisStages: appendStage(state, 'answer_with_deepseek', 'Generating grounded response text', 'Fell back to deterministic output due to model error.'),
     };
   }
 }
@@ -1323,6 +2272,7 @@ async function condenseAnswerNode(state: AgentStateType): Promise<AgentUpdateTyp
     return {
       answer: compact,
       model: concise.model,
+      analysisStages: appendStage(state, 'condense_answer', 'Condensing final response'),
     };
   } catch {
     return {};
@@ -1332,16 +2282,22 @@ async function condenseAnswerNode(state: AgentStateType): Promise<AgentUpdateTyp
 const graph = new StateGraph(AgentState)
   .addNode('load_grounding', loadCanonicalGrounding)
   .addNode('classify_intent', classifyIntentNode)
+  .addNode('plan_execution', planExecutionNode)
   .addNode('run_specialized_tools', runSpecializedToolsNode)
   .addNode('run_general_tools', runGeneralToolsNode)
+  .addNode('evaluate_coverage', evaluateCoverageNode)
+  .addNode('refine_tools', refineToolsNode)
   .addNode('build_prompt', buildPromptNode)
   .addNode('answer_with_deepseek', answerWithDeepSeekNode)
   .addNode('condense_answer', condenseAnswerNode)
   .addEdge(START, 'load_grounding')
   .addEdge('load_grounding', 'classify_intent')
-  .addConditionalEdges('classify_intent', routeIntent)
+  .addEdge('classify_intent', 'plan_execution')
+  .addConditionalEdges('plan_execution', routeIntent)
   .addEdge('run_specialized_tools', 'run_general_tools')
-  .addEdge('run_general_tools', 'build_prompt')
+  .addEdge('run_general_tools', 'evaluate_coverage')
+  .addConditionalEdges('evaluate_coverage', routeAfterCoverage)
+  .addEdge('refine_tools', 'evaluate_coverage')
   .addEdge('build_prompt', 'answer_with_deepseek')
   .addEdge('answer_with_deepseek', 'condense_answer')
   .addEdge('condense_answer', END)
@@ -1350,6 +2306,19 @@ const graph = new StateGraph(AgentState)
 // Phase-2: LangGraph-based grounded assistant that only reads canonical raw payload sections from Postgres.
 export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnswer> {
   const ownerId = input.ownerId ?? 'anonymous';
+  const mode: AgentMode = input.mode ?? 'mini';
+
+  if (mode === 'mini') {
+    const miniScope = evaluateMiniScope(input.message);
+    if (!miniScope.allowed) {
+    return {
+        answer: buildMiniUpgradeResponse(input.message, miniScope.reasons),
+        model: 'cozmic-mini-guard',
+        mode,
+      };
+    }
+  }
+
   const profileId = normalizeProfileId(input);
   const referenceTime = resolveReferenceTime(input);
 
@@ -1360,10 +2329,19 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
   const finalState = (await graph.invoke({
     ownerId,
     profileId,
+    mode,
     question: input.message,
+    kundliInput: input.kundli ?? null,
     referenceTimestamp: referenceTime.timestamp,
     referenceTimeSource: referenceTime.source,
+    conversationContext: input.conversationContext ?? [],
+    stageReporter: input.onStage ?? null,
+    toolIteration: 0,
+    maxToolIterations: 2,
     intent: null,
+    executionPlan: null,
+    coverageGaps: [],
+    analysisStages: [],
     toolFindings: [],
     prompt: null,
   })) as AgentStateType;
@@ -1375,12 +2353,16 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
   return {
     answer: finalState.answer,
     model: finalState.model ?? env.GOOGLE_GENAI_MODEL,
+    mode,
+    executionPlan: finalState.executionPlan ?? undefined,
+    analysisStages: finalState.analysisStages ?? undefined,
     grounding: {
       ownerId,
       profileId,
       sourceDocId: finalState.grounding.sourceDocId,
       chartVersion: finalState.grounding.chartVersion,
       kundliSignature: finalState.grounding.kundliSignature,
+      kundli: finalState.grounding.kundli,
       requestKey: finalState.grounding.requestKey,
       payloadHash: finalState.grounding.payloadHash,
       referenceTimestamp: finalState.grounding.referenceTimestamp,
