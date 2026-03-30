@@ -20,7 +20,6 @@ export interface RelevantChatMemory {
   similarity: number;
   createdAt: number;
 }
-
 export function buildChatMessageEmbedding(text: string): { embedding: number[]; embeddingModel: string; embeddingDim: number } {
   const result = embedTextDeterministic(text, env.EMBEDDING_DIM);
   return {

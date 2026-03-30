@@ -45,6 +45,8 @@ const EnvSchema = z.object({
   BEDROCK_DEEPSEEK_COMPOSER_MODEL_ID: z.string().optional(),
   EMBEDDING_DIM: z.coerce.number().default(192),
   MAX_AUDIO_BYTES: z.coerce.number().default(5 * 1024 * 1024),
+  REVENUECAT_WEBHOOK_SECRET: z.string().optional(),
+  REVENUECAT_PRO_ENTITLEMENT_ID: z.string().default('Cozmic Astrology Pro'),
 });
 
 export const env = EnvSchema.parse(process.env);

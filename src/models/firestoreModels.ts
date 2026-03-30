@@ -1,5 +1,6 @@
 export const COLLECTIONS = {
   authUsers: 'auth_users',
+  userSubscriptions: 'user_subscriptions',
   ragProfiles: 'rag_profiles',
   ragApiSources: 'rag_api_sources',
   ragChunks: 'rag_chunks',
@@ -13,6 +14,20 @@ export interface AuthUserDocument {
   createdAt: number;
   updatedAt: number;
   lastSeenAt: number;
+}
+
+export interface UserSubscriptionDocument {
+  ownerId: string;
+  source: 'revenuecat';
+  entitlementId: string;
+  isPro: boolean;
+  store?: string;
+  productId?: string;
+  eventType?: string;
+  expiresAtMs?: number;
+  updatedAt: number;
+  lastEventAt: number;
+  lastEventId?: string;
 }
 
 export interface RagProfileDocument {

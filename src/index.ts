@@ -7,6 +7,7 @@ import meRoutes from './routes/me.js';
 import kundaliRoutes from './routes/kundalis.js';
 import voiceRoutes from './routes/voice.js';
 import ragRoutes from './routes/rag.js';
+import billingRoutes from './routes/billing.js';
 import { expensiveEndpointRateLimit } from './middleware/rateLimit.js';
 import { disconnectValkey } from './services/valkeyCache.js';
 
@@ -43,6 +44,7 @@ app.use('/v1/rag/query', expensiveEndpointRateLimit);
 app.use(healthRoutes);
 app.use(chatRoutes);
 app.use(meRoutes);
+app.use(billingRoutes);
 app.use(kundaliRoutes);
 app.use(voiceRoutes);
 app.use(ragRoutes);

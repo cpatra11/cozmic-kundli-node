@@ -4,7 +4,8 @@ import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import { runKundliAgent } from '../services/kundliAgent.js';
 import { getPostgresStore } from '../services/postgresStore.js';
-import { COLLECTIONS, type RagProfileDocument } from '../models/firestoreModels.js';
+import { COLLECTIONS, type RagProfileDocument, type UserSubscriptionDocument } from '../models/firestoreModels.js';
+import { env } from '../config/env.js';
 import { buildChatMessageEmbedding, queryRelevantSessionMemories } from '../services/chatMemory.js';
 
 const CreateSessionSchema = z.object({
@@ -63,6 +64,22 @@ interface ChatMessageDoc {
   embeddingModel?: string;
   embeddingDim?: number;
   createdAt: number;
+}
+
+async function ownerHasProEntitlement(ownerId: string): Promise<boolean> {
+  const store = getPostgresStore();
+  const doc = await store.getDocument<UserSubscriptionDocument>(`${COLLECTIONS.userSubscriptions}/${ownerId}`);
+  if (!doc) return false;
+
+  const subscription = doc.data;
+  if (!subscription.isPro) return false;
+
+  if (typeof subscription.expiresAtMs === 'number' && subscription.expiresAtMs <= Date.now()) {
+    return false;
+  }
+
+  const expectedEntitlement = env.REVENUECAT_PRO_ENTITLEMENT_ID;
+  return subscription.entitlementId === expectedEntitlement || subscription.entitlementId === 'pro';
 }
 
 function writeSseEvent(res: Response, event: string, payload: unknown): void {
@@ -174,6 +191,19 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
     }
 
     const store = getPostgresStore();
+    if ((parsed.data.mode ?? 'mini') === 'pro') {
+      const hasPro = await ownerHasProEntitlement(req.user!.uid);
+      if (!hasPro) {
+        writeSseEvent(res, 'error', {
+          error: 'Pro subscription required',
+          details: 'Pro mode requires an active subscription. Please purchase or restore your plan.',
+          code: 'PRO_SUBSCRIPTION_REQUIRED',
+        });
+        res.end();
+        return;
+      }
+    }
+
     const sessionIdParam = req.params.sessionId;
     const sessionId = Array.isArray(sessionIdParam) ? sessionIdParam[0] : sessionIdParam;
 
@@ -327,6 +357,18 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
     }
 
     const store = getPostgresStore();
+
+    if ((parsed.data.mode ?? 'mini') === 'pro') {
+      const hasPro = await ownerHasProEntitlement(req.user!.uid);
+      if (!hasPro) {
+        return res.status(402).json({
+          error: 'Pro subscription required',
+          details: 'Pro mode requires an active subscription. Please purchase or restore your plan.',
+          code: 'PRO_SUBSCRIPTION_REQUIRED',
+        });
+      }
+    }
+
     const sessionIdParam = req.params.sessionId;
     const sessionId = Array.isArray(sessionIdParam) ? sessionIdParam[0] : sessionIdParam;
 
