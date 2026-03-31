@@ -1,11 +1,12 @@
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
 import { type KundliSnapshotInput } from './be1Client.js';
 import { env } from '../config/env.js';
-import { COLLECTIONS, type RagApiSourceDocument, type RagProfileDocument } from '../models/firestoreModels.js';
-import { getPostgresStore } from './postgresStore.js';
+import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
+import { getRagSourcesRepository } from '../repositories/ragSourcesRepository.js';
 import { stableHash } from './hash.js';
 import { invokeDeepSeekBedrock } from './deepseekBedrock.js';
 import { buildTransitToolFinding, type ToolFinding } from './astrologyTools.js';
+import { z } from 'zod';
 
 export interface AgentAnswerInput {
   ownerId?: string;
@@ -17,6 +18,8 @@ export interface AgentAnswerInput {
   conversationContext?: string[];
   onStage?: (stage: AnalysisStage) => void;
 }
+
+type TopLevelRoute = 'pipeline' | 'smalltalk' | 'general_astro';
 
 type AgentMode = 'mini' | 'pro';
 
@@ -42,6 +45,57 @@ type MicroSignal = 'nakshatra' | 'nakshatra_lord' | 'sign_lord' | 'drishti' | 'd
 type TimeSource = 'client' | 'server';
 type TimeDirection = 'past' | 'future' | 'present';
 type TimeUnit = 'day' | 'week' | 'month' | 'year';
+type FastAnswerIntentKind = 'identity' | 'capability' | 'smalltalk' | 'general_astro';
+type QuestionTypeRoute = 'timing_marriage' | 'timing_career' | 'timing_general' | 'relationship_general' | 'career_general' | 'other';
+type MiniScopeEnforcementMode = 'full' | 'restricted' | 'blocked';
+type ToolGroupKey =
+  | 'reference_time'
+  | 'atlas'
+  | 'varga'
+  | 'arudha'
+  | 'd9'
+  | 'dasha'
+  | 'transit'
+  | 'career'
+  | 'longevity'
+  | 'placement'
+  | 'panchanga'
+  | 'feature'
+  | 'general_grounding'
+  | 'nakshatra_lord'
+  | 'drishti_degree';
+
+type LlmDecisionMode = 'deterministic' | 'hybrid' | 'llm_first';
+type ToolCostClass = 'low' | 'medium' | 'high';
+
+type ToolCapability = {
+  group: ToolGroupKey;
+  domains: string[];
+  requiredScopes: string[];
+  minMode: AgentMode;
+  costClass: ToolCostClass;
+  fallbackGroup?: ToolGroupKey;
+};
+
+type ToolAvailabilityPreflight = {
+  availableGroups: ToolGroupKey[];
+  blockedByMode: ToolGroupKey[];
+  missingByData: ToolGroupKey[];
+  notes: string[];
+};
+
+type DecisionBundle = {
+  source: 'deterministic' | 'llm' | 'hybrid';
+  topRoute?: TopLevelRoute;
+  intentPrimary?: IntentPrimary;
+  questionFamily?: QuestionFamily;
+  timeDirection?: TimeDirection;
+  requiredScopes?: string[];
+  requiredToolGroups?: ToolGroupKey[];
+  miniEnforcementMode?: MiniScopeEnforcementMode;
+  confidence?: number;
+  reason?: string;
+};
 
 type AnalysisStage = {
   id: string;
@@ -49,6 +103,159 @@ type AnalysisStage = {
   status: 'completed';
   details?: string;
 };
+
+type DecisionTelemetry = {
+  node: string;
+  model: string;
+  latencyMs: number;
+  confidence?: number;
+  usedFallback: boolean;
+  fallbackReason?: string;
+  shadowComparison?: string;
+};
+
+const IntentRouteDecisionSchema = z.object({
+  topRoute: z.enum(['pipeline', 'smalltalk', 'general_astro']),
+  confidence: z.number().min(0).max(1).default(0.5),
+  reasoningBrief: z.string().default(''),
+  requiresPersonalChart: z.boolean().default(false),
+});
+
+type IntentRouteDecision = z.infer<typeof IntentRouteDecisionSchema>;
+
+const IntentDecisionSchema = z.object({
+  primary: z.enum(['d9', 'dasha', 'transit', 'general']).default('general'),
+  flags: z.array(z.string()).default([]),
+  topics: z.array(z.string()).default([]),
+  timeDirection: z.enum(['past', 'future', 'present']).default('present'),
+  timeValue: z.number().int().positive().optional(),
+  timeUnit: z.enum(['day', 'week', 'month', 'year']).optional(),
+  timeLabel: z.string().optional(),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type IntentDecision = z.infer<typeof IntentDecisionSchema>;
+
+const ExecutionPlanDecisionSchema = z.object({
+  questionFamily: z.string(),
+  requiredChartLayers: z.array(z.string()).default([]),
+  includeMicroSignals: z.array(z.string()).default([]),
+  includeTiming: z.boolean().default(false),
+  includeTransit: z.boolean().default(false),
+  includeDasha: z.boolean().default(false),
+  includeCareer: z.boolean().default(false),
+  includeRelationship: z.boolean().default(false),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type ExecutionPlanDecision = z.infer<typeof ExecutionPlanDecisionSchema>;
+
+const EvidenceGateDecisionSchema = z.object({
+  sufficientCoverageAchieved: z.boolean().default(false),
+  gapsIdentified: z.array(z.string()).default([]),
+  shouldRetry: z.boolean().default(false),
+  nextAction: z.enum(['refine_tools', 'build_prompt']).default('build_prompt'),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type EvidenceGateDecision = z.infer<typeof EvidenceGateDecisionSchema>;
+
+const ResponsePolicyDecisionSchema = z.object({
+  shouldCondense: z.boolean().default(false),
+  tone: z.enum(['confident', 'balanced', 'cautious']).default('balanced'),
+  addDisclaimer: z.boolean().default(false),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+const ToolSelectionDecisionSchema = z.object({
+  selectedToolGroups: z.array(z.string()).default([]),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type ToolSelectionDecision = z.infer<typeof ToolSelectionDecisionSchema>;
+
+const PlanAndToolsDecisionSchema = z.object({
+  questionFamily: z.string(),
+  requiredChartLayers: z.array(z.string()).default([]),
+  includeMicroSignals: z.array(z.string()).default([]),
+  includeTiming: z.boolean().default(false),
+  includeTransit: z.boolean().default(false),
+  includeDasha: z.boolean().default(false),
+  includeCareer: z.boolean().default(false),
+  includeRelationship: z.boolean().default(false),
+  selectedToolGroups: z.array(z.string()).default([]),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type PlanAndToolsDecision = z.infer<typeof PlanAndToolsDecisionSchema>;
+
+const MiniScopeDecisionSchema = z.object({
+  allowed: z.boolean().default(true),
+  enforcementMode: z.enum(['full', 'restricted', 'blocked']).default('full'),
+  reasons: z.array(z.string()).default([]),
+  suggestedAlternative: z.string().optional(),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type MiniScopeDecision = z.infer<typeof MiniScopeDecisionSchema>;
+
+const FastAnswerIntentDecisionSchema = z.object({
+  intentKind: z.enum(['identity', 'capability', 'smalltalk', 'general_astro']).default('general_astro'),
+  responseStyle: z.enum(['brief', 'normal']).default('brief'),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type FastAnswerIntentDecision = z.infer<typeof FastAnswerIntentDecisionSchema>;
+
+const TemporalWindowDecisionSchema = z.object({
+  direction: z.enum(['past', 'future', 'present']).default('present'),
+  timeValue: z.number().int().positive().optional(),
+  timeUnit: z.enum(['day', 'week', 'month', 'year']).optional(),
+  timeLabel: z.string().optional(),
+  absStartTs: z.number().int().optional(),
+  absEndTs: z.number().int().optional(),
+  dashaPeriodRef: z.string().optional(),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type TemporalWindowDecision = z.infer<typeof TemporalWindowDecisionSchema>;
+
+const ScopeSelectionDecisionSchema = z.object({
+  questionType: z.enum(['timing_marriage', 'timing_career', 'timing_general', 'relationship_general', 'career_general', 'other']).default('other'),
+  requiredScopes: z.array(z.string()).default([]),
+  requiredTools: z.array(z.string()).default([]),
+  needsDasha: z.boolean().default(false),
+  needsTransit: z.boolean().default(false),
+  needsD9: z.boolean().default(false),
+  needsD10: z.boolean().default(false),
+  needsLongevity: z.boolean().default(false),
+  needsGeneral: z.boolean().default(true),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type ScopeSelectionDecision = z.infer<typeof ScopeSelectionDecisionSchema>;
+
+const UnifiedIntentScopeDecisionSchema = z.object({
+  primary: z.enum(['d9', 'dasha', 'transit', 'general']).default('general'),
+  flags: z.array(z.string()).default([]),
+  topics: z.array(z.string()).default([]),
+  timeDirection: z.enum(['past', 'future', 'present']).default('present'),
+  timeValue: z.number().int().positive().optional(),
+  timeUnit: z.enum(['day', 'week', 'month', 'year']).optional(),
+  timeLabel: z.string().optional(),
+  questionType: z.enum(['timing_marriage', 'timing_career', 'timing_general', 'relationship_general', 'career_general', 'other']).default('other'),
+  requiredScopes: z.array(z.string()).default([]),
+  requiredTools: z.array(z.string()).default([]),
+  needsDasha: z.boolean().default(false),
+  needsTransit: z.boolean().default(false),
+  needsD9: z.boolean().default(false),
+  needsD10: z.boolean().default(false),
+  needsLongevity: z.boolean().default(false),
+  needsGeneral: z.boolean().default(true),
+  confidence: z.number().min(0).max(1).default(0.5),
+});
+
+type UnifiedIntentScopeDecision = z.infer<typeof UnifiedIntentScopeDecisionSchema>;
 
 type DynamicExecutionPlan = {
   family: QuestionFamily;
@@ -109,6 +316,7 @@ export interface AgentAnswer {
   mode: AgentMode;
   executionPlan?: DynamicExecutionPlan;
   analysisStages?: AnalysisStage[];
+  decisionTelemetry?: DecisionTelemetry[];
   grounding?: {
     ownerId: string;
     profileId: string;
@@ -126,25 +334,40 @@ export interface AgentAnswer {
 
 const AgentState = Annotation.Root({
   ownerId: Annotation<string>,
-  profileId: Annotation<string>,
+  profileId: Annotation<string | null>,
   mode: Annotation<AgentMode>,
   question: Annotation<string>,
   kundliInput: Annotation<KundliSnapshotInput | null>,
   referenceTimestamp: Annotation<number | null>,
   referenceTimeSource: Annotation<TimeSource | null>,
   conversationContext: Annotation<string[]>,
+  topLevelRoute: Annotation<TopLevelRoute | null>,
+  topLevelRouteConfidence: Annotation<number | null>,
+  decisionTelemetry: Annotation<DecisionTelemetry[]>,
   stageReporter: Annotation<((stage: AnalysisStage) => void) | null>,
   toolIteration: Annotation<number>,
   maxToolIterations: Annotation<number>,
+  temporalWindow: Annotation<TemporalWindowDecision | null>,
   intent: Annotation<QuestionIntent | null>,
+  scopeSelection: Annotation<ScopeSelectionDecision | null>,
+  selectedToolGroups: Annotation<ToolGroupKey[] | null>,
   executionPlan: Annotation<DynamicExecutionPlan | null>,
   coverageGaps: Annotation<CoverageGap[]>,
+  coverageShouldRetry: Annotation<boolean | null>,
+  coverageDecisionConfidence: Annotation<number | null>,
+  refinementNextAction: Annotation<'refine_tools' | 'build_prompt' | null>,
   grounding: Annotation<GroundingContext | null>,
   analysisStages: Annotation<AnalysisStage[]>,
   toolFindings: Annotation<ToolFinding[]>,
   prompt: Annotation<string | null>,
   answer: Annotation<string | null>,
+  responseShouldCondense: Annotation<boolean | null>,
+  responsePolicyTone: Annotation<'confident' | 'balanced' | 'cautious' | null>,
+  responsePolicyAddDisclaimer: Annotation<boolean | null>,
+  responsePolicyConfidence: Annotation<number | null>,
   model: Annotation<string | null>,
+  decisionBundle: Annotation<DecisionBundle | null>,
+  toolAvailabilityPreflight: Annotation<ToolAvailabilityPreflight | null>,
 });
 
 type AgentStateType = typeof AgentState.State;
@@ -152,6 +375,392 @@ type AgentUpdateType = typeof AgentState.Update;
 
 const CONCISE_ANSWER_MAX_CHARS = 900;
 const CONCISE_ANSWER_MIN_LINES = 6;
+
+const QUESTION_FAMILY_ALLOWLIST = new Set<QuestionFamily>([
+  'general',
+  'career',
+  'marriage',
+  'relationship',
+  'finance',
+  'health',
+  'longevity',
+  'education',
+  'children',
+  'property',
+  'travel',
+  'spirituality',
+  'timing',
+  'yoga',
+  'family',
+]);
+
+const CHART_LAYER_ALLOWLIST = new Set<ChartLayer>(['D1', 'D9', 'D10', 'D8', 'D30', 'D7', 'D4', 'D12', 'D20']);
+const MICRO_SIGNAL_ALLOWLIST = new Set<MicroSignal>(['nakshatra', 'nakshatra_lord', 'sign_lord', 'drishti', 'degree']);
+const COVERAGE_GAP_ALLOWLIST = new Set<CoverageGap>(['varga', 'd9', 'dasha', 'transit', 'career', 'longevity']);
+const TOOL_GROUP_ALLOWLIST = new Set<ToolGroupKey>([
+  'reference_time',
+  'atlas',
+  'varga',
+  'arudha',
+  'd9',
+  'dasha',
+  'transit',
+  'career',
+  'longevity',
+  'placement',
+  'panchanga',
+  'feature',
+  'general_grounding',
+  'nakshatra_lord',
+  'drishti_degree',
+]);
+
+const MODE_RANK: Record<AgentMode, number> = { mini: 0, pro: 1 };
+
+const TOOL_CAPABILITY_MANIFEST: Record<ToolGroupKey, ToolCapability> = {
+  reference_time: {
+    group: 'reference_time',
+    domains: ['timing', 'general'],
+    requiredScopes: [],
+    minMode: 'mini',
+    costClass: 'low',
+  },
+  atlas: {
+    group: 'atlas',
+    domains: ['general', 'discovery'],
+    requiredScopes: ['chart'],
+    minMode: 'mini',
+    costClass: 'low',
+  },
+  varga: {
+    group: 'varga',
+    domains: ['general', 'varga'],
+    requiredScopes: ['chart.varga'],
+    minMode: 'mini',
+    costClass: 'medium',
+  },
+  arudha: {
+    group: 'arudha',
+    domains: ['advanced', 'arudha'],
+    requiredScopes: ['chart.arudha'],
+    minMode: 'pro',
+    costClass: 'medium',
+    fallbackGroup: 'general_grounding',
+  },
+  d9: {
+    group: 'd9',
+    domains: ['relationship', 'marriage', 'varga'],
+    requiredScopes: ['chart.varga.D9'],
+    minMode: 'mini',
+    costClass: 'medium',
+    fallbackGroup: 'varga',
+  },
+  dasha: {
+    group: 'dasha',
+    domains: ['timing', 'forecast'],
+    requiredScopes: ['chart.dasha'],
+    minMode: 'pro',
+    costClass: 'high',
+    fallbackGroup: 'reference_time',
+  },
+  transit: {
+    group: 'transit',
+    domains: ['timing', 'forecast', 'gochar'],
+    requiredScopes: ['chart.transit'],
+    minMode: 'pro',
+    costClass: 'high',
+    fallbackGroup: 'reference_time',
+  },
+  career: {
+    group: 'career',
+    domains: ['career'],
+    requiredScopes: ['chart.varga.D10'],
+    minMode: 'pro',
+    costClass: 'high',
+    fallbackGroup: 'varga',
+  },
+  longevity: {
+    group: 'longevity',
+    domains: ['longevity', 'risk_profile'],
+    requiredScopes: ['chart.varga.D8', 'chart.varga.D30', 'chart.dasha'],
+    minMode: 'pro',
+    costClass: 'high',
+    fallbackGroup: 'general_grounding',
+  },
+  placement: {
+    group: 'placement',
+    domains: ['general', 'planetary_positions'],
+    requiredScopes: ['chart.varga.D1'],
+    minMode: 'mini',
+    costClass: 'low',
+  },
+  panchanga: {
+    group: 'panchanga',
+    domains: ['calendar', 'muhurta', 'nakshatra'],
+    requiredScopes: ['chart.panchanga'],
+    minMode: 'mini',
+    costClass: 'low',
+    fallbackGroup: 'general_grounding',
+  },
+  feature: {
+    group: 'feature',
+    domains: ['advanced', 'yoga', 'ashtakavarga'],
+    requiredScopes: ['chart.yogas', 'chart.ashtakavarga', 'chart.arudha'],
+    minMode: 'pro',
+    costClass: 'medium',
+    fallbackGroup: 'general_grounding',
+  },
+  general_grounding: {
+    group: 'general_grounding',
+    domains: ['general'],
+    requiredScopes: ['chart.graha', 'chart.lagna'],
+    minMode: 'mini',
+    costClass: 'low',
+  },
+  nakshatra_lord: {
+    group: 'nakshatra_lord',
+    domains: ['nakshatra', 'lordship'],
+    requiredScopes: ['chart.graha'],
+    minMode: 'mini',
+    costClass: 'low',
+    fallbackGroup: 'general_grounding',
+  },
+  drishti_degree: {
+    group: 'drishti_degree',
+    domains: ['drishti', 'degree'],
+    requiredScopes: ['chart.graha'],
+    minMode: 'mini',
+    costClass: 'medium',
+    fallbackGroup: 'general_grounding',
+  },
+};
+
+function getToolManifestForMode(mode: AgentMode): ToolCapability[] {
+  return Object.values(TOOL_CAPABILITY_MANIFEST).filter((capability) => MODE_RANK[mode] >= MODE_RANK[capability.minMode]);
+}
+
+function hasAnyPath(rawPayload: unknown, paths: string[]): boolean {
+  return paths.some((path) => getByPath(rawPayload, path) !== undefined);
+}
+
+function buildToolAvailabilityPreflight(rawPayload: unknown, mode: AgentMode): ToolAvailabilityPreflight {
+  const availableGroups: ToolGroupKey[] = [];
+  const blockedByMode: ToolGroupKey[] = [];
+  const missingByData: ToolGroupKey[] = [];
+  const notes: string[] = [];
+
+  for (const capability of Object.values(TOOL_CAPABILITY_MANIFEST)) {
+    const modeBlocked = MODE_RANK[mode] < MODE_RANK[capability.minMode];
+    if (modeBlocked) {
+      blockedByMode.push(capability.group);
+      continue;
+    }
+
+    const hasRequiredData = capability.requiredScopes.length === 0 || hasAnyPath(rawPayload, capability.requiredScopes);
+    if (hasRequiredData) {
+      availableGroups.push(capability.group);
+    } else {
+      missingByData.push(capability.group);
+    }
+  }
+
+  if (mode === 'mini' && blockedByMode.length > 0) {
+    notes.push(`mini-mode restrictions active for: ${blockedByMode.join(', ')}`);
+  }
+
+  if (missingByData.length > 0) {
+    notes.push(`payload gaps affecting tools: ${missingByData.join(', ')}`);
+  }
+
+  return {
+    availableGroups: [...new Set(availableGroups)],
+    blockedByMode: [...new Set(blockedByMode)],
+    missingByData: [...new Set(missingByData)],
+    notes,
+  };
+}
+
+function resolveDecisionMode(): LlmDecisionMode {
+  return (env.LLM_DECISION_MODE as LlmDecisionMode) ?? 'hybrid';
+}
+
+function isDecisionNodeEnabled(legacyNodeFlag: boolean): boolean {
+  if (!env.LLM_DECISION_ENABLED) {
+    return false;
+  }
+
+  const mode = resolveDecisionMode();
+  if (mode === 'deterministic') {
+    return false;
+  }
+
+  if (mode === 'llm_first') {
+    return true;
+  }
+
+  return legacyNodeFlag;
+}
+
+function mergeDecisionBundle(state: AgentStateType, patch: Partial<DecisionBundle>): DecisionBundle {
+  const current = state.decisionBundle ?? { source: 'deterministic' as const };
+  return { ...current, ...patch };
+}
+
+function normalizeToken(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, '_');
+}
+
+function clampQuestionFamily(value: string, fallback: QuestionFamily): QuestionFamily {
+  const normalized = normalizeToken(value);
+  return QUESTION_FAMILY_ALLOWLIST.has(normalized as QuestionFamily) ? (normalized as QuestionFamily) : fallback;
+}
+
+function clampChartLayers(values: string[], fallback: ChartLayer[]): ChartLayer[] {
+  const next = values
+    .map((item) => String(item).trim().toUpperCase())
+    .filter((item): item is ChartLayer => CHART_LAYER_ALLOWLIST.has(item as ChartLayer));
+
+  const unique = [...new Set<ChartLayer>(['D1', ...next])];
+  return unique.length > 0 ? unique : fallback;
+}
+
+function clampMicroSignals(values: string[], fallback: MicroSignal[]): MicroSignal[] {
+  const next = values
+    .map((item) => normalizeToken(String(item)))
+    .filter((item): item is MicroSignal => MICRO_SIGNAL_ALLOWLIST.has(item as MicroSignal));
+  return next.length > 0 ? [...new Set(next)] : fallback;
+}
+
+function clampCoverageGaps(values: string[], fallback: CoverageGap[]): CoverageGap[] {
+  const next = values
+    .map((item) => normalizeToken(String(item)))
+    .filter((item): item is CoverageGap => COVERAGE_GAP_ALLOWLIST.has(item as CoverageGap));
+  return next.length > 0 ? [...new Set(next)] : fallback;
+}
+
+function clampToolGroups(values: string[], fallback: ToolGroupKey[], mode: AgentMode): ToolGroupKey[] {
+  const next = values
+    .map((item) => normalizeToken(String(item)))
+    .filter((item): item is ToolGroupKey => TOOL_GROUP_ALLOWLIST.has(item as ToolGroupKey));
+
+  const unique = [...new Set(next)];
+  const withDefaults = unique.length > 0 ? unique : fallback;
+
+  if (mode !== 'mini') {
+    return withDefaults;
+  }
+
+  const miniBlocked = new Set<ToolGroupKey>(['dasha', 'transit', 'career', 'longevity', 'feature', 'arudha']);
+  const miniSafe = withDefaults.filter((group) => !miniBlocked.has(group));
+  if (miniSafe.length > 0) {
+    return miniSafe;
+  }
+
+  return ['reference_time', 'general_grounding', 'varga', 'placement'];
+}
+
+function buildDataGapDisclaimer(findings: ToolFinding[]): string | null {
+  const missing = findings
+    .filter((f) => f.status === 'unavailable')
+    .slice(0, 3)
+    .map((f) => f.name);
+
+  if (missing.length === 0) return null;
+  return `Note: some sections are missing in current data (${missing.join(', ')}), so this answer is based on available canonical evidence.`;
+}
+
+function appendDecisionTelemetry(state: AgentStateType, telemetry: DecisionTelemetry): DecisionTelemetry[] {
+  const current = state.decisionTelemetry ?? [];
+  return [...current, telemetry];
+}
+
+function appendDecisionTelemetries(state: AgentStateType, telemetry: DecisionTelemetry[]): DecisionTelemetry[] {
+  const current = state.decisionTelemetry ?? [];
+  return [...current, ...telemetry];
+}
+
+function clampRequiredScopes(values: string[], fallback: string[], mode: AgentMode): string[] {
+  const normalized = values
+    .map((item) => String(item).trim())
+    .filter((item) => /^chart(?:\.[A-Za-z0-9_]+)+$/.test(item));
+
+  const modeFiltered = mode === 'mini'
+    ? normalized.filter((path) => {
+      if (
+        path === 'chart.user'
+        || path === 'chart.graha'
+        || path === 'chart.lagna'
+        || path === 'chart.houses'
+        || path === 'chart.bhava'
+        || path === 'chart.panchanga'
+        || path === 'chart.yogas'
+      ) {
+        return true;
+      }
+
+      return path.startsWith('chart.varga.D1') || path.startsWith('chart.varga.D9');
+    })
+    : normalized;
+
+  const withD1 = [...new Set(['chart.varga.D1', ...modeFiltered])];
+  if (withD1.length > 0) return withD1;
+  return [...new Set(fallback.length > 0 ? fallback : ['chart.varga.D1', 'chart.graha', 'chart.lagna'])];
+}
+
+function parseJsonObject(text: string): unknown {
+  const direct = text.trim();
+  if (!direct) throw new Error('Empty JSON text');
+
+  try {
+    return JSON.parse(direct);
+  } catch {
+    const fenced = direct.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fenced?.[1]) {
+      return JSON.parse(fenced[1]);
+    }
+    const firstBrace = direct.indexOf('{');
+    const lastBrace = direct.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      return JSON.parse(direct.slice(firstBrace, lastBrace + 1));
+    }
+    throw new Error('No JSON object found in model response');
+  }
+}
+
+async function invokeDecisionNode<T>(params: {
+  node: string;
+  schema: z.ZodType<T, z.ZodTypeDef, unknown>;
+  input: Record<string, unknown>;
+  fallback: () => T;
+}): Promise<{ decision: T; model: string; usedFallback: boolean; latencyMs: number }> {
+  const startedAt = Date.now();
+  try {
+    const response = await invokeDeepSeekBedrock({
+      systemPrompt: [
+        'You are a strict JSON decision engine for an astrology agent.',
+        'Return ONE JSON object only. No markdown. No prose.',
+        `Decision node: ${params.node}`,
+      ].join(' '),
+      userPrompt: JSON.stringify(params.input),
+      maxTokens: 300,
+    });
+
+    const parsed = params.schema.parse(parseJsonObject(response.text));
+    return {
+      decision: parsed,
+      model: response.model,
+      usedFallback: false,
+      latencyMs: Date.now() - startedAt,
+    };
+  } catch {
+    return {
+      decision: params.fallback(),
+      model: 'decision-fallback',
+      usedFallback: true,
+      latencyMs: Date.now() - startedAt,
+    };
+  }
+}
 
 function normalizeProfileId(input: AgentAnswerInput): string | null {
   if (input.profileId?.trim()) return input.profileId.trim();
@@ -344,33 +953,87 @@ function extractRequestedVargaKeys(question: string): string[] {
   return [...keys];
 }
 
-function evaluateMiniScope(question: string): { allowed: boolean; reasons: string[] } {
-  const reasons: string[] = [];
+function miniScopeSeverity(mode: MiniScopeEnforcementMode): number {
+  switch (mode) {
+    case 'full':
+      return 0;
+    case 'restricted':
+      return 1;
+    case 'blocked':
+      return 2;
+    default:
+      return 2;
+  }
+}
+
+function evaluateMiniScope(question: string): {
+  allowed: boolean;
+  enforcementMode: MiniScopeEnforcementMode;
+  reasons: string[];
+  suggestedAlternative?: string;
+} {
+  const restrictedReasons: string[] = [];
+  const blockedReasons: string[] = [];
   const q = question.toLowerCase();
 
   const vargaKeys = extractRequestedVargaKeys(question);
-  if (vargaKeys.some((key) => key !== 'D1' && key !== 'D9')) {
-    reasons.push('This asks for advanced divisional charts beyond D1/D9.');
+  const advancedVargas = vargaKeys.filter((key) => key !== 'D1' && key !== 'D9');
+  const onlyCareerAdvanced = advancedVargas.length > 0 && advancedVargas.every((key) => key === 'D10');
+
+  if (advancedVargas.length > 0) {
+    if (onlyCareerAdvanced) {
+      restrictedReasons.push('D10 is Pro-level; mini will provide D1/D9-based career guidance only.');
+    } else {
+      blockedReasons.push('This asks for advanced divisional charts beyond mini scope (D1/D9).');
+    }
   }
 
   const intent = classifyQuestionIntent(question);
   const family = determineQuestionFamily(question, intent);
-  const allowedFamilies = new Set<QuestionFamily>(['general', 'relationship', 'marriage']);
+  const restrictedFamilies = new Set<QuestionFamily>([
+    'career',
+    'finance',
+    'health',
+    'education',
+    'children',
+    'property',
+    'travel',
+    'spirituality',
+    'family',
+  ]);
 
-  if (!allowedFamilies.has(family)) {
-    reasons.push(`This falls under ${family} analysis, which is Pro scope.`);
+  if (family === 'longevity') {
+    blockedReasons.push('Longevity analysis (D8/D30 + advanced timing) is Pro scope.');
+  } else if (restrictedFamilies.has(family)) {
+    restrictedReasons.push(`This is ${family} analysis; mini will use foundational D1/D9 scope.`);
   }
 
   const proTimingFlags = new Set(['timing', 'dasha', 'transit', 'forecast', 'history', 'career_timing']);
   if (intent.flags.some((flag) => proTimingFlags.has(flag))) {
-    reasons.push('This requires timing/predictive analysis (dasha/transit/forecast).');
+    blockedReasons.push('This requires predictive timing analysis (dasha/transit/forecast), which is Pro scope.');
   }
 
   if (/(\bashtakavarga\b|\barudha\b|\baruda\b|\bshadbala\b|\bkp\b|\bjaimini\b|\bnadi\b)/.test(q)) {
-    reasons.push('This requests advanced systems reserved for Pro mode.');
+    blockedReasons.push('This requests advanced systems reserved for Pro mode.');
   }
 
-  return { allowed: reasons.length === 0, reasons };
+  const enforcementMode: MiniScopeEnforcementMode = blockedReasons.length > 0
+    ? 'blocked'
+    : restrictedReasons.length > 0
+      ? 'restricted'
+      : 'full';
+
+  const reasons = [...new Set([...blockedReasons, ...restrictedReasons])];
+
+  return {
+    allowed: enforcementMode !== 'blocked',
+    enforcementMode,
+    reasons,
+    suggestedAlternative:
+      enforcementMode === 'restricted'
+        ? 'I can provide D1/D9-based foundational guidance in Mini mode.'
+        : undefined,
+  };
 }
 
 function buildMiniUpgradeResponse(question: string, reasons: string[] = []): string {
@@ -386,6 +1049,18 @@ function buildMiniUpgradeResponse(question: string, reasons: string[] = []): str
     ...why,
     '',
     `Please switch to **Cozmic Pro** and ask again: "${question.trim()}"`,
+  ].join('\n');
+}
+
+function buildMiniRestrictedNotice(reasons: string[] = [], suggestedAlternative?: string): string {
+  const why = reasons.length > 0
+    ? ['Why this was restricted in Mini:', ...reasons.slice(0, 2).map((reason) => `- ${reason}`)]
+    : [];
+
+  return [
+    'Mini scope note: this answer is intentionally constrained to **D1/D9 foundational guidance**.',
+    ...why,
+    suggestedAlternative ?? 'For full predictive/advanced chart analysis, switch to Cozmic Pro.',
   ].join('\n');
 }
 
@@ -758,6 +1433,607 @@ function classifyQuestionIntent(question: string): QuestionIntent {
   };
 }
 
+function buildDeterministicTemporalWindow(question: string): TemporalWindowDecision {
+  const temporal = parseTemporalWindow(question);
+  return {
+    direction: temporal.direction,
+    timeValue: temporal.value,
+    timeUnit: temporal.unit,
+    timeLabel: temporal.label,
+    confidence: 0.35,
+  };
+}
+
+function buildDeterministicScopeSelection(question: string, intent: QuestionIntent, mode: AgentMode): ScopeSelectionDecision {
+  const q = question.toLowerCase();
+  const hasTiming = intent.flags.includes('timing') || intent.flags.includes('dasha') || /\b(when|timing|timeline|period)\b/.test(q);
+  const hasCareer = intent.flags.includes('career') || intent.topics.includes('career') || /\b(career|job|profession|business|work|promotion)\b/.test(q);
+  const hasRelationship = intent.flags.includes('relationship') || intent.topics.includes('relationship') || /\b(marriage|relationship|partner|spouse|love|compatibility|romance|dating)\b/.test(q);
+  const hasLongevity = intent.flags.includes('longevity') || /\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/.test(q);
+  const hasTransit = intent.flags.includes('transit') || /\b(transit|gochar|today|now|tomorrow)\b/.test(q);
+
+  const questionType: QuestionTypeRoute = hasTiming && hasRelationship
+    ? 'timing_marriage'
+    : hasTiming && hasCareer
+      ? 'timing_career'
+      : hasTiming
+        ? 'timing_general'
+        : hasRelationship
+          ? 'relationship_general'
+          : hasCareer
+            ? 'career_general'
+            : 'other';
+
+  const requiredScopes = clampRequiredScopes(pickQuestionScope(question), ['chart.varga.D1', 'chart.graha', 'chart.lagna'], mode);
+  const needsDasha = hasTiming;
+  const needsTransit = hasTransit;
+  const needsD9 = hasRelationship || intent.flags.includes('d9');
+  const needsD10 = hasCareer;
+  const needsLongevity = hasLongevity;
+  const needsGeneral = true;
+
+  const requiredTools = [
+    needsGeneral ? 'general' : '',
+    needsDasha ? 'dasha' : '',
+    needsTransit ? 'transit' : '',
+    needsD9 ? 'd9' : '',
+    needsD10 ? 'career' : '',
+    needsLongevity ? 'longevity' : '',
+  ].filter(Boolean);
+
+  return {
+    questionType,
+    requiredScopes,
+    requiredTools,
+    needsDasha,
+    needsTransit,
+    needsD9,
+    needsD10,
+    needsLongevity,
+    needsGeneral,
+    confidence: 0.35,
+  };
+}
+
+function applyTemporalToIntent(intent: QuestionIntent, temporal: TemporalWindowDecision): QuestionIntent {
+  const nextFlags = new Set(intent.flags);
+
+  if (temporal.direction !== 'present') {
+    nextFlags.add('timing');
+  }
+
+  if (temporal.direction === 'future') {
+    nextFlags.add('forecast');
+    nextFlags.delete('history');
+  } else if (temporal.direction === 'past') {
+    nextFlags.add('history');
+    nextFlags.delete('forecast');
+  }
+
+  if (intent.topics.includes('career') && temporal.direction !== 'present') {
+    nextFlags.add('career_timing');
+  }
+
+  return {
+    ...intent,
+    flags: [...nextFlags],
+    timeDirection: temporal.direction,
+    timeValue: temporal.timeValue,
+    timeUnit: temporal.timeUnit,
+    timeLabel: temporal.timeLabel,
+  };
+}
+
+async function decideTemporalWindowDetailed(
+  message: string,
+  mode: AgentMode,
+  conversationContext: string[] = [],
+  referenceTimestamp: number = Date.now()
+): Promise<{ decision: TemporalWindowDecision; model: string; usedFallback: boolean; latencyMs: number }> {
+  const deterministic = buildDeterministicTemporalWindow(message);
+
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_TEMPORAL_ENABLED)) {
+    return {
+      decision: deterministic,
+      model: 'temporal-disabled',
+      usedFallback: true,
+      latencyMs: 0,
+    };
+  }
+
+  const result = await invokeDecisionNode<TemporalWindowDecision>({
+    node: 'temporal_parser',
+    schema: TemporalWindowDecisionSchema,
+    input: {
+      question: message,
+      mode,
+      referenceTimestamp,
+      conversationContext: conversationContext.slice(-6),
+      instruction:
+        'Extract temporal window for astrology intent routing. Return structured time direction and optional value/unit. Use present when uncertain.',
+    },
+    fallback: () => deterministic,
+  });
+
+  return result;
+}
+
+async function decideScopeSelectionDetailed(
+  question: string,
+  mode: AgentMode,
+  intent: QuestionIntent,
+  temporal: TemporalWindowDecision,
+  conversationContext: string[] = []
+): Promise<{ decision: ScopeSelectionDecision; model: string; usedFallback: boolean; latencyMs: number }> {
+  const deterministic = buildDeterministicScopeSelection(question, applyTemporalToIntent(intent, temporal), mode);
+
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_SCOPE_SELECTOR_ENABLED)) {
+    return {
+      decision: deterministic,
+      model: 'scope-disabled',
+      usedFallback: true,
+      latencyMs: 0,
+    };
+  }
+
+  const result = await invokeDecisionNode<ScopeSelectionDecision>({
+    node: 'intent_and_scope_router',
+    schema: ScopeSelectionDecisionSchema,
+    input: {
+      question,
+      mode,
+      intent,
+      temporal,
+      conversationContext: conversationContext.slice(-6),
+      deterministicScopes: deterministic.requiredScopes,
+      instruction:
+        'Classify question type and choose required canonical scopes/tools for astrology analysis. Prioritize precision and avoid unrelated scopes.',
+    },
+    fallback: () => deterministic,
+  });
+
+  return {
+    ...result,
+    decision: {
+      ...result.decision,
+      requiredScopes: clampRequiredScopes(result.decision.requiredScopes, deterministic.requiredScopes, mode),
+      requiredTools: [...new Set(result.decision.requiredTools.map((item) => normalizeToken(item)))],
+    },
+  };
+}
+
+function buildDeterministicUnifiedIntentScopeDecision(question: string, mode: AgentMode): UnifiedIntentScopeDecision {
+  const deterministicTemporal = buildDeterministicTemporalWindow(question);
+  const deterministicIntent = applyTemporalToIntent(classifyQuestionIntent(question), deterministicTemporal);
+  const deterministicScope = buildDeterministicScopeSelection(question, deterministicIntent, mode);
+
+  return {
+    primary: deterministicIntent.primary,
+    flags: deterministicIntent.flags,
+    topics: deterministicIntent.topics,
+    timeDirection: deterministicTemporal.direction,
+    timeValue: deterministicTemporal.timeValue,
+    timeUnit: deterministicTemporal.timeUnit,
+    timeLabel: deterministicTemporal.timeLabel,
+    questionType: deterministicScope.questionType,
+    requiredScopes: deterministicScope.requiredScopes,
+    requiredTools: deterministicScope.requiredTools,
+    needsDasha: deterministicScope.needsDasha,
+    needsTransit: deterministicScope.needsTransit,
+    needsD9: deterministicScope.needsD9,
+    needsD10: deterministicScope.needsD10,
+    needsLongevity: deterministicScope.needsLongevity,
+    needsGeneral: deterministicScope.needsGeneral,
+    confidence: 0.35,
+  };
+}
+
+async function decideUnifiedIntentScopeDetailed(
+  question: string,
+  mode: AgentMode,
+  conversationContext: string[] = [],
+  referenceTimestamp: number = Date.now()
+): Promise<{ decision: UnifiedIntentScopeDecision; model: string; usedFallback: boolean; latencyMs: number }> {
+  const deterministic = buildDeterministicUnifiedIntentScopeDecision(question, mode);
+  const legacyIntentEnabled = isDecisionNodeEnabled(env.LLM_DECISION_INTENT_ENABLED);
+  const legacyTemporalEnabled = isDecisionNodeEnabled(env.LLM_DECISION_TEMPORAL_ENABLED);
+  const legacyScopeEnabled = isDecisionNodeEnabled(env.LLM_DECISION_SCOPE_SELECTOR_ENABLED);
+  const unifiedEnabled = legacyIntentEnabled || legacyTemporalEnabled || legacyScopeEnabled;
+
+  if (!unifiedEnabled) {
+    return {
+      decision: deterministic,
+      model: 'intent-scope-unified-disabled',
+      usedFallback: true,
+      latencyMs: 0,
+    };
+  }
+
+  const result = await invokeDecisionNode<UnifiedIntentScopeDecision>({
+    node: 'intent_scope_unified',
+    schema: UnifiedIntentScopeDecisionSchema,
+    input: {
+      question,
+      mode,
+      referenceTimestamp,
+      conversationContext: conversationContext.slice(-8),
+      deterministic,
+      instruction:
+        'Extract intent, temporal window, and scope/tool requirements in one JSON. Keep output conservative, mode-aware, and aligned to deterministic hints when uncertain.',
+    },
+    fallback: () => deterministic,
+  });
+
+  return {
+    ...result,
+    decision: {
+      ...result.decision,
+      flags: [...new Set(result.decision.flags.map((flag) => normalizeToken(flag)))],
+      topics: [...new Set(result.decision.topics.map((topic) => normalizeToken(topic)))],
+      requiredScopes: clampRequiredScopes(result.decision.requiredScopes, deterministic.requiredScopes, mode),
+      requiredTools: [...new Set(result.decision.requiredTools.map((item) => normalizeToken(item)))],
+    },
+  };
+}
+
+async function decideMiniScopeDetailed(
+  question: string,
+  mode: AgentMode,
+  conversationContext: string[] = []
+): Promise<{ decision: MiniScopeDecision; model: string; usedFallback: boolean; latencyMs: number }> {
+  if (mode === 'pro') {
+    return {
+      decision: { allowed: true, enforcementMode: 'full', reasons: [], confidence: 1 },
+      model: 'mini-scope-not-required',
+      usedFallback: false,
+      latencyMs: 0,
+    };
+  }
+
+  const deterministic = evaluateMiniScope(question);
+  const deterministicDecision: MiniScopeDecision = {
+    allowed: deterministic.allowed,
+    enforcementMode: deterministic.enforcementMode,
+    reasons: deterministic.reasons,
+    suggestedAlternative: deterministic.suggestedAlternative,
+    confidence: 0.35,
+  };
+
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_MINI_SCOPE_ENABLED)) {
+    return {
+      decision: deterministicDecision,
+      model: 'mini-scope-disabled',
+      usedFallback: true,
+      latencyMs: 0,
+    };
+  }
+
+  const result = await invokeDecisionNode<MiniScopeDecision>({
+    node: 'mini_scope_decision',
+    schema: MiniScopeDecisionSchema,
+    input: {
+      question,
+      mode,
+      conversationContext: conversationContext.slice(-6),
+      deterministicReasons: deterministic.reasons,
+      instruction:
+        'Decide mini-scope enforcement mode. Modes: full (allowed as-is), restricted (answer with D1/D9 foundational scope), blocked (requires Pro). Mini allows D1/D9 and basic non-predictive guidance. Block advanced systems and predictive timing.',
+    },
+    fallback: () => deterministicDecision,
+  });
+
+  const clampedMode = miniScopeSeverity(result.decision.enforcementMode) >= miniScopeSeverity(deterministicDecision.enforcementMode)
+    ? result.decision.enforcementMode
+    : deterministicDecision.enforcementMode;
+  const forcedAllowed = clampedMode !== 'blocked';
+  const reasons = [...new Set([...deterministic.reasons, ...result.decision.reasons])];
+  const suggestedAlternative = result.decision.suggestedAlternative ?? deterministicDecision.suggestedAlternative;
+
+  return {
+    ...result,
+    decision: {
+      ...result.decision,
+      enforcementMode: clampedMode,
+      allowed: forcedAllowed,
+      reasons,
+      suggestedAlternative,
+    },
+  };
+}
+
+function deriveDeterministicFastAnswerIntent(message: string, route: TopLevelRoute): FastAnswerIntentDecision {
+  let intentKind: FastAnswerIntentKind;
+  if (isIdentityQuestion(message)) {
+    intentKind = 'identity';
+  } else if (isCapabilityQuestion(message)) {
+    intentKind = 'capability';
+  } else if (route === 'smalltalk') {
+    intentKind = 'smalltalk';
+  } else {
+    intentKind = 'general_astro';
+  }
+
+  return {
+    intentKind,
+    responseStyle: 'brief',
+    confidence: 0.35,
+  };
+}
+
+async function decideFastAnswerIntentDetailed(
+  message: string,
+  mode: AgentMode,
+  route: TopLevelRoute,
+  conversationContext: string[] = []
+): Promise<{ decision: FastAnswerIntentDecision; model: string; usedFallback: boolean; latencyMs: number }> {
+  const deterministic = deriveDeterministicFastAnswerIntent(message, route);
+
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_FAST_ANSWER_ENABLED)) {
+    return {
+      decision: deterministic,
+      model: 'fast-answer-disabled',
+      usedFallback: true,
+      latencyMs: 0,
+    };
+  }
+
+  const result = await invokeDecisionNode<FastAnswerIntentDecision>({
+    node: 'fast_answer_intent',
+    schema: FastAnswerIntentDecisionSchema,
+    input: {
+      message,
+      mode,
+      route,
+      conversationContext: conversationContext.slice(-6),
+      instruction:
+        'Classify the fast-answer intent for a non-pipeline astrology chat message. Pick exactly one intent kind.',
+    },
+    fallback: () => deterministic,
+  });
+
+  return result;
+}
+
+function decideTopLevelRouteDeterministic(message: string): TopLevelRoute {
+  // DEPRECATED: Kept for reference only. Direct LLM routing is now used.
+  // This function is no longer critical to the routing decision.
+  const q = message.trim().toLowerCase();
+
+  if (!q || /^(h+i+|hello|hey|namaste|good\s+(morning|afternoon|evening)|thanks|thank you|bye|goodbye)\b/.test(q)) {
+    return 'smalltalk';
+  }
+
+  if (/\b(what\s+can\s+you|how\s+can\s+you|features|capabilities)\b/.test(q)) {
+    return 'general_astro';
+  }
+
+  // Default to pipeline for anything with personal chart cues
+  if (/\b(my|mine|me|for me|my chart|my kundli|when will i|will i|should i)\b/.test(q)) {
+    return 'pipeline';
+  }
+
+  return 'general_astro'; // Safe default
+}
+
+// DIRECT LLM ROUTER - Connects message → decision → response immediately
+async function directLLMRoute(
+  message: string,
+  mode: AgentMode,
+  conversationContext: string[] = []
+): Promise<{ route: TopLevelRoute; confidence: number; latencyMs: number }> {
+  const startTime = Date.now();
+  const deterministicRoute = decideTopLevelRouteDeterministic(message);
+  
+  const result = await invokeDecisionNode<IntentRouteDecision>({
+    node: 'route_top_level',
+    schema: IntentRouteDecisionSchema,
+    input: {
+      message,
+      mode,
+      conversationContext: conversationContext.slice(-8),
+      allowedRoutes: ['pipeline', 'smalltalk', 'general_astro'],
+      instruction: `You are Cozmic AI's root routing node. Analyze the user message and decide ONE route:
+
+**smalltalk** (instant response): Greetings (hi, hello), thanks/acks (thanks, okay, cool), farewells (bye, goodbye), casual chat
+    **general_astro** (brief astro answer): Concept questions (what is nakshatra, planets), capabilities (what can you do), features, general astrology, "who are you / who built you"
+**pipeline** (full analysis): Personal requests with "my" (my chart, my career, my marriage), predictions (when will I), timing requests
+
+    Mode policy:
+    - mini: keep non-pipeline astrology scope to D1, D9, and basic astrological insights.
+    - pro: allow all kinds of astrology answers and advanced topics.
+
+    Brand rule:
+    - If user asks identity (who are you / who built you), route to general_astro so response can clearly state: "I am Cozmic AI."
+
+Message: "${message}"
+
+Reply with just the route name and confidence score (0-1).`,
+    },
+    fallback: () => ({
+      topRoute: deterministicRoute,
+      confidence: deterministicRoute === 'pipeline' ? 0.85 : 0.7,
+      reasoningBrief: 'llm fallback deterministic',
+      requiresPersonalChart: deterministicRoute === 'pipeline',
+    }),
+  });
+
+  return {
+    route: result.decision.topRoute,
+    confidence: result.decision.confidence,
+    latencyMs: Date.now() - startTime,
+  };
+}
+
+// IMMEDIATE RESPONSE GENERATORS - Called after LLM route decision
+
+
+async function generatePipelineResponse(message: string, mode: AgentMode): Promise<Pick<AgentAnswer, 'answer' | 'model' | 'mode'>> {
+  // Route to full pipeline - handled by langgraph
+  return {
+    answer: 'Loading your chart analysis...',
+    model: 'cozmic-pipeline-router',
+    mode,
+  };
+}
+
+async function decideTopLevelRoute(message: string, mode: AgentMode = 'mini', conversationContext: string[] = []): Promise<IntentRouteDecision> {
+  // Direct LLM decision - no pattern detection
+  const result = await directLLMRoute(message, mode, conversationContext);
+  return {
+    topRoute: result.route,
+    confidence: result.confidence,
+    reasoningBrief: `direct_llm (${result.latencyMs}ms)`,
+    requiresPersonalChart: result.route === 'pipeline',
+  };
+}
+
+async function decideTopLevelRouteDetailed(
+  message: string,
+  mode: AgentMode = 'mini',
+  conversationContext: string[] = []
+): Promise<{ decision: IntentRouteDecision; model: string; usedFallback: boolean; latencyMs: number }> {
+  const result = await directLLMRoute(message, mode, conversationContext);
+  return {
+    decision: {
+      topRoute: result.route,
+      confidence: result.confidence,
+      reasoningBrief: 'direct_llm_router',
+      requiresPersonalChart: result.route === 'pipeline',
+    },
+    model: 'cozmic-direct-llm-router',
+    usedFallback: false,
+    latencyMs: result.latencyMs,
+  };
+}
+
+export async function shouldBypassChartPipeline(message: string, mode: AgentMode = 'mini', conversationContext: string[] = []): Promise<boolean> {
+  const route = await decideTopLevelRoute(message, mode, conversationContext);
+  return route.topRoute !== 'pipeline';
+}
+
+function isIdentityQuestion(message: string): boolean {
+  const q = message.toLowerCase().trim();
+  return /\b(who\s+(are\s+)?you|who\s+built\s+you|who\s+created\s+you|what\s+are\s+you|who\s+made\s+you|tell\s+me\s+about\s+yourself|your\s+name|introduce\s+yourself)\b/.test(q);
+}
+
+function isCapabilityQuestion(message: string): boolean {
+  const q = message.toLowerCase().trim();
+  return /\b(what\s+can\s+you\s+do|how\s+can\s+you\s+help|your\s+capabilities|features|what\s+do\s+you\s+do|help\s+me\s+with)\b/.test(q);
+}
+
+// Response generators for immediate answers after LLM route decision
+async function answerIdentityQuestion(message: string, mode: AgentMode): Promise<string> {
+  const identityAnswers = {
+    mini: 'I am Cozmic AI, your Vedic astrology assistant. I analyze your birth chart (D1 & D9) for personality, relationships, and compatibility insights. In mini mode, I focus on the main chart and divisional chart 9 (marriage). Share your birth details to get started!',
+    pro: 'I am Cozmic AI, your comprehensive Vedic astrology assistant. I analyze all divisional charts (D1-D30), dasha periods, transits, yogas, and advanced techniques for personality, relationships, career, finances, health, and life timing. Share your birth details for deep cosmic insights!',
+  };
+  return identityAnswers[mode];
+}
+
+async function answerCapabilityQuestion(message: string, mode: AgentMode): Promise<string> {
+  const capabilityAnswers = {
+    mini: 'In **mini mode**, I analyze your **D1 (Main Chart)** for core personality and **D9 (Navamsha)** for relationships and hidden traits. You get personality insights, relationship compatibility, and basic life timing. Upgrade to **Pro** for career analysis (D10), longevity (D8/D30), and advanced techniques.',
+    pro: 'I provide complete Vedic astrology analysis: **all divisional charts** (D1, D9, D10, D8, D30, D7, D4, D12, D20), **dasha periods** (life timing), **transits** (current planetary cycles), **yogas** (auspicious combinations), and advanced astrological techniques. I cover personality, relationships, career, finances, health, remedies, and timing.',
+  };
+  return capabilityAnswers[mode];
+}
+
+async function generateSmallTalkResponse(message: string, mode: AgentMode, conversationContext: string[] = []): Promise<string> {
+  try {
+    const response = await invokeDeepSeekBedrock({
+      systemPrompt: [
+        'You are Cozmic AI, a friendly Vedic astrology assistant.',
+        'Respond briefly (1-2 short sentences).',
+        'If asked identity (who are you / who built you), explicitly say: "I am Cozmic AI."',
+        mode === 'mini'
+          ? 'Mini mode scope: mention D1, D9, and basic astrology guidance only.'
+          : 'Pro mode scope: you may mention comprehensive astrology capabilities.',
+      ].join(' '),
+      userPrompt: [
+        `Message: ${message}`,
+        conversationContext.length > 0 ? `Recent context: ${conversationContext.slice(-4).join(' | ')}` : 'Recent context: none',
+      ].join('\n'),
+      maxTokens: 90,
+    });
+
+    const text = response.text.trim();
+    if (text) return text;
+  } catch {
+    // fall through to deterministic fallback
+  }
+
+  return 'I am Cozmic AI. Ask me anything about your chart, astrology concepts, or life guidance.';
+}
+
+async function generateGeneralAstroResponse(message: string, mode: AgentMode, conversationContext: string[] = []): Promise<string> {
+  // LLM for complex concept questions
+  try {
+    const response = await invokeDeepSeekBedrock({
+      systemPrompt: `You are Cozmic AI, a Vedic astrology assistant. Answer clearly and accurately in 2-4 short sentences.
+Identity rule: If the user asks who you are or who built you, say clearly: "I am Cozmic AI."
+${mode === 'mini'
+  ? 'Mini mode policy: answer using D1, D9, and basic astrology insights only. Avoid deep advanced techniques.'
+  : 'Pro mode policy: provide all kinds of astrology answers, including advanced divisional charts, dasha, transit, yogas, and timing.'}
+If question needs personal chart-specific analysis but birth details are missing, ask for birth details.` ,
+      userPrompt: [
+        `User message: ${message}`,
+        conversationContext.length > 0 ? `Recent context: ${conversationContext.slice(-6).join(' | ')}` : 'Recent context: none',
+      ].join('\n'),
+      maxTokens: 150,
+    });
+    return response.text.trim();
+  } catch {
+    return 'I can explain astrology concepts. What would you like to know about planets, houses, signs, nakshatras, or timing?';
+  }
+}
+
+async function answerSimpleWithoutChart(
+  message: string,
+  mode: AgentMode,
+  route: TopLevelRoute,
+  conversationContext: string[] = []
+): Promise<Pick<AgentAnswer, 'answer' | 'model' | 'mode'>> {
+  try {
+    const decisionResult = await decideFastAnswerIntentDetailed(message, mode, route, conversationContext);
+    const decision = decisionResult.decision;
+
+    let answer = '';
+    let handlerModel = 'cozmic-fallback-response';
+
+    switch (decision.intentKind) {
+      case 'identity':
+        answer = await answerIdentityQuestion(message, mode);
+        handlerModel = 'cozmic-identity-response';
+        break;
+      case 'capability':
+        answer = await answerCapabilityQuestion(message, mode);
+        handlerModel = 'cozmic-capability-response';
+        break;
+      case 'smalltalk':
+        answer = await generateSmallTalkResponse(message, mode, conversationContext);
+        handlerModel = 'cozmic-smalltalk-response';
+        break;
+      case 'general_astro':
+      default:
+        answer = await generateGeneralAstroResponse(message, mode, conversationContext);
+        handlerModel = 'cozmic-general-astro-response';
+        break;
+    }
+
+    return {
+      answer: answer.trim() || 'Ask me an astrology question, and I will help!',
+      model: `${handlerModel}|intent=${decision.intentKind}|router=${decisionResult.model}`,
+      mode,
+    };
+  } catch {
+    return {
+      answer: 'I can help with astrology. What would you like to know?',
+      model: 'cozmic-error-fallback',
+      mode,
+    };
+  }
+}
+
 function determineQuestionFamily(question: string, intent: QuestionIntent): QuestionFamily {
   const q = question.toLowerCase();
 
@@ -817,7 +2093,7 @@ function buildDynamicExecutionPlan(question: string, intent: QuestionIntent, mod
 
   const includeMicroSignals: MicroSignal[] = ['nakshatra', 'nakshatra_lord', 'sign_lord', 'drishti', 'degree'];
 
-  const seriesNodes = ['load_grounding', 'classify_intent', 'plan_execution', 'run_specialized_tools', 'run_general_tools', 'build_prompt', 'answer_with_deepseek', 'condense_answer'];
+  const seriesNodes = ['classify_intent', 'load_grounding', 'plan_and_tools', 'run_specialized_tools', 'run_general_tools', 'build_prompt', 'answer_with_deepseek', 'condense_answer'];
   const parallelBatches = [
     ['atlas', 'varga', 'placement'],
     [includeDasha ? 'dasha' : '', includeTransit ? 'transit' : '', includeCareer ? 'career' : ''].filter(Boolean),
@@ -945,7 +2221,12 @@ function planetPathHints(question: string): string[] {
   return hints;
 }
 
-function selectRelevantPaths(question: string, flags: string[] = [], mode: AgentMode = 'pro'): string[] {
+function selectRelevantPaths(
+  question: string,
+  flags: string[] = [],
+  mode: AgentMode = 'pro',
+  scopeSelection: ScopeSelectionDecision | null = null
+): string[] {
   const q = question.toLowerCase();
   const paths = new Set<string>([
     'chart.user',
@@ -964,8 +2245,12 @@ function selectRelevantPaths(question: string, flags: string[] = [], mode: Agent
 
   const add = (...items: string[]) => items.forEach((item) => paths.add(item));
 
-  for (const scope of pickQuestionScope(q)) {
-    add(scope);
+  if (scopeSelection?.requiredScopes?.length) {
+    add(...scopeSelection.requiredScopes);
+  } else {
+    for (const scope of pickQuestionScope(q)) {
+      add(scope);
+    }
   }
 
   if (flags.includes('d9')) add('chart.varga.D9');
@@ -974,6 +2259,14 @@ function selectRelevantPaths(question: string, flags: string[] = [], mode: Agent
   if (flags.includes('career')) add('chart.varga.D10');
   if (flags.includes('relationship')) add('chart.varga.D9');
   if (flags.includes('longevity')) add('chart.varga.D8', 'chart.varga.D30', 'chart.dasha', 'chart.bhava');
+
+  if (scopeSelection) {
+    if (scopeSelection.needsDasha) add('chart.dasha');
+    if (scopeSelection.needsTransit) add('chart.transit', 'chart.transits', 'chart.gochar');
+    if (scopeSelection.needsD9) add('chart.varga.D9');
+    if (scopeSelection.needsD10) add('chart.varga.D10');
+    if (scopeSelection.needsLongevity) add('chart.varga.D8', 'chart.varga.D30');
+  }
 
   if (/\b(career|job|profession|business|promotion|work|employment|salary|interview|office)\b/.test(q)) {
     add('chart.varga.D10', 'chart.varga.D1', 'chart.varga.D11');
@@ -1028,8 +2321,14 @@ function selectRelevantPaths(question: string, flags: string[] = [], mode: Agent
   return [...paths];
 }
 
-function selectSections(rawPayload: unknown, question: string, flags: string[] = [], mode: AgentMode = 'pro'): SelectedSection[] {
-  const selectedPaths = selectRelevantPaths(question, flags, mode);
+function selectSections(
+  rawPayload: unknown,
+  question: string,
+  flags: string[] = [],
+  mode: AgentMode = 'pro',
+  scopeSelection: ScopeSelectionDecision | null = null
+): SelectedSection[] {
+  const selectedPaths = selectRelevantPaths(question, flags, mode, scopeSelection);
   return selectedPaths
     .map((path) => ({ path, value: getByPath(rawPayload, path) }))
     .filter((section) => section.value !== undefined);
@@ -1043,35 +2342,39 @@ function normalizeRawPayload(rawPayload: unknown): unknown {
 }
 
 async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdateType> {
-  const store = getPostgresStore();
-  const profilePath = `${COLLECTIONS.ragProfiles}/${state.ownerId}__${state.profileId}`;
-  const profileDoc = await store.getDocument<RagProfileDocument>(profilePath);
-
-  if (!profileDoc) {
-    throw new Error(`No canonical profile snapshot found for ${state.profileId}. Regenerate the Kundli first.`);
+  const profileId = state.profileId;
+  if (!profileId) {
+    throw new Error('Profile identity is required before grounding can be loaded.');
   }
 
-  const sourceDoc = await store.getDocument<RagApiSourceDocument>(
-    `${COLLECTIONS.ragApiSources}/${profileDoc.data.latestSourceDocId}`
-  );
+  const ragProfiles = getRagProfilesRepository();
+  const ragSources = getRagSourcesRepository();
+  const profileDoc = await ragProfiles.getByOwnerAndProfileId(state.ownerId, profileId);
+
+  if (!profileDoc) {
+    throw new Error(`No canonical profile snapshot found for ${profileId}. Regenerate the Kundli first.`);
+  }
+
+  const sourceDoc = await ragSources.getById(profileDoc.latestSourceDocId);
 
   if (!sourceDoc) {
-    throw new Error(`No canonical raw payload found for profile ${state.profileId}. Regenerate the Kundli first.`);
+    throw new Error(`No canonical raw payload found for profile ${profileId}. Regenerate the Kundli first.`);
   }
 
   const rawPayload = normalizeRawPayload(sourceDoc.data.rawPayload);
   const atlas = summarizeChartAtlas(rawPayload);
-  const selectedSections = selectSections(rawPayload, state.question, [], state.mode);
+  const toolAvailabilityPreflight = buildToolAvailabilityPreflight(rawPayload, state.mode);
+  const selectedSections = selectSections(rawPayload, state.question, state.intent?.flags ?? [], state.mode, state.scopeSelection ?? null);
   const fallbackSections = selectedSections.length > 0 ? selectedSections : atlas.slice(0, 12).map((item) => ({ path: item.path, value: getByPath(rawPayload, item.path) }));
-  const kundli = state.kundliInput ?? profileDoc.data.kundliInput;
+  const kundli = state.kundliInput ?? profileDoc.kundliInput;
 
   return {
     grounding: {
       ownerId: state.ownerId,
-      profileId: state.profileId,
-      sourceDocId: profileDoc.data.latestSourceDocId,
-      chartVersion: profileDoc.data.chartVersion,
-      kundliSignature: profileDoc.data.kundliSignature,
+      profileId,
+      sourceDocId: profileDoc.latestSourceDocId,
+      chartVersion: profileDoc.chartVersion,
+      kundliSignature: profileDoc.kundliSignature,
       kundli,
       requestKey: sourceDoc.data.requestKey,
       payloadHash: sourceDoc.data.payloadHash,
@@ -1081,6 +2384,7 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
       selectedPaths: fallbackSections.map((section) => section.path),
       selectedSections: fallbackSections,
     },
+    toolAvailabilityPreflight,
     toolFindings: [{
       name: 'Reference time analyzer',
       status: 'ok',
@@ -1766,8 +3070,14 @@ function makeTransitToolFinding(rawPayload: unknown): ToolFinding {
   };
 }
 
-function makeGeneralToolFinding(rawPayload: unknown, question: string, flags: string[]): ToolFinding {
-  const sections = selectSections(rawPayload, question, flags);
+function makeGeneralToolFinding(
+  rawPayload: unknown,
+  question: string,
+  flags: string[],
+  mode: AgentMode = 'pro',
+  scopeSelection: ScopeSelectionDecision | null = null
+): ToolFinding {
+  const sections = selectSections(rawPayload, question, flags, mode, scopeSelection);
   if (sections.length === 0) {
     return {
       name: 'General grounding analyzer',
@@ -1824,25 +3134,625 @@ function makeArudhaToolFinding(rawPayload: unknown): ToolFinding {
 }
 
 async function classifyIntentNode(state: AgentStateType): Promise<AgentUpdateType> {
-  const intent = classifyQuestionIntent(state.question);
+  const deterministicUnified = buildDeterministicUnifiedIntentScopeDecision(state.question, state.mode);
+  const result = await decideUnifiedIntentScopeDetailed(
+    state.question,
+    state.mode,
+    state.conversationContext ?? [],
+    state.referenceTimestamp ?? Date.now()
+  );
+
+  const legacyIntentEnabled = isDecisionNodeEnabled(env.LLM_DECISION_INTENT_ENABLED);
+  const legacyTemporalEnabled = isDecisionNodeEnabled(env.LLM_DECISION_TEMPORAL_ENABLED);
+  const legacyScopeEnabled = isDecisionNodeEnabled(env.LLM_DECISION_SCOPE_SELECTOR_ENABLED);
+
+  const temporalWindow: TemporalWindowDecision = {
+    direction: legacyTemporalEnabled ? result.decision.timeDirection : deterministicUnified.timeDirection,
+    timeValue: legacyTemporalEnabled ? result.decision.timeValue : deterministicUnified.timeValue,
+    timeUnit: legacyTemporalEnabled ? result.decision.timeUnit : deterministicUnified.timeUnit,
+    timeLabel: legacyTemporalEnabled ? result.decision.timeLabel : deterministicUnified.timeLabel,
+    confidence: legacyTemporalEnabled ? result.decision.confidence : 0.35,
+  };
+
+  const llmIntentBase: QuestionIntent = {
+    primary: result.decision.primary,
+    flags: [...new Set(result.decision.flags.map((flag) => normalizeToken(flag)))],
+    topics: [...new Set(result.decision.topics.map((topic) => normalizeToken(topic)))],
+    timeDirection: temporalWindow.direction,
+    timeValue: temporalWindow.timeValue,
+    timeUnit: temporalWindow.timeUnit,
+    timeLabel: temporalWindow.timeLabel,
+  };
+
+  const deterministicIntentBase = classifyQuestionIntent(state.question);
+  const intentBase = legacyIntentEnabled ? llmIntentBase : deterministicIntentBase;
+  const intent = applyTemporalToIntent(intentBase, temporalWindow);
+
+  const deterministicScope = buildDeterministicScopeSelection(state.question, intent, state.mode);
+  const scopeSelection: ScopeSelectionDecision = legacyScopeEnabled
+    ? {
+        questionType: result.decision.questionType,
+        requiredScopes: clampRequiredScopes(result.decision.requiredScopes, deterministicScope.requiredScopes, state.mode),
+        requiredTools: (() => {
+          const normalized = [...new Set(result.decision.requiredTools.map((item) => normalizeToken(item)))];
+          return normalized.length > 0 ? normalized : deterministicScope.requiredTools;
+        })(),
+        needsDasha: result.decision.needsDasha,
+        needsTransit: result.decision.needsTransit,
+        needsD9: result.decision.needsD9,
+        needsD10: result.decision.needsD10,
+        needsLongevity: result.decision.needsLongevity,
+        needsGeneral: result.decision.needsGeneral,
+        confidence: result.decision.confidence,
+      }
+    : {
+        ...deterministicScope,
+        confidence: 0.35,
+      };
+
+  const deterministicIntentWithTemporal = applyTemporalToIntent(
+    classifyQuestionIntent(state.question),
+    {
+      direction: deterministicUnified.timeDirection,
+      timeValue: deterministicUnified.timeValue,
+      timeUnit: deterministicUnified.timeUnit,
+      timeLabel: deterministicUnified.timeLabel,
+      confidence: deterministicUnified.confidence,
+    }
+  );
+
+  const usedAnyLlm = (legacyIntentEnabled || legacyTemporalEnabled || legacyScopeEnabled) && !result.usedFallback;
+  const source: DecisionBundle['source'] = usedAnyLlm
+    ? 'llm'
+    : (legacyIntentEnabled || legacyTemporalEnabled || legacyScopeEnabled)
+      ? 'hybrid'
+      : 'deterministic';
+
+  const shadowIntentComparison = env.LLM_DECISION_SHADOW_MODE
+    ? `deterministicPrimary=${deterministicIntentWithTemporal.primary}; llmPrimary=${result.decision.primary}; finalPrimary=${intent.primary}; match=${deterministicIntentWithTemporal.primary === intent.primary}`
+    : undefined;
+
   return {
+    temporalWindow,
     intent,
-    analysisStages: appendStage(state, 'classify_intent', 'Classifying user question intent', `Primary=${intent.primary}; flags=${intent.flags.join(',') || 'none'}`),
+    scopeSelection,
+    decisionBundle: mergeDecisionBundle(state, {
+      source,
+      intentPrimary: intent.primary,
+      questionFamily: determineQuestionFamily(state.question, intent),
+      timeDirection: temporalWindow.direction,
+      requiredScopes: scopeSelection.requiredScopes,
+      requiredToolGroups: clampToolGroups(
+        scopeSelection.requiredTools,
+        ['reference_time', 'general_grounding', 'varga', 'placement'],
+        state.mode
+      ),
+      miniEnforcementMode: state.mode === 'mini' ? evaluateMiniScope(state.question).enforcementMode : 'full',
+      confidence: result.decision.confidence,
+      reason: 'unified intent+temporal+scope decision',
+    }),
+    decisionTelemetry: appendDecisionTelemetry(state, {
+      node: 'intent_scope_unified',
+      model: result.model,
+      latencyMs: result.latencyMs,
+      confidence: result.decision.confidence,
+      usedFallback: result.usedFallback,
+      fallbackReason: result.usedFallback ? 'unified intent/scope fallback' : undefined,
+      shadowComparison: shadowIntentComparison,
+    }),
+    analysisStages: appendStage(
+      state,
+      'classify_intent',
+      'Classifying user question intent',
+      `Primary=${intent.primary}; flags=${intent.flags.join(',') || 'none'}; temporal=${temporalWindow.direction}; questionType=${scopeSelection.questionType}; model=${result.model}; latencyMs=${result.latencyMs}; confidence=${result.decision.confidence.toFixed(2)}`
+    ),
+  };
+}
+
+async function routeTopLevelNode(state: AgentStateType): Promise<AgentUpdateType> {
+  if (state.topLevelRoute) {
+    return {
+      analysisStages: appendStage(state, 'route_top_level', 'Routing question at top-level', `route=${state.topLevelRoute}`),
+    };
+  }
+
+  const result = await decideTopLevelRouteDetailed(state.question, state.mode, state.conversationContext ?? []);
+  const decision = result.decision;
+  const deterministicRoute = decideTopLevelRouteDeterministic(state.question);
+  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+    ? `deterministic=${deterministicRoute}; llm=${decision.topRoute}; match=${deterministicRoute === decision.topRoute}`
+    : undefined;
+  return {
+    topLevelRoute: decision.topRoute,
+    topLevelRouteConfidence: decision.confidence,
+    decisionBundle: mergeDecisionBundle(state, {
+      source: result.usedFallback ? 'hybrid' : 'llm',
+      topRoute: decision.topRoute,
+      confidence: decision.confidence,
+      reason: 'top-level routing',
+    }),
+    decisionTelemetry: appendDecisionTelemetry(state, {
+      node: 'route_top_level',
+      model: result.model,
+      latencyMs: result.latencyMs,
+      confidence: decision.confidence,
+      usedFallback: result.usedFallback,
+      fallbackReason: result.usedFallback ? 'route decision fallback' : undefined,
+      shadowComparison,
+    }),
+    analysisStages: appendStage(
+      state,
+      'route_top_level',
+      'Routing question at top-level',
+      `route=${decision.topRoute}; confidence=${decision.confidence.toFixed(2)}; model=${result.model}; latencyMs=${result.latencyMs}`
+    ),
+  };
+}
+
+function routeFromTopLevel(state: AgentStateType): 'fast_answer' | 'classify_intent' {
+  return state.topLevelRoute === 'pipeline' ? 'classify_intent' : 'fast_answer';
+}
+
+async function fastAnswerNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const route = state.topLevelRoute ?? 'smalltalk';
+  const fast = await answerSimpleWithoutChart(state.question, state.mode, route, state.conversationContext ?? []);
+  return {
+    answer: fast.answer,
+    model: fast.model,
+    executionPlan: {
+      family: 'general',
+      chartLayers: [],
+      includeTiming: false,
+      includeTransit: false,
+      includeDasha: false,
+      includeCareer: false,
+      includeRelationship: false,
+      includeMicroSignals: [],
+      seriesNodes: ['route_top_level', 'fast_answer'],
+      parallelBatches: [],
+    },
+    analysisStages: appendStage(state, 'fast_answer', 'Returning direct LLM answer for non-pipeline route', `route=${route}`),
   };
 }
 
 async function planExecutionNode(state: AgentStateType): Promise<AgentUpdateType> {
   const intent = state.intent ?? classifyQuestionIntent(state.question);
-  const executionPlan = buildDynamicExecutionPlan(state.question, intent, state.mode);
+  const deterministicPlan = buildDynamicExecutionPlan(state.question, intent, state.mode);
+
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_PLAN_ENABLED)) {
+    return {
+      executionPlan: deterministicPlan,
+      decisionTelemetry: appendDecisionTelemetry(state, {
+        node: 'plan_execution',
+        model: 'plan-disabled',
+        latencyMs: 0,
+        confidence: 0.25,
+        usedFallback: true,
+      }),
+      analysisStages: appendStage(
+        state,
+        'plan_execution',
+        'Planning dynamic analysis path',
+        `Family=${deterministicPlan.family}; layers=${deterministicPlan.chartLayers.join(',')}; parallelBatches=${deterministicPlan.parallelBatches.length}; model=plan-disabled`
+      ),
+    };
+  }
+
+  const result = await invokeDecisionNode<ExecutionPlanDecision>({
+    node: 'plan_execution',
+    schema: ExecutionPlanDecisionSchema,
+    input: {
+      question: state.question,
+      mode: state.mode,
+      intent,
+      allowedFamilies: [...QUESTION_FAMILY_ALLOWLIST],
+      allowedChartLayers: [...CHART_LAYER_ALLOWLIST],
+      allowedMicroSignals: [...MICRO_SIGNAL_ALLOWLIST],
+      instruction:
+        'Return execution plan fields for chart analysis. Use conservative defaults when uncertain and avoid unsupported layers.',
+    },
+    fallback: () => ({
+      questionFamily: deterministicPlan.family,
+      requiredChartLayers: deterministicPlan.chartLayers,
+      includeMicroSignals: deterministicPlan.includeMicroSignals,
+      includeTiming: deterministicPlan.includeTiming,
+      includeTransit: deterministicPlan.includeTransit,
+      includeDasha: deterministicPlan.includeDasha,
+      includeCareer: deterministicPlan.includeCareer,
+      includeRelationship: deterministicPlan.includeRelationship,
+      confidence: 0.35,
+    }),
+  });
+
+  const executionPlan: DynamicExecutionPlan = {
+    ...deterministicPlan,
+    family: clampQuestionFamily(result.decision.questionFamily, deterministicPlan.family),
+    chartLayers: clampChartLayers(result.decision.requiredChartLayers, deterministicPlan.chartLayers),
+    includeMicroSignals: clampMicroSignals(result.decision.includeMicroSignals, deterministicPlan.includeMicroSignals),
+    includeTiming: result.decision.includeTiming,
+    includeTransit: state.mode === 'pro' ? result.decision.includeTransit : false,
+    includeDasha: state.mode === 'pro' ? result.decision.includeDasha : false,
+    includeCareer: state.mode === 'pro' ? result.decision.includeCareer : false,
+    includeRelationship: result.decision.includeRelationship,
+  };
+
   return {
     executionPlan,
+    decisionTelemetry: appendDecisionTelemetry(state, {
+      node: 'plan_execution',
+      model: result.model,
+      latencyMs: result.latencyMs,
+      confidence: result.decision.confidence,
+      usedFallback: result.usedFallback,
+    }),
     analysisStages: appendStage(
       state,
       'plan_execution',
       'Planning dynamic analysis path',
-      `Family=${executionPlan.family}; layers=${executionPlan.chartLayers.join(',')}; parallelBatches=${executionPlan.parallelBatches.length}`
+      `Family=${executionPlan.family}; layers=${executionPlan.chartLayers.join(',')}; parallelBatches=${executionPlan.parallelBatches.length}; model=${result.model}; latencyMs=${result.latencyMs}; confidence=${result.decision.confidence.toFixed(2)}`
     ),
   };
+}
+
+async function planAndToolsNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const intent = state.intent ?? classifyQuestionIntent(state.question);
+  const deterministicPlan = buildDynamicExecutionPlan(state.question, intent, state.mode);
+  const deterministicGroups = buildDeterministicToolGroupsFromInputs({
+    question: state.question,
+    mode: state.mode,
+    intent,
+    executionPlan: deterministicPlan,
+    scopeSelection: state.scopeSelection,
+  });
+
+  const availableByManifest = getToolManifestForMode(state.mode).map((item) => item.group);
+  const preflight = state.toolAvailabilityPreflight;
+  const preflightAvailable = preflight?.availableGroups ?? availableByManifest;
+  const preflightBlocked = preflight?.blockedByMode ?? [];
+  const deterministicManifestSafe = deterministicGroups.filter((group) => preflightAvailable.includes(group) && !preflightBlocked.includes(group));
+  const deterministicForDecision = deterministicManifestSafe.length > 0 ? deterministicManifestSafe : deterministicGroups;
+
+  const planEnabled = isDecisionNodeEnabled(env.LLM_DECISION_PLAN_ENABLED);
+  const toolEnabled = isDecisionNodeEnabled(env.LLM_DECISION_TOOL_SELECTION_ENABLED);
+
+  if (!planEnabled && !toolEnabled) {
+    return {
+      executionPlan: deterministicPlan,
+      selectedToolGroups: deterministicForDecision,
+      decisionBundle: mergeDecisionBundle(state, {
+        source: 'deterministic',
+        questionFamily: deterministicPlan.family,
+        requiredToolGroups: deterministicForDecision,
+        confidence: 0.35,
+        reason: 'plan_and_tools deterministic path',
+      }),
+      decisionTelemetry: appendDecisionTelemetry(state, {
+        node: 'plan_and_tools',
+        model: 'plan-and-tools-disabled',
+        latencyMs: 0,
+        confidence: 0.25,
+        usedFallback: true,
+      }),
+      analysisStages: appendStage(
+        state,
+        'plan_and_tools',
+        'Planning execution and selecting tools',
+        `Family=${deterministicPlan.family}; layers=${deterministicPlan.chartLayers.join(',')}; selected=${deterministicForDecision.join(', ')}; model=plan-and-tools-disabled`
+      ),
+    };
+  }
+
+  const result = await invokeDecisionNode<PlanAndToolsDecision>({
+    node: 'plan_and_tools',
+    schema: PlanAndToolsDecisionSchema,
+    input: {
+      question: state.question,
+      mode: state.mode,
+      intent,
+      scopeSelection: state.scopeSelection,
+      deterministicPlan: {
+        questionFamily: deterministicPlan.family,
+        requiredChartLayers: deterministicPlan.chartLayers,
+        includeMicroSignals: deterministicPlan.includeMicroSignals,
+        includeTiming: deterministicPlan.includeTiming,
+        includeTransit: deterministicPlan.includeTransit,
+        includeDasha: deterministicPlan.includeDasha,
+        includeCareer: deterministicPlan.includeCareer,
+        includeRelationship: deterministicPlan.includeRelationship,
+      },
+      deterministicGroups: deterministicForDecision,
+      allowedFamilies: [...QUESTION_FAMILY_ALLOWLIST],
+      allowedChartLayers: [...CHART_LAYER_ALLOWLIST],
+      allowedMicroSignals: [...MICRO_SIGNAL_ALLOWLIST],
+      allowedGroups: [...TOOL_GROUP_ALLOWLIST],
+      toolManifest: getToolManifestForMode(state.mode).map((item) => ({
+        group: item.group,
+        minMode: item.minMode,
+        domains: item.domains,
+        requiredScopes: item.requiredScopes,
+        costClass: item.costClass,
+        fallbackGroup: item.fallbackGroup,
+      })),
+      preflight,
+      instruction:
+        'Return one JSON containing execution-plan fields and selected tool groups. Keep selection minimal but sufficient, respect mode and available data, and prefer deterministic hints when uncertain.',
+    },
+    fallback: () => ({
+      questionFamily: deterministicPlan.family,
+      requiredChartLayers: deterministicPlan.chartLayers,
+      includeMicroSignals: deterministicPlan.includeMicroSignals,
+      includeTiming: deterministicPlan.includeTiming,
+      includeTransit: deterministicPlan.includeTransit,
+      includeDasha: deterministicPlan.includeDasha,
+      includeCareer: deterministicPlan.includeCareer,
+      includeRelationship: deterministicPlan.includeRelationship,
+      selectedToolGroups: deterministicForDecision,
+      confidence: 0.35,
+    }),
+  });
+
+  const executionPlan: DynamicExecutionPlan = planEnabled
+    ? {
+        ...deterministicPlan,
+        family: clampQuestionFamily(result.decision.questionFamily, deterministicPlan.family),
+        chartLayers: clampChartLayers(result.decision.requiredChartLayers, deterministicPlan.chartLayers),
+        includeMicroSignals: clampMicroSignals(result.decision.includeMicroSignals, deterministicPlan.includeMicroSignals),
+        includeTiming: result.decision.includeTiming,
+        includeTransit: state.mode === 'pro' ? result.decision.includeTransit : false,
+        includeDasha: state.mode === 'pro' ? result.decision.includeDasha : false,
+        includeCareer: state.mode === 'pro' ? result.decision.includeCareer : false,
+        includeRelationship: result.decision.includeRelationship,
+      }
+    : deterministicPlan;
+
+  const llmSelectedToolGroups = clampToolGroups(result.decision.selectedToolGroups, deterministicForDecision, state.mode)
+    .filter((group) => preflightAvailable.includes(group) && !preflightBlocked.includes(group));
+  const selectedToolGroups = toolEnabled
+    ? (llmSelectedToolGroups.length > 0 ? llmSelectedToolGroups : deterministicForDecision)
+    : deterministicForDecision;
+
+  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+    ? `planFamily deterministic=${deterministicPlan.family}; llm=${executionPlan.family}; tools deterministic=${deterministicForDecision.join('|')}; llm=${selectedToolGroups.join('|')}`
+    : undefined;
+
+  return {
+    executionPlan,
+    selectedToolGroups,
+    decisionBundle: mergeDecisionBundle(state, {
+      source: result.usedFallback ? 'hybrid' : 'llm',
+      questionFamily: executionPlan.family,
+      requiredToolGroups: selectedToolGroups,
+      confidence: result.decision.confidence,
+      reason: 'merged plan_and_tools node',
+    }),
+    decisionTelemetry: appendDecisionTelemetry(state, {
+      node: 'plan_and_tools',
+      model: result.model,
+      latencyMs: result.latencyMs,
+      confidence: result.decision.confidence,
+      usedFallback: result.usedFallback,
+      fallbackReason: result.usedFallback ? 'plan_and_tools fallback' : undefined,
+      shadowComparison,
+    }),
+    analysisStages: appendStage(
+      state,
+      'plan_and_tools',
+      'Planning execution and selecting tools',
+      `Family=${executionPlan.family}; layers=${executionPlan.chartLayers.join(',')}; selected=${selectedToolGroups.join(', ')}; model=${result.model}; latencyMs=${result.latencyMs}; confidence=${result.decision.confidence.toFixed(2)}`
+    ),
+  };
+}
+
+function buildDeterministicToolGroupsFromInputs(params: {
+  question: string;
+  mode: AgentMode;
+  intent: QuestionIntent;
+  executionPlan: DynamicExecutionPlan;
+  scopeSelection: ScopeSelectionDecision | null;
+}): ToolGroupKey[] {
+  const { question, mode, intent, executionPlan, scopeSelection: scope } = params;
+  const groups = new Set<ToolGroupKey>(['reference_time', 'general_grounding', 'varga', 'placement']);
+
+  if (executionPlan.family !== 'general') {
+    groups.add('atlas');
+  }
+
+  if (scope?.needsD9 || executionPlan.chartLayers.includes('D9') || intent.flags.includes('d9') || intent.flags.includes('relationship')) {
+    groups.add('d9');
+  }
+
+  if (mode === 'pro') {
+    if (scope?.needsDasha || executionPlan.includeDasha || intent.flags.includes('dasha') || intent.flags.includes('timing')) {
+      groups.add('dasha');
+    }
+
+    if (scope?.needsTransit || executionPlan.includeTransit || intent.flags.includes('transit')) {
+      groups.add('transit');
+    }
+
+    if (scope?.needsD10 || executionPlan.includeCareer || intent.flags.includes('career') || intent.flags.includes('career_timing')) {
+      groups.add('career');
+    }
+
+    if (scope?.needsLongevity || executionPlan.family === 'longevity' || intent.flags.includes('longevity')) {
+      groups.add('longevity');
+    }
+  }
+
+  if (/\b(arudha|aruda)\b/i.test(question) && mode === 'pro') {
+    groups.add('arudha');
+  }
+
+  if (/\b(panchanga|tithi|nakshatra|karana|yoga)\b/i.test(question)) {
+    groups.add('panchanga');
+  }
+
+  if (/\b(yoga|yogas|ashtakavarga|arudha|aruda)\b/i.test(question) && mode === 'pro') {
+    groups.add('feature');
+  }
+
+  if (executionPlan.includeMicroSignals.includes('nakshatra') || executionPlan.includeMicroSignals.includes('nakshatra_lord') || executionPlan.includeMicroSignals.includes('sign_lord')) {
+    groups.add('nakshatra_lord');
+  }
+
+  if (executionPlan.includeMicroSignals.includes('drishti') || executionPlan.includeMicroSignals.includes('degree')) {
+    groups.add('drishti_degree');
+  }
+
+  return clampToolGroups([...groups], ['reference_time', 'general_grounding', 'varga', 'placement'], mode);
+}
+
+function buildDeterministicToolGroups(state: AgentStateType): ToolGroupKey[] {
+  const intent = state.intent ?? classifyQuestionIntent(state.question);
+  const executionPlan = state.executionPlan ?? buildDynamicExecutionPlan(state.question, intent, state.mode);
+  return buildDeterministicToolGroupsFromInputs({
+    question: state.question,
+    mode: state.mode,
+    intent,
+    executionPlan,
+    scopeSelection: state.scopeSelection,
+  });
+}
+
+async function selectToolGroupsNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const deterministicGroups = buildDeterministicToolGroups(state);
+  const availableByManifest = getToolManifestForMode(state.mode).map((item) => item.group);
+  const preflight = state.toolAvailabilityPreflight;
+  const preflightAvailable = preflight?.availableGroups ?? availableByManifest;
+  const preflightBlocked = preflight?.blockedByMode ?? [];
+  const deterministicManifestSafe = deterministicGroups.filter((group) => preflightAvailable.includes(group) && !preflightBlocked.includes(group));
+  const deterministicForDecision = deterministicManifestSafe.length > 0 ? deterministicManifestSafe : deterministicGroups;
+
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_TOOL_SELECTION_ENABLED)) {
+    return {
+      selectedToolGroups: deterministicForDecision,
+      decisionBundle: mergeDecisionBundle(state, {
+        source: 'deterministic',
+        requiredToolGroups: deterministicForDecision,
+        confidence: 0.35,
+        reason: 'deterministic tool selection (node disabled)',
+      }),
+      decisionTelemetry: appendDecisionTelemetry(state, {
+        node: 'tool_selection',
+        model: 'tool-selection-disabled',
+        latencyMs: 0,
+        confidence: 0.25,
+        usedFallback: true,
+        fallbackReason: 'LLM_DECISION_TOOL_SELECTION_ENABLED=false',
+      }),
+      analysisStages: appendStage(
+        state,
+        'tool_selection',
+        'Selecting tool groups for analysis',
+        `selected=${deterministicForDecision.join(', ')}; model=tool-selection-disabled`
+      ),
+    };
+  }
+
+  const result = await invokeDecisionNode<ToolSelectionDecision>({
+    node: 'tool_selection',
+    schema: ToolSelectionDecisionSchema,
+    input: {
+      question: state.question,
+      mode: state.mode,
+      intent: state.intent,
+      scopeSelection: state.scopeSelection,
+      executionPlan: state.executionPlan,
+      deterministicGroups: deterministicForDecision,
+      allowedGroups: [...TOOL_GROUP_ALLOWLIST],
+      toolManifest: getToolManifestForMode(state.mode).map((item) => ({
+        group: item.group,
+        minMode: item.minMode,
+        domains: item.domains,
+        requiredScopes: item.requiredScopes,
+        costClass: item.costClass,
+        fallbackGroup: item.fallbackGroup,
+      })),
+      preflight,
+      instruction:
+        'Select minimal but sufficient tool groups for this query. Prefer deterministicGroups when uncertain and avoid unnecessary expensive groups.',
+    },
+    fallback: () => ({
+      selectedToolGroups: deterministicForDecision,
+      confidence: 0.35,
+    }),
+  });
+
+  const selectedToolGroups = clampToolGroups(result.decision.selectedToolGroups, deterministicForDecision, state.mode)
+    .filter((group) => preflightAvailable.includes(group) && !preflightBlocked.includes(group));
+  const finalGroups = selectedToolGroups.length > 0 ? selectedToolGroups : deterministicForDecision;
+  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+    ? `deterministic=${deterministicForDecision.join('|')}; llm=${finalGroups.join('|')}; match=${deterministicForDecision.join('|') === finalGroups.join('|')}`
+    : undefined;
+
+  return {
+    selectedToolGroups: finalGroups,
+    decisionBundle: mergeDecisionBundle(state, {
+      source: result.usedFallback ? 'hybrid' : 'llm',
+      requiredToolGroups: finalGroups,
+      confidence: result.decision.confidence,
+      reason: 'tool selection with manifest + preflight',
+    }),
+    decisionTelemetry: appendDecisionTelemetry(state, {
+      node: 'tool_selection',
+      model: result.model,
+      latencyMs: result.latencyMs,
+      confidence: result.decision.confidence,
+      usedFallback: result.usedFallback,
+      fallbackReason: result.usedFallback ? 'tool selection fallback' : undefined,
+      shadowComparison,
+    }),
+    analysisStages: appendStage(
+      state,
+      'tool_selection',
+      'Selecting tool groups for analysis',
+      `selected=${finalGroups.join(', ')}; model=${result.model}; latencyMs=${result.latencyMs}; confidence=${result.decision.confidence.toFixed(2)}`
+    ),
+  };
+}
+
+type ToolTaskContext = {
+  grounding: GroundingContext;
+  question: string;
+  mode: AgentMode;
+  intent: QuestionIntent;
+  executionPlan: DynamicExecutionPlan;
+  scopeSelection: ScopeSelectionDecision | null;
+  analysisTimestamp: number;
+};
+
+function createToolTaskRegistry(ctx: ToolTaskContext): Record<ToolGroupKey, () => Promise<ToolFinding | null>> {
+  const { grounding, question, mode, intent, analysisTimestamp, scopeSelection } = ctx;
+  const isMini = mode === 'mini';
+
+  return {
+    reference_time: () => Promise.resolve(makeReferenceTimeToolFinding(grounding.referenceTimestamp, grounding.referenceTimeSource)),
+    atlas: () => Promise.resolve(makeAtlasToolFinding(grounding.rawPayload)),
+    varga: () => Promise.resolve(makeVargaToolFinding(grounding.rawPayload, question, mode)),
+    arudha: () => (isMini ? Promise.resolve(null) : Promise.resolve(makeArudhaToolFinding(grounding.rawPayload))),
+    d9: () => Promise.resolve(makeD9ToolFinding(grounding.rawPayload, question)),
+    dasha: () => (isMini ? Promise.resolve(null) : Promise.resolve(makeDashaToolFinding(grounding.rawPayload, analysisTimestamp))),
+    transit: () => (isMini
+      ? Promise.resolve(null)
+      : buildTransitToolFinding({ kundli: grounding.kundli, question, referenceTimestamp: grounding.referenceTimestamp })),
+    career: () => (isMini ? Promise.resolve(null) : Promise.resolve(makeCareerToolFinding(grounding.rawPayload, question, analysisTimestamp))),
+    longevity: () => (isMini ? Promise.resolve(null) : Promise.resolve(makeLongevityToolFinding(grounding.rawPayload, grounding.referenceTimestamp))),
+    placement: () => Promise.resolve(makePlacementToolFinding(grounding.rawPayload, question)),
+    panchanga: () => Promise.resolve(makePanchangaToolFinding(grounding.rawPayload)),
+    feature: () => (isMini ? Promise.resolve(null) : Promise.resolve(makeFeatureToolFinding(grounding.rawPayload))),
+    general_grounding: () => Promise.resolve(makeGeneralToolFinding(grounding.rawPayload, question, intent.flags, mode, scopeSelection)),
+    nakshatra_lord: () => Promise.resolve(makeNakshatraLordToolFinding(grounding.rawPayload)),
+    drishti_degree: () => Promise.resolve(makeDrishtiDegreeToolFinding(grounding.rawPayload)),
+  };
+}
+
+async function executeToolGroups(
+  groups: ToolGroupKey[],
+  registry: Record<ToolGroupKey, () => Promise<ToolFinding | null>>
+): Promise<ToolFinding[]> {
+  const uniqueGroups = [...new Set(groups)];
+  const findings = await Promise.all(uniqueGroups.map((group) => registry[group]()));
+  return findings.filter((item): item is ToolFinding => Boolean(item));
 }
 
 async function runSpecializedToolsNode(state: AgentStateType): Promise<AgentUpdateType> {
@@ -1850,48 +3760,52 @@ async function runSpecializedToolsNode(state: AgentStateType): Promise<AgentUpda
   if (!grounding) throw new Error('Grounding context missing before specialized tools stage.');
   const intent = state.intent ?? classifyQuestionIntent(state.question);
   const executionPlan = state.executionPlan ?? buildDynamicExecutionPlan(state.question, intent, state.mode);
+  const scopeSelection = state.scopeSelection;
+  const selectedGroups = new Set(state.selectedToolGroups ?? []);
+  const useSelection = selectedGroups.size > 0;
+  const shouldRun = (group: ToolGroupKey, fallback: boolean) => (useSelection ? selectedGroups.has(group) : fallback);
   const analysisTimestamp = resolveAnalysisTimestamp(grounding.referenceTimestamp, intent);
   const isMini = state.mode === 'mini';
 
-  const includeTransit = executionPlan.includeTransit;
-  const includeD9 = executionPlan.chartLayers.includes('D9') || intent.flags.includes('d9') || intent.primary === 'd9';
-  const includeDasha = executionPlan.includeDasha;
-  const includePlacement = intent.flags.includes('relationship') || intent.flags.includes('career') || intent.flags.includes('health') || intent.flags.includes('finance') || executionPlan.family !== 'general';
-  const includeCareer = executionPlan.includeCareer || intent.topics.includes('career') || intent.flags.includes('career') || intent.flags.includes('career_timing');
-  const includeLongevity = executionPlan.family === 'longevity' || intent.flags.includes('longevity');
-
-  const baseTasks: Array<Promise<ToolFinding | null>> = [
-    Promise.resolve(makeReferenceTimeToolFinding(grounding.referenceTimestamp, grounding.referenceTimeSource)),
-    Promise.resolve(makeAtlasToolFinding(grounding.rawPayload)),
-    Promise.resolve(makeVargaToolFinding(grounding.rawPayload, state.question, state.mode)),
-  ];
-
-  const domainTasks: Array<Promise<ToolFinding | null>> = [
-    /\b(arudha|aruda)\b/i.test(state.question) && !isMini ? Promise.resolve(makeArudhaToolFinding(grounding.rawPayload)) : Promise.resolve(null),
-    includeD9 ? Promise.resolve(makeD9ToolFinding(grounding.rawPayload, state.question)) : Promise.resolve(null),
-    includeDasha && !isMini ? Promise.resolve(makeDashaToolFinding(grounding.rawPayload, analysisTimestamp)) : Promise.resolve(null),
-    includeTransit
-      && !isMini
-      ? buildTransitToolFinding({ kundli: grounding.kundli, question: state.question, referenceTimestamp: grounding.referenceTimestamp })
-      : Promise.resolve(null),
-    includeCareer && !isMini ? Promise.resolve(makeCareerToolFinding(grounding.rawPayload, state.question, analysisTimestamp)) : Promise.resolve(null),
-    includeLongevity && !isMini ? Promise.resolve(makeLongevityToolFinding(grounding.rawPayload, grounding.referenceTimestamp)) : Promise.resolve(null),
-    includePlacement ? Promise.resolve(makePlacementToolFinding(grounding.rawPayload, state.question)) : Promise.resolve(null),
-  ];
-
-  const microSignalTasks: Array<Promise<ToolFinding | null>> = [
+  const includeTransit = shouldRun('transit', executionPlan.includeTransit || Boolean(scopeSelection?.needsTransit));
+  const includeD9 = shouldRun('d9', executionPlan.chartLayers.includes('D9') || intent.flags.includes('d9') || intent.primary === 'd9' || Boolean(scopeSelection?.needsD9));
+  const includeDasha = shouldRun('dasha', executionPlan.includeDasha || Boolean(scopeSelection?.needsDasha));
+  const includePlacement = shouldRun('placement', intent.flags.includes('relationship') || intent.flags.includes('career') || intent.flags.includes('health') || intent.flags.includes('finance') || executionPlan.family !== 'general');
+  const includeCareer = shouldRun('career', executionPlan.includeCareer || intent.topics.includes('career') || intent.flags.includes('career') || intent.flags.includes('career_timing') || Boolean(scopeSelection?.needsD10));
+  const includeLongevity = shouldRun('longevity', executionPlan.family === 'longevity' || intent.flags.includes('longevity') || Boolean(scopeSelection?.needsLongevity));
+  const includeArudha = shouldRun('arudha', /\b(arudha|aruda)\b/i.test(state.question) && !isMini);
+  const includeNakshatraLord = shouldRun(
+    'nakshatra_lord',
     executionPlan.includeMicroSignals.includes('nakshatra') || executionPlan.includeMicroSignals.includes('nakshatra_lord') || executionPlan.includeMicroSignals.includes('sign_lord')
-      ? Promise.resolve(makeNakshatraLordToolFinding(grounding.rawPayload))
-      : Promise.resolve(null),
-    executionPlan.includeMicroSignals.includes('drishti') || executionPlan.includeMicroSignals.includes('degree')
-      ? Promise.resolve(makeDrishtiDegreeToolFinding(grounding.rawPayload))
-      : Promise.resolve(null),
-  ];
+  );
+  const includeDrishtiDegree = shouldRun('drishti_degree', executionPlan.includeMicroSignals.includes('drishti') || executionPlan.includeMicroSignals.includes('degree'));
 
-  const batch1 = (await Promise.all(baseTasks)).filter((item): item is ToolFinding => Boolean(item));
-  const batch2 = (await Promise.all(domainTasks)).filter((item): item is ToolFinding => Boolean(item));
-  const batch3 = (await Promise.all(microSignalTasks)).filter((item): item is ToolFinding => Boolean(item));
-  const findings = mergeFindings(state.toolFindings ?? [], [...batch1, ...batch2, ...batch3]);
+  const groupsToRun: ToolGroupKey[] = [
+    shouldRun('reference_time', true) ? 'reference_time' : null,
+    shouldRun('atlas', true) ? 'atlas' : null,
+    shouldRun('varga', true) ? 'varga' : null,
+    includeArudha ? 'arudha' : null,
+    includeD9 ? 'd9' : null,
+    includeDasha && !isMini ? 'dasha' : null,
+    includeTransit && !isMini ? 'transit' : null,
+    includeCareer && !isMini ? 'career' : null,
+    includeLongevity && !isMini ? 'longevity' : null,
+    includePlacement ? 'placement' : null,
+    includeNakshatraLord ? 'nakshatra_lord' : null,
+    includeDrishtiDegree ? 'drishti_degree' : null,
+  ].filter((item): item is ToolGroupKey => Boolean(item));
+
+  const registry = createToolTaskRegistry({
+    grounding,
+    question: state.question,
+    mode: state.mode,
+    intent,
+    executionPlan,
+    scopeSelection,
+    analysisTimestamp,
+  });
+
+  const findings = mergeFindings(state.toolFindings ?? [], await executeToolGroups(groupsToRun, registry));
 
   return {
     toolFindings: findings,
@@ -1899,7 +3813,7 @@ async function runSpecializedToolsNode(state: AgentStateType): Promise<AgentUpda
       state,
       'run_specialized_tools',
       'Running specialized analyzers',
-      `Completed ${executionPlan.parallelBatches.length} parallel batch group(s); findings=${findings.length}`
+      `Executed groups=${groupsToRun.join(', ') || 'none'}; findings=${findings.length}`
     ),
   };
 }
@@ -1909,61 +3823,181 @@ async function runGeneralToolsNode(state: AgentStateType): Promise<AgentUpdateTy
   if (!grounding) throw new Error('Grounding context missing before general tools stage.');
   const intent = state.intent ?? classifyQuestionIntent(state.question);
   const executionPlan = state.executionPlan ?? buildDynamicExecutionPlan(state.question, intent, state.mode);
+  const scopeSelection = state.scopeSelection;
+  const selectedGroups = new Set(state.selectedToolGroups ?? []);
+  const useSelection = selectedGroups.size > 0;
+  const shouldRun = (group: ToolGroupKey, fallback: boolean) => (useSelection ? selectedGroups.has(group) : fallback);
   const analysisTimestamp = resolveAnalysisTimestamp(grounding.referenceTimestamp, intent);
   const isMini = state.mode === 'mini';
 
-  const includePanchanga = /\b(panchanga|tithi|nakshatra|karana|yoga)\b/i.test(state.question);
-  const includeFeature = /\b(yoga|yogas|ashtakavarga|arudha|aruda)\b/i.test(state.question) && !isMini;
-  const includeDasha = executionPlan.includeDasha && !intent.flags.includes('dasha') && !isMini;
-  const includeTransit = executionPlan.includeTransit && !intent.flags.includes('transit') && !isMini;
-  const includeCareer = (executionPlan.includeCareer || intent.topics.includes('career') || /\b(career|job|profession|business|promotion|work|employment|salary|interview)\b/i.test(state.question)) && !isMini;
-  const includeLongevity = (executionPlan.family === 'longevity' || intent.flags.includes('longevity') || /\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/i.test(state.question)) && !isMini;
-
-  const taskList: Array<Promise<ToolFinding | null>> = [
-    Promise.resolve(makeReferenceTimeToolFinding(grounding.referenceTimestamp, grounding.referenceTimeSource)),
-    Promise.resolve(makeGeneralToolFinding(grounding.rawPayload, state.question, intent.flags)),
-    Promise.resolve(makeVargaToolFinding(grounding.rawPayload, state.question, state.mode)),
-    /\b(arudha|aruda)\b/i.test(state.question) && !isMini ? Promise.resolve(makeArudhaToolFinding(grounding.rawPayload)) : Promise.resolve(null),
-    Promise.resolve(makePlacementToolFinding(grounding.rawPayload, state.question)),
-    includePanchanga ? Promise.resolve(makePanchangaToolFinding(grounding.rawPayload)) : Promise.resolve(null),
-    includeFeature ? Promise.resolve(makeFeatureToolFinding(grounding.rawPayload)) : Promise.resolve(null),
-    includeDasha ? Promise.resolve(makeDashaToolFinding(grounding.rawPayload, analysisTimestamp)) : Promise.resolve(null),
-    includeTransit
-      ? buildTransitToolFinding({ kundli: grounding.kundli, question: state.question, referenceTimestamp: grounding.referenceTimestamp })
-      : Promise.resolve(null),
-    includeCareer ? Promise.resolve(makeCareerToolFinding(grounding.rawPayload, state.question, analysisTimestamp)) : Promise.resolve(null),
-    includeLongevity ? Promise.resolve(makeLongevityToolFinding(grounding.rawPayload, grounding.referenceTimestamp)) : Promise.resolve(null),
+  const includePanchanga = shouldRun('panchanga', /\b(panchanga|tithi|nakshatra|karana|yoga)\b/i.test(state.question));
+  const includeFeature = shouldRun('feature', /\b(yoga|yogas|ashtakavarga|arudha|aruda)\b/i.test(state.question) && !isMini);
+  const includeDasha = shouldRun('dasha', (executionPlan.includeDasha || Boolean(scopeSelection?.needsDasha)) && !intent.flags.includes('dasha') && !isMini);
+  const includeTransit = shouldRun('transit', (executionPlan.includeTransit || Boolean(scopeSelection?.needsTransit)) && !intent.flags.includes('transit') && !isMini);
+  const includeCareer = shouldRun('career', (executionPlan.includeCareer || Boolean(scopeSelection?.needsD10) || intent.topics.includes('career') || /\b(career|job|profession|business|promotion|work|employment|salary|interview)\b/i.test(state.question)) && !isMini);
+  const includeLongevity = shouldRun('longevity', (executionPlan.family === 'longevity' || Boolean(scopeSelection?.needsLongevity) || intent.flags.includes('longevity') || /\b(longevity|lifespan|life span|how long will i live|length of life|ayush|ayu|mrityu|death|end of life)\b/i.test(state.question)) && !isMini);
+  const includeArudha = shouldRun('arudha', /\b(arudha|aruda)\b/i.test(state.question) && !isMini);
+  const includeGeneralGrounding = shouldRun('general_grounding', true);
+  const includeVarga = shouldRun('varga', true);
+  const includePlacement = shouldRun('placement', true);
+  const includeReferenceTime = shouldRun('reference_time', true);
+  const includeNakshatraLord = shouldRun(
+    'nakshatra_lord',
     executionPlan.includeMicroSignals.includes('nakshatra') || executionPlan.includeMicroSignals.includes('nakshatra_lord') || executionPlan.includeMicroSignals.includes('sign_lord')
-      ? Promise.resolve(makeNakshatraLordToolFinding(grounding.rawPayload))
-      : Promise.resolve(null),
-    executionPlan.includeMicroSignals.includes('drishti') || executionPlan.includeMicroSignals.includes('degree')
-      ? Promise.resolve(makeDrishtiDegreeToolFinding(grounding.rawPayload))
-      : Promise.resolve(null),
-  ];
-
-  const findings = mergeFindings(
-    state.toolFindings ?? [],
-    (await Promise.all(taskList)).filter((item): item is ToolFinding => Boolean(item))
   );
+  const includeDrishtiDegree = shouldRun('drishti_degree', executionPlan.includeMicroSignals.includes('drishti') || executionPlan.includeMicroSignals.includes('degree'));
+
+  const groupsToRun: ToolGroupKey[] = [
+    includeReferenceTime ? 'reference_time' : null,
+    includeGeneralGrounding ? 'general_grounding' : null,
+    includeVarga ? 'varga' : null,
+    includeArudha ? 'arudha' : null,
+    includePlacement ? 'placement' : null,
+    includePanchanga ? 'panchanga' : null,
+    includeFeature ? 'feature' : null,
+    includeDasha ? 'dasha' : null,
+    includeTransit ? 'transit' : null,
+    includeCareer ? 'career' : null,
+    includeLongevity ? 'longevity' : null,
+    includeNakshatraLord ? 'nakshatra_lord' : null,
+    includeDrishtiDegree ? 'drishti_degree' : null,
+  ].filter((item): item is ToolGroupKey => Boolean(item));
+
+  const registry = createToolTaskRegistry({
+    grounding,
+    question: state.question,
+    mode: state.mode,
+    intent,
+    executionPlan,
+    scopeSelection,
+    analysisTimestamp,
+  });
+
+  const findings = mergeFindings(state.toolFindings ?? [], await executeToolGroups(groupsToRun, registry));
 
   return {
     toolFindings: findings,
-    analysisStages: appendStage(state, 'run_general_tools', 'Running general analyzers', `Findings total=${findings.length}`),
+    analysisStages: appendStage(state, 'run_general_tools', 'Running general analyzers', `Executed groups=${groupsToRun.join(', ') || 'none'}; findings=${findings.length}`),
   };
 }
 
-async function evaluateCoverageNode(state: AgentStateType): Promise<AgentUpdateType> {
-  const coverageGaps = determineCoverageGaps(state);
+async function evidenceGateNode(state: AgentStateType): Promise<AgentUpdateType> {
+  const deterministicGaps = determineCoverageGaps(state);
+  const gapCount = deterministicGaps.length;
+  const iteration = state.toolIteration ?? 0;
+  const maxIterations = state.maxToolIterations ?? 2;
+  const deterministicShouldRetry = gapCount > 0;
+  const deterministicAction: 'refine_tools' | 'build_prompt' = deterministicShouldRetry && iteration < maxIterations
+    ? 'refine_tools'
+    : 'build_prompt';
+
+  // Hard stop guardrail always wins.
+  if (iteration >= maxIterations || gapCount === 0) {
+    const shouldRetry = gapCount > 0 && iteration < maxIterations;
+    return {
+      coverageGaps: deterministicGaps,
+      coverageShouldRetry: shouldRetry,
+      coverageDecisionConfidence: 1,
+      refinementNextAction: 'build_prompt',
+      decisionTelemetry: appendDecisionTelemetry(state, {
+        node: 'evidence_gate',
+        model: 'evidence-hard-stop',
+        latencyMs: 0,
+        confidence: 1,
+        usedFallback: true,
+        fallbackReason: 'hard iteration/gap guardrail',
+      }),
+      analysisStages: appendStage(
+        state,
+        'evidence_gate',
+        'Evaluating evidence and deciding refinement',
+        `nextAction=build_prompt; reason=hard-stop; iteration=${iteration}/${maxIterations}; gaps=${gapCount}`
+      ),
+    };
+  }
+
+  const currentFindings = (state.toolFindings ?? []).map((finding) => ({
+    name: finding.name,
+    status: finding.status,
+    factCount: finding.facts.length,
+  }));
+
+  const coverageEnabled = isDecisionNodeEnabled(env.LLM_DECISION_COVERAGE_ENABLED);
+  const refinementEnabled = isDecisionNodeEnabled(env.LLM_DECISION_REFINEMENT_ROUTER_ENABLED);
+  if (!coverageEnabled && !refinementEnabled) {
+    return {
+      coverageGaps: deterministicGaps,
+      coverageShouldRetry: deterministicShouldRetry,
+      coverageDecisionConfidence: 0.25,
+      refinementNextAction: deterministicAction,
+      decisionTelemetry: appendDecisionTelemetry(state, {
+        node: 'evidence_gate',
+        model: 'evidence-gate-disabled',
+        latencyMs: 0,
+        confidence: 0.25,
+        usedFallback: true,
+        fallbackReason: 'LLM_DECISION_COVERAGE_ENABLED=false and LLM_DECISION_REFINEMENT_ROUTER_ENABLED=false',
+      }),
+      analysisStages: appendStage(
+        state,
+        'evidence_gate',
+        'Evaluating evidence and deciding refinement',
+        `nextAction=${deterministicAction}; gaps=${deterministicGaps.join(',') || 'none'}; model=evidence-gate-disabled; iteration=${iteration}/${maxIterations}`
+      ),
+    };
+  }
+
+  const result = await invokeDecisionNode<EvidenceGateDecision>({
+    node: 'evidence_gate',
+    schema: EvidenceGateDecisionSchema,
+    input: {
+      question: state.question,
+      mode: state.mode,
+      executionPlan: state.executionPlan,
+      deterministicGaps,
+      deterministicShouldRetry,
+      deterministicAction,
+      currentIteration: iteration,
+      maxIterations,
+      findings: currentFindings,
+      instruction:
+        'Evaluate evidence coverage and choose next action. Use refine_tools only if critical gaps remain and another iteration is likely to improve evidence. Respect deterministic hints when uncertain.',
+    },
+    fallback: () => ({
+      sufficientCoverageAchieved: deterministicGaps.length === 0,
+      gapsIdentified: deterministicGaps,
+      shouldRetry: deterministicShouldRetry,
+      nextAction: deterministicAction,
+      confidence: 0.35,
+    }),
+  });
+
+  const coverageGaps = clampCoverageGaps(result.decision.gapsIdentified, deterministicGaps);
+  const shouldRetry = coverageGaps.length > 0 && result.decision.shouldRetry && iteration < maxIterations;
+  const nextAction = shouldRetry && result.decision.nextAction === 'refine_tools' ? 'refine_tools' : 'build_prompt';
+  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+    ? `deterministic=${deterministicAction}; llm=${nextAction}; match=${deterministicAction === nextAction}`
+    : undefined;
 
   return {
     coverageGaps,
+    coverageShouldRetry: shouldRetry,
+    coverageDecisionConfidence: result.decision.confidence,
+    refinementNextAction: nextAction,
+    decisionTelemetry: appendDecisionTelemetry(state, {
+      node: 'evidence_gate',
+      model: result.model,
+      latencyMs: result.latencyMs,
+      confidence: result.decision.confidence,
+      usedFallback: result.usedFallback,
+      fallbackReason: result.usedFallback ? 'evidence gate fallback' : undefined,
+      shadowComparison,
+    }),
     analysisStages: appendStage(
       state,
-      'evaluate_coverage',
-      'Evaluating tool coverage quality',
-      coverageGaps.length > 0
-        ? `Coverage gaps: ${coverageGaps.join(', ')}`
-        : 'Coverage is sufficient for answer generation.'
+      'evidence_gate',
+      'Evaluating evidence and deciding refinement',
+      `nextAction=${nextAction}; gaps=${coverageGaps.join(',') || 'none'}; shouldRetry=${shouldRetry}; model=${result.model}; latencyMs=${result.latencyMs}; confidence=${result.decision.confidence.toFixed(2)}; iteration=${iteration}/${maxIterations}`
     ),
   };
 }
@@ -2016,7 +4050,7 @@ async function refineToolsNode(state: AgentStateType): Promise<AgentUpdateType> 
   }
 
   // Always include one broad grounding pass in refinement to capture missed paths.
-  tasks.push(Promise.resolve(makeGeneralToolFinding(grounding.rawPayload, state.question, intent.flags)));
+  tasks.push(Promise.resolve(makeGeneralToolFinding(grounding.rawPayload, state.question, intent.flags, state.mode, state.scopeSelection ?? null)));
 
   const retryFindings = (await Promise.all(tasks)).filter((item): item is ToolFinding => Boolean(item));
   const merged = mergeFindings(state.toolFindings ?? [], retryFindings);
@@ -2034,30 +4068,89 @@ async function refineToolsNode(state: AgentStateType): Promise<AgentUpdateType> 
   };
 }
 
-function routeAfterCoverage(state: AgentStateType): 'refine_tools' | 'build_prompt' {
-  const gapCount = (state.coverageGaps ?? []).length;
-  const iteration = state.toolIteration ?? 0;
-  const maxIterations = state.maxToolIterations ?? 2;
+function routeAfterEvidenceGate(state: AgentStateType): 'refine_tools' | 'build_prompt' {
+  return state.refinementNextAction === 'refine_tools' ? 'refine_tools' : 'build_prompt';
+}
 
-  if (gapCount > 0 && iteration < maxIterations) {
-    return 'refine_tools';
-  }
+function rankFindingsForPrompt(state: AgentStateType, findings: ToolFinding[]): ToolFinding[] {
+  const selectedGroups = new Set(state.selectedToolGroups ?? []);
+  const q = state.question.toLowerCase();
 
-  return 'build_prompt';
+  const groupToToolName: Partial<Record<ToolGroupKey, string>> = {
+    reference_time: 'Reference time analyzer',
+    atlas: 'Chart atlas',
+    varga: 'Varga analyzer',
+    arudha: 'Arudha analyzer',
+    d9: 'D9 analyzer',
+    dasha: 'Dasha analyzer',
+    transit: 'Transit analyzer',
+    career: 'Career analyzer',
+    longevity: 'Longevity analyzer',
+    placement: 'Placement analyzer',
+    panchanga: 'Panchanga analyzer',
+    feature: 'Feature analyzer',
+    general_grounding: 'General grounding analyzer',
+    nakshatra_lord: 'Nakshatra/lord analyzer',
+    drishti_degree: 'Drishti/degree analyzer',
+  };
+
+  const selectedToolNames = new Set(
+    [...selectedGroups]
+      .map((group) => groupToToolName[group])
+      .filter((name): name is string => Boolean(name))
+  );
+
+  const getScore = (finding: ToolFinding): number => {
+    let score = 0;
+
+    if (finding.status === 'ok') score += 4;
+    else if (finding.status === 'partial') score += 2;
+
+    if (selectedToolNames.has(finding.name)) score += 6;
+
+    const name = finding.name.toLowerCase();
+    if ((/career|job|profession|business|work/.test(q) && /career/.test(name))
+      || (/marriage|relationship|partner|spouse|love|compatibility/.test(q) && /d9|varga|placement/.test(name))
+      || (/when|timing|dasha|period|timeline/.test(q) && /dasha|reference time/.test(name))
+      || (/transit|gochar|today|now/.test(q) && /transit/.test(name))
+      || (/longevity|lifespan|ayush|mrityu|death/.test(q) && /longevity|d8|d30|dasha/.test(name))) {
+      score += 5;
+    }
+
+    score += Math.min(4, Math.floor((finding.facts?.length ?? 0) / 6));
+    return score;
+  };
+
+  return [...findings].sort((a, b) => getScore(b) - getScore(a));
+}
+
+function computeDynamicSnippetBudget(state: AgentStateType, findings: ToolFinding[]): { totalChars: number; perSnippetCap: number } {
+  const base = state.mode === 'pro' ? 9000 : 7000;
+  const questionPenalty = Math.min(2200, state.question.length * 2);
+  const contextPenalty = Math.min(1200, (state.conversationContext?.length ?? 0) * 140);
+  const findingBoost = Math.min(3200, findings.length * 280);
+
+  const totalChars = Math.max(4500, Math.min(14000, base + findingBoost - questionPenalty - contextPenalty));
+  const perSnippetCap = Math.max(600, Math.min(1800, Math.floor(totalChars / Math.max(6, findings.length * 1.4))));
+  return { totalChars, perSnippetCap };
 }
 
 function buildPrompt(state: AgentStateType): string {
   const grounding = state.grounding;
   if (!grounding) throw new Error('Grounding context missing while building prompt.');
   const executionPlan = state.executionPlan;
+  const mode = state.mode;
 
   const findings = state.toolFindings ?? [];
+  const rankedFindings = rankFindingsForPrompt(state, findings);
+  const maxFindings = mode === 'pro' ? 12 : 8;
+  const promptFindings = rankedFindings.slice(0, maxFindings);
   const conversationContext = (state.conversationContext ?? [])
     .map((item) => String(item).trim())
     .filter(Boolean)
     .slice(-8);
 
-  const findingBlock = findings
+  const findingBlock = promptFindings
     .map((finding) => {
       const facts = finding.facts.map((fact) => `- ${fact}`).join('\n');
       const paths = finding.evidencePaths.length ? `Evidence paths: ${finding.evidencePaths.join(', ')}` : 'Evidence paths: none';
@@ -2066,18 +4159,23 @@ function buildPrompt(state: AgentStateType): string {
     })
     .join('\n\n');
 
-  const MAX_SNIPPET_CHARS = 9000;
-  let budget = MAX_SNIPPET_CHARS;
+  const availability = getToolAvailabilityIndex(findings);
+  const availableNames = [...availability.available];
+  const partialNames = [...availability.partial];
+  const unavailableNames = [...availability.unavailable];
+
+  const snippetBudget = computeDynamicSnippetBudget(state, promptFindings);
+  let budget = snippetBudget.totalChars;
   let omitted = 0;
 
   const snippets: string[] = [];
-  for (const finding of findings) {
+  for (const finding of promptFindings) {
     for (const snippet of finding.snippets ?? []) {
       if (budget <= 0) {
         omitted += 1;
         continue;
       }
-      const piece = truncateText(snippet, Math.min(1200, budget));
+      const piece = truncateText(snippet, Math.min(snippetBudget.perSnippetCap, budget));
       snippets.push(piece);
       budget -= piece.length + 2;
     }
@@ -2099,9 +4197,36 @@ function buildPrompt(state: AgentStateType): string {
     snippets.push(`[${omitted} additional snippet(s) omitted due to prompt size budget]`);
   }
 
+  // Mode-specific instructions
+  const modeInstructions =
+    mode === 'mini'
+      ? [
+          'MODE: MINI - Basic Astrological Insights',
+          'In mini mode, focus insights on D1 (Rashi) and D9 (Navamsha) charts only.',
+          'Provide foundational interpretations: planetary placements, sign/nakshatra meanings, basic timing.',
+          'Avoid deep divisional chart analysis (D10, D8, D30, etc.) unless explicitly requested.',
+          'Keep guidance practical and accessible for users new to astrology.',
+        ]
+      : [
+          'MODE: PRO - Comprehensive Astrological Analysis',
+          'In pro mode, provide thorough analysis using all relevant divisional charts.',
+          'Analyze D1, D9, D10, D8, D30, D7, D4, D12, D20 as needed for complete insights.',
+          'Include advanced techniques: dasha periods, transits, yoga formations, micro-signals.',
+          'Synthesize multiple layers of evidence for nuanced, multi-dimensional predictions.',
+        ];
+
   return [
-    'You are a Vedic astrology assistant grounded in canonical JSON payload data.',
+    'You are Cozmic AI, a Vedic astrology assistant grounded in canonical JSON payload data.',
+    'Brand identity rule: if asked "who are you" / "who built you", state clearly: "I am Cozmic AI."',
+    'Your goal is to analyze personal birth charts and provide accurate, evidence-based astrological insights.',
+    '',
+    ...modeInstructions,
+    '',
+    'Core analysis guidelines:',
     'Use the tool findings first; they are deterministic extracts from the JSON blob.',
+    'Grounding contract: every material claim must be grounded in one or more tool findings listed below.',
+    'Grounding contract: do NOT claim data is missing when that tool is marked ok/partial.',
+    'Grounding contract: only mention missing data if the related tool is marked unavailable.',
     'Never invent chart facts. If dasha/transit details are missing in payload, explicitly say so.',
     'For compound questions, separate the topic, the time window, and the chart layer before answering.',
     'For varga requests, prefer the specific Dxx chart named by the user and fall back to D1 only when needed.',
@@ -2117,6 +4242,7 @@ function buildPrompt(state: AgentStateType): string {
     `payloadHash: ${grounding.payloadHash}`,
     `referenceTimestamp: ${grounding.referenceTimestamp}`,
     `referenceTimeSource: ${grounding.referenceTimeSource}`,
+    `userMode: ${mode}`,
     ...(executionPlan
       ? [
           `questionFamily: ${executionPlan.family}`,
@@ -2130,6 +4256,8 @@ function buildPrompt(state: AgentStateType): string {
     '',
     'Deterministic tool findings:',
     findingBlock || 'No tool findings available.',
+    '',
+    `Tool availability summary: ok=[${availableNames.join(', ') || 'none'}]; partial=[${partialNames.join(', ') || 'none'}]; unavailable=[${unavailableNames.join(', ') || 'none'}]`,
     '',
     'Relevant prior chat context (same thread; semantic retrieval):',
     conversationContext.length > 0 ? conversationContext.map((line) => `- ${line}`).join('\n') : 'None',
@@ -2178,6 +4306,78 @@ function buildDeterministicFallback(state: AgentStateType): string {
   return lines.join('\n').trim();
 }
 
+function getToolAvailabilityIndex(findings: ToolFinding[]): {
+  available: Set<string>;
+  partial: Set<string>;
+  unavailable: Set<string>;
+} {
+  const available = new Set<string>();
+  const partial = new Set<string>();
+  const unavailable = new Set<string>();
+
+  for (const finding of findings) {
+    if (finding.status === 'ok') {
+      available.add(finding.name);
+    } else if (finding.status === 'partial') {
+      partial.add(finding.name);
+    } else {
+      unavailable.add(finding.name);
+    }
+  }
+
+  return { available, partial, unavailable };
+}
+
+function sanitizeMissingDataContradictions(answer: string, findings: ToolFinding[]): string {
+  const { available, partial } = getToolAvailabilityIndex(findings);
+  const hasData = (name: string) => available.has(name) || partial.has(name);
+
+  let next = answer;
+
+  const removeIfHasData = (toolName: string, patterns: RegExp[]) => {
+    if (!hasData(toolName)) return;
+    for (const pattern of patterns) {
+      next = next.replace(pattern, '');
+    }
+  };
+
+  removeIfHasData('Dasha analyzer', [
+    /\b(?:no|missing|unavailable)\s+dasha(?:\s+data)?\b[^.]*\.?/gi,
+    /\b(?:cannot|can't|unable to)\s+(?:analy[sz]e|determine|predict)\b[^.]*\bdasha\b[^.]*\.?/gi,
+  ]);
+
+  removeIfHasData('Transit analyzer', [
+    /\b(?:no|missing|unavailable)\s+(?:transit|gochar)(?:\s+data)?\b[^.]*\.?/gi,
+    /\b(?:cannot|can't|unable to)\s+(?:analy[sz]e|determine|compute)\b[^.]*\b(?:transit|gochar)\b[^.]*\.?/gi,
+  ]);
+
+  removeIfHasData('D9 analyzer', [
+    /\b(?:no|missing|unavailable)\s+(?:d9|navamsha|navamsa)(?:\s+data)?\b[^.]*\.?/gi,
+    /\b(?:need|requires?)\b[^.]*\b(?:d9|navamsha|navamsa)\b[^.]*\b(?:for|to)\b[^.]*\.?/gi,
+  ]);
+
+  removeIfHasData('Career analyzer', [
+    /\b(?:no|missing|unavailable)\s+(?:d10|career chart|career data)\b[^.]*\.?/gi,
+    /\b(?:cannot|can't|unable to)\s+(?:analy[sz]e|assess|evaluate)\b[^.]*\bcareer\b[^.]*\.?/gi,
+  ]);
+
+  removeIfHasData('Longevity analyzer', [
+    /\b(?:cannot|can't|unable to)\s+(?:analy[sz]e|assess|evaluate)\b[^.]*\blongevity\b[^.]*\.?/gi,
+    /\b(?:need|requires?)\b[^.]*\b(?:d8|d30)\b[^.]*\blongevity\b[^.]*\.?/gi,
+  ]);
+
+  return next
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function enforceGroundingAnswerContract(answer: string, findings: ToolFinding[]): string {
+  const step1 = sanitizeGenericMissingAnalysisClaims(answer, findings);
+  const step2 = sanitizeMissingDataContradictions(step1, findings);
+  return step2;
+}
+
 function sanitizeGenericMissingAnalysisClaims(answer: string, findings: ToolFinding[]): string {
   const hasVarga = findings.some((f) => f.name === 'Varga analyzer' && f.status !== 'unavailable');
   const hasDasha = findings.some((f) => f.name === 'Dasha analyzer' && f.status !== 'unavailable');
@@ -2195,6 +4395,12 @@ function sanitizeGenericMissingAnalysisClaims(answer: string, findings: ToolFind
 }
 
 function routeIntent(state: AgentStateType): 'run_specialized_tools' | 'run_general_tools' {
+  const selected = new Set(state.selectedToolGroups ?? []);
+  if (selected.size > 0) {
+    const specialized = ['d9', 'dasha', 'transit', 'career', 'longevity', 'feature', 'arudha'].some((group) => selected.has(group as ToolGroupKey));
+    return specialized ? 'run_specialized_tools' : 'run_general_tools';
+  }
+
   if (state.mode === 'mini') {
     return 'run_general_tools';
   }
@@ -2218,12 +4424,22 @@ async function answerWithDeepSeekNode(state: AgentStateType): Promise<AgentUpdat
   }
 
   try {
+    const findings = state.toolFindings ?? [];
+    const availability = getToolAvailabilityIndex(findings);
     const deepSeek = await invokeDeepSeekBedrock({
       systemPrompt: state.prompt,
-      userPrompt: 'Answer using deterministic tool findings and canonical snippets. Be decisive, specific, and avoid generic disclaimers unless payload data is actually missing.',
+      userPrompt: [
+        'Answer using deterministic tool findings and canonical snippets.',
+        'Contract: every important claim must be grounded in available tool findings.',
+        'Contract: do not claim missing dasha/transit/D9/D10/longevity data when related analyzer status is ok/partial.',
+        'Contract: if data is missing, name the exact unavailable analyzer/tool and continue with available evidence.',
+        `Available analyzers: ${[...availability.available, ...availability.partial].join(', ') || 'none'}`,
+        `Unavailable analyzers: ${[...availability.unavailable].join(', ') || 'none'}`,
+        'Be decisive, specific, and avoid generic disclaimers.',
+      ].join(' '),
     });
 
-    const sanitized = sanitizeGenericMissingAnalysisClaims(deepSeek.text, state.toolFindings ?? []);
+    const sanitized = enforceGroundingAnswerContract(deepSeek.text, findings);
 
     return {
       answer: sanitized,
@@ -2239,6 +4455,86 @@ async function answerWithDeepSeekNode(state: AgentStateType): Promise<AgentUpdat
   }
 }
 
+async function responsePolicyNode(state: AgentStateType): Promise<AgentUpdateType> {
+  if (!state.answer) {
+    return {};
+  }
+
+  const defaultShouldCondense = (() => {
+    const raw = state.answer ?? '';
+    const lineCount = raw.split('\n').filter(Boolean).length;
+    return raw.length > CONCISE_ANSWER_MAX_CHARS || lineCount > CONCISE_ANSWER_MIN_LINES;
+  })();
+
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_RESPONSE_POLICY_ENABLED)) {
+    return {
+      responseShouldCondense: defaultShouldCondense,
+      responsePolicyTone: 'balanced',
+      responsePolicyAddDisclaimer: false,
+      responsePolicyConfidence: 0.25,
+      decisionTelemetry: appendDecisionTelemetry(state, {
+        node: 'response_policy',
+        model: 'response-policy-disabled',
+        latencyMs: 0,
+        confidence: 0.25,
+        usedFallback: true,
+      }),
+      analysisStages: appendStage(
+        state,
+        'response_policy',
+        'Applying response policy',
+        `shouldCondense=${defaultShouldCondense}; tone=balanced; model=response-policy-disabled`
+      ),
+    };
+  }
+
+  const result = await invokeDecisionNode<z.infer<typeof ResponsePolicyDecisionSchema>>({
+    node: 'response_policy',
+    schema: ResponsePolicyDecisionSchema,
+    input: {
+      question: state.question,
+      mode: state.mode,
+      answer: state.answer,
+      findings: (state.toolFindings ?? []).map((f) => ({ name: f.name, status: f.status })),
+      defaultShouldCondense,
+      instruction:
+        'Set condensation strategy and confidence tone based on evidence quality. Use disclaimer only when key findings are unavailable.',
+    },
+    fallback: () => ({
+      shouldCondense: defaultShouldCondense,
+      tone: 'balanced',
+      addDisclaimer: false,
+      confidence: 0.35,
+    }),
+  });
+
+  const disclaimer = result.decision.addDisclaimer ? buildDataGapDisclaimer(state.toolFindings ?? []) : null;
+  const nextAnswer = disclaimer && state.answer && !state.answer.includes(disclaimer)
+    ? `${disclaimer}\n\n${state.answer}`
+    : state.answer;
+
+  return {
+    answer: nextAnswer,
+    responseShouldCondense: result.decision.shouldCondense,
+    responsePolicyTone: result.decision.tone,
+    responsePolicyAddDisclaimer: result.decision.addDisclaimer,
+    responsePolicyConfidence: result.decision.confidence,
+    decisionTelemetry: appendDecisionTelemetry(state, {
+      node: 'response_policy',
+      model: result.model,
+      latencyMs: result.latencyMs,
+      confidence: result.decision.confidence,
+      usedFallback: result.usedFallback,
+    }),
+    analysisStages: appendStage(
+      state,
+      'response_policy',
+      'Applying response policy',
+      `shouldCondense=${result.decision.shouldCondense}; tone=${result.decision.tone}; model=${result.model}; latencyMs=${result.latencyMs}; confidence=${result.decision.confidence.toFixed(2)}`
+    ),
+  };
+}
+
 async function condenseAnswerNode(state: AgentStateType): Promise<AgentUpdateType> {
   if (!state.answer) {
     return {};
@@ -2246,7 +4542,9 @@ async function condenseAnswerNode(state: AgentStateType): Promise<AgentUpdateTyp
 
   const rawAnswer = state.answer.trim();
   const lineCount = rawAnswer.split('\n').filter(Boolean).length;
-  if (rawAnswer.length <= CONCISE_ANSWER_MAX_CHARS && lineCount <= CONCISE_ANSWER_MIN_LINES) {
+  const shouldCondense = state.responseShouldCondense ?? (rawAnswer.length > CONCISE_ANSWER_MAX_CHARS || lineCount > CONCISE_ANSWER_MIN_LINES);
+
+  if (!shouldCondense) {
     return {};
   }
 
@@ -2280,26 +4578,32 @@ async function condenseAnswerNode(state: AgentStateType): Promise<AgentUpdateTyp
 }
 
 const graph = new StateGraph(AgentState)
+  .addNode('route_top_level', routeTopLevelNode)
+  .addNode('fast_answer', fastAnswerNode)
   .addNode('load_grounding', loadCanonicalGrounding)
   .addNode('classify_intent', classifyIntentNode)
-  .addNode('plan_execution', planExecutionNode)
+  .addNode('plan_and_tools', planAndToolsNode)
   .addNode('run_specialized_tools', runSpecializedToolsNode)
   .addNode('run_general_tools', runGeneralToolsNode)
-  .addNode('evaluate_coverage', evaluateCoverageNode)
+  .addNode('evidence_gate', evidenceGateNode)
   .addNode('refine_tools', refineToolsNode)
   .addNode('build_prompt', buildPromptNode)
   .addNode('answer_with_deepseek', answerWithDeepSeekNode)
+  .addNode('response_policy', responsePolicyNode)
   .addNode('condense_answer', condenseAnswerNode)
-  .addEdge(START, 'load_grounding')
-  .addEdge('load_grounding', 'classify_intent')
-  .addEdge('classify_intent', 'plan_execution')
-  .addConditionalEdges('plan_execution', routeIntent)
-  .addEdge('run_specialized_tools', 'run_general_tools')
-  .addEdge('run_general_tools', 'evaluate_coverage')
-  .addConditionalEdges('evaluate_coverage', routeAfterCoverage)
-  .addEdge('refine_tools', 'evaluate_coverage')
+  .addEdge(START, 'route_top_level')
+  .addConditionalEdges('route_top_level', routeFromTopLevel)
+  .addEdge('fast_answer', END)
+  .addEdge('classify_intent', 'load_grounding')
+  .addEdge('load_grounding', 'plan_and_tools')
+  .addConditionalEdges('plan_and_tools', routeIntent)
+  .addEdge('run_specialized_tools', 'evidence_gate')
+  .addEdge('run_general_tools', 'evidence_gate')
+  .addConditionalEdges('evidence_gate', routeAfterEvidenceGate)
+  .addEdge('refine_tools', 'evidence_gate')
   .addEdge('build_prompt', 'answer_with_deepseek')
-  .addEdge('answer_with_deepseek', 'condense_answer')
+  .addEdge('answer_with_deepseek', 'response_policy')
+  .addEdge('response_policy', 'condense_answer')
   .addEdge('condense_answer', END)
   .compile();
 
@@ -2308,11 +4612,33 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
   const ownerId = input.ownerId ?? 'anonymous';
   const mode: AgentMode = input.mode ?? 'mini';
 
+  const topRouteResult = await decideTopLevelRouteDetailed(input.message, mode, input.conversationContext ?? []);
+  const topRouteDecision = topRouteResult.decision;
+  const topLevelRoute = topRouteDecision.topRoute;
+  const deterministicTopRoute = decideTopLevelRouteDeterministic(input.message);
+
+  let miniScopeTelemetry: DecisionTelemetry | null = null;
+  let miniScopeDecision: MiniScopeDecision | null = null;
+
   if (mode === 'mini') {
-    const miniScope = evaluateMiniScope(input.message);
-    if (!miniScope.allowed) {
-    return {
-        answer: buildMiniUpgradeResponse(input.message, miniScope.reasons),
+    const miniScopeResult = await decideMiniScopeDetailed(input.message, mode, input.conversationContext ?? []);
+    const deterministicMiniScope = evaluateMiniScope(input.message);
+    miniScopeDecision = miniScopeResult.decision;
+    miniScopeTelemetry = {
+      node: 'mini_scope_decision',
+      model: miniScopeResult.model,
+      latencyMs: miniScopeResult.latencyMs,
+      confidence: miniScopeResult.decision.confidence,
+      usedFallback: miniScopeResult.usedFallback,
+      fallbackReason: miniScopeResult.usedFallback ? 'mini scope decision fallback' : undefined,
+      shadowComparison: env.LLM_DECISION_SHADOW_MODE
+        ? `deterministicMode=${deterministicMiniScope.enforcementMode}; llmMode=${miniScopeResult.decision.enforcementMode}; deterministicAllowed=${deterministicMiniScope.allowed}; llmAllowed=${miniScopeResult.decision.allowed}`
+        : undefined,
+    };
+
+    if (!miniScopeResult.decision.allowed || miniScopeResult.decision.enforcementMode === 'blocked') {
+      return {
+        answer: buildMiniUpgradeResponse(input.message, miniScopeResult.decision.reasons),
         model: 'cozmic-mini-guard',
         mode,
       };
@@ -2322,7 +4648,7 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
   const profileId = normalizeProfileId(input);
   const referenceTime = resolveReferenceTime(input);
 
-  if (!profileId) {
+  if (!profileId && topLevelRoute === 'pipeline') {
     throw new Error('A profileId or kundli snapshot is required to load canonical chart data.');
   }
 
@@ -2335,39 +4661,89 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
     referenceTimestamp: referenceTime.timestamp,
     referenceTimeSource: referenceTime.source,
     conversationContext: input.conversationContext ?? [],
+    topLevelRoute,
+    topLevelRouteConfidence: topRouteDecision.confidence,
+    decisionTelemetry: [
+      {
+        node: 'route_top_level',
+        model: topRouteResult.model,
+        latencyMs: topRouteResult.latencyMs,
+        confidence: topRouteDecision.confidence,
+        usedFallback: topRouteResult.usedFallback,
+        fallbackReason: topRouteResult.usedFallback ? 'route preflight fallback' : undefined,
+        shadowComparison: env.LLM_DECISION_SHADOW_MODE
+          ? `deterministic=${deterministicTopRoute}; llm=${topLevelRoute}; match=${deterministicTopRoute === topLevelRoute}`
+          : undefined,
+      },
+      ...(miniScopeTelemetry ? [miniScopeTelemetry] : []),
+    ],
     stageReporter: input.onStage ?? null,
     toolIteration: 0,
     maxToolIterations: 2,
+    temporalWindow: null,
     intent: null,
+    scopeSelection: null,
+    selectedToolGroups: null,
     executionPlan: null,
     coverageGaps: [],
+    coverageShouldRetry: null,
+    coverageDecisionConfidence: null,
+    refinementNextAction: null,
     analysisStages: [],
     toolFindings: [],
     prompt: null,
+    responseShouldCondense: null,
+    responsePolicyTone: null,
+    responsePolicyAddDisclaimer: null,
+    responsePolicyConfidence: null,
+    decisionBundle: {
+      source: topRouteResult.usedFallback ? 'hybrid' : 'llm',
+      topRoute: topLevelRoute,
+      miniEnforcementMode: miniScopeDecision?.enforcementMode,
+      confidence: topRouteDecision.confidence,
+      reason: 'preflight route decision',
+    },
+    toolAvailabilityPreflight: null,
   })) as AgentStateType;
 
-  if (!finalState.answer || !finalState.grounding) {
+  if (!finalState.answer) {
     throw new Error('LangGraph execution completed without a grounded answer.');
   }
 
+  if (finalState.topLevelRoute === 'pipeline' && !finalState.grounding) {
+    throw new Error('LangGraph execution completed without grounding for pipeline route.');
+  }
+
+  const restrictedMiniNotice =
+    mode === 'mini' && miniScopeDecision?.enforcementMode === 'restricted'
+      ? buildMiniRestrictedNotice(miniScopeDecision.reasons, miniScopeDecision.suggestedAlternative)
+      : null;
+
+  const finalAnswer = restrictedMiniNotice
+    ? `${restrictedMiniNotice}\n\n${finalState.answer}`
+    : finalState.answer;
+
   return {
-    answer: finalState.answer,
+    answer: finalAnswer,
     model: finalState.model ?? env.GOOGLE_GENAI_MODEL,
     mode,
     executionPlan: finalState.executionPlan ?? undefined,
     analysisStages: finalState.analysisStages ?? undefined,
-    grounding: {
-      ownerId,
-      profileId,
-      sourceDocId: finalState.grounding.sourceDocId,
-      chartVersion: finalState.grounding.chartVersion,
-      kundliSignature: finalState.grounding.kundliSignature,
-      kundli: finalState.grounding.kundli,
-      requestKey: finalState.grounding.requestKey,
-      payloadHash: finalState.grounding.payloadHash,
-      referenceTimestamp: finalState.grounding.referenceTimestamp,
-      referenceTimeSource: finalState.grounding.referenceTimeSource,
-      selectedPaths: finalState.grounding.selectedPaths,
-    },
+    decisionTelemetry: finalState.decisionTelemetry ?? undefined,
+    grounding: finalState.grounding
+      ? {
+          ownerId,
+          profileId: finalState.grounding.profileId,
+          sourceDocId: finalState.grounding.sourceDocId,
+          chartVersion: finalState.grounding.chartVersion,
+          kundliSignature: finalState.grounding.kundliSignature,
+          kundli: finalState.grounding.kundli,
+          requestKey: finalState.grounding.requestKey,
+          payloadHash: finalState.grounding.payloadHash,
+          referenceTimestamp: finalState.grounding.referenceTimestamp,
+          referenceTimeSource: finalState.grounding.referenceTimeSource,
+          selectedPaths: finalState.grounding.selectedPaths,
+        }
+      : undefined,
   };
 }

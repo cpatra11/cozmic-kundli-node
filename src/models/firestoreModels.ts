@@ -10,6 +10,7 @@ export const COLLECTIONS = {
 export interface AuthUserDocument {
   ownerId: string;
   email?: string;
+  phoneNumber?: string;
   provider: 'firebase';
   createdAt: number;
   updatedAt: number;

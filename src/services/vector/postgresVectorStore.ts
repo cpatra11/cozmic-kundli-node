@@ -1,6 +1,7 @@
 import { env } from '../../config/env.js';
 import type { RagChunkResult } from '../../models/firestoreModels.js';
 import { getPostgresPool } from '../postgresClient.js';
+import { applyPendingMigrations } from '../postgresMigrations.js';
 import type { VectorChunkUpsertRecord, VectorSearchInput, VectorStoreProvider } from './types.js';
 
 function shouldEnablePgVector(): boolean {
@@ -43,6 +44,8 @@ export class PostgresVectorStore implements VectorStoreProvider {
   async upsertChunks(records: VectorChunkUpsertRecord[]): Promise<void> {
     const pool = getPostgresPool();
     if (!pool || records.length === 0 || !shouldEnablePgVector()) return;
+
+    await applyPendingMigrations(pool);
 
     const client = await pool.connect();
     try {
@@ -108,10 +111,10 @@ export class PostgresVectorStore implements VectorStoreProvider {
             chartOwnerId,
             kundaliId,
             sourceDocId,
-              firstChunk?.sourceType ?? 'be1',
-              firstChunk?.endpoint ?? 'calculate',
+              record.data.sourceType ?? firstChunk?.sourceType ?? 'be1',
+              record.data.endpoint ?? firstChunk?.endpoint ?? 'calculate',
             record.data.chunkIndex,
-            deriveTextPreview(record.data.text),
+            null,
             record.data.text,
               deriveTextPreview(record.data.text),
               record.data.embeddingModel ?? 'deterministic-hash',
@@ -136,6 +139,8 @@ export class PostgresVectorStore implements VectorStoreProvider {
   async searchChunks(input: VectorSearchInput): Promise<RagChunkResult[]> {
     const pool = getPostgresPool();
     if (!pool || !shouldEnablePgVector()) return [];
+
+    await applyPendingMigrations(pool);
 
     const client = await pool.connect();
     try {

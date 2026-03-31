@@ -1,12 +1,19 @@
 import { Router } from 'express';
 import { createHash } from 'crypto';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { COLLECTIONS, type RagApiSourceDocument, type RagChunkDocument, type RagProfileDocument } from '../models/firestoreModels.js';
+import { type RagProfileDocument } from '../models/firestoreModels.js';
+import { getRagChunksRepository } from '../repositories/ragChunksRepository.js';
+import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
+import { getRagSourcesRepository } from '../repositories/ragSourcesRepository.js';
 import { buildChartSnapshot } from '../services/chartSnapshot.js';
-import { getPostgresStore } from '../services/postgresStore.js';
+import { getPostgresPool } from '../services/postgresClient.js';
+import { applyPendingMigrations } from '../services/postgresMigrations.js';
 import { cacheDelete, cacheGetJson, cacheSetJson } from '../services/valkeyCache.js';
 
 const router = Router();
+const ragProfiles = getRagProfilesRepository();
+const ragSources = getRagSourcesRepository();
+const ragChunks = getRagChunksRepository();
 
 const KUNDALI_CACHE_TTL_MS = 20_000;
 
@@ -29,9 +36,20 @@ function buildKundaliEtag(
   return `W/"${digest}"`;
 }
 
-function buildKundaliSummary(doc: RagProfileDocument, id: string) {
+function buildDocumentId(ownerId: string, profileId: string): string {
+  return `${ownerId}__${profileId}`;
+}
+
+function extractProfileId(identifier: string, ownerId: string): string {
+  if (identifier.startsWith(`${ownerId}__`)) {
+    return identifier.slice(ownerId.length + 2);
+  }
+  return identifier;
+}
+
+function buildKundaliSummary(doc: RagProfileDocument) {
   return {
-    id,
+    id: buildDocumentId(doc.ownerId, doc.profileId),
     kundaliId: doc.profileId,
     name: doc.displayName ?? doc.profileId,
     displayName: doc.displayName ?? doc.profileId,
@@ -44,21 +62,13 @@ function buildKundaliSummary(doc: RagProfileDocument, id: string) {
 
 router.get('/v1/kundalis', requireFirebaseAuth, async (req, res) => {
   try {
-    const store = getPostgresStore();
-    const rows = await store.runQuery<RagProfileDocument>(
-      COLLECTIONS.ragProfiles,
-      [{ field: 'ownerId', op: 'EQUAL', value: req.user!.uid }],
-      {
-        orderBy: [{ field: 'updatedAt', direction: 'DESCENDING' }],
-        limit: 100,
-      }
-    );
+    const rows = await ragProfiles.listByOwner(req.user!.uid, 100);
 
     res.setHeader('Cache-Control', 'private, max-age=10, stale-while-revalidate=20');
     res.setHeader('Vary', 'Authorization');
 
     return res.json({
-      kundalis: rows.map((doc) => buildKundaliSummary(doc.data, doc.id)),
+      kundalis: rows.map((doc) => buildKundaliSummary(doc)),
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to list kundalis', details: String(error) });
@@ -92,30 +102,14 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
       console.warn('Redis cache miss or error:', redisError);
     }
 
-    const store = getPostgresStore();
-
-    const directPath = `${COLLECTIONS.ragProfiles}/${ownerId}__${identifier}`;
-    let profileDoc = await store.getDocument<RagProfileDocument>(directPath);
-
-    if (!profileDoc) {
-      const matches = await store.runQuery<RagProfileDocument>(
-        COLLECTIONS.ragProfiles,
-        [
-          { field: 'ownerId', op: 'EQUAL', value: req.user!.uid },
-          { field: 'profileId', op: 'EQUAL', value: identifier },
-        ],
-        { limit: 1 }
-      );
-      profileDoc = matches[0] ?? null;
-    }
+    const profileId = extractProfileId(identifier, ownerId);
+    const profileDoc = await ragProfiles.getByOwnerAndProfileId(ownerId, profileId);
 
     if (!profileDoc) {
       return res.status(404).json({ error: 'Kundali not found' });
     }
 
-    const sourceDoc = await store.getDocument<RagApiSourceDocument>(
-      `${COLLECTIONS.ragApiSources}/${profileDoc.data.latestSourceDocId}`
-    );
+    const sourceDoc = await ragSources.getById(profileDoc.latestSourceDocId);
 
     const rawPayload = sourceDoc?.data.rawPayload;
     const baseSnapshot = sourceDoc?.data.chartSnapshot ?? rawPayload;
@@ -123,28 +117,28 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
 
     const responseBody = {
       kundali: {
-        id: profileDoc.id,
-        kundaliId: profileDoc.data.profileId,
-        ownerId: profileDoc.data.ownerId,
-        name: profileDoc.data.displayName ?? profileDoc.data.profileId,
-        displayName: profileDoc.data.displayName ?? profileDoc.data.profileId,
-        place: profileDoc.data.place,
+        id: buildDocumentId(profileDoc.ownerId, profileDoc.profileId),
+        kundaliId: profileDoc.profileId,
+        ownerId: profileDoc.ownerId,
+        name: profileDoc.displayName ?? profileDoc.profileId,
+        displayName: profileDoc.displayName ?? profileDoc.profileId,
+        place: profileDoc.place,
         chartData,
         rawPayload,
-        createdAt: profileDoc.data.createdAt,
-        updatedAt: profileDoc.data.updatedAt,
-        kundliInput: profileDoc.data.kundliInput,
-        chartVersion: profileDoc.data.chartVersion,
-        latestSourceDocId: profileDoc.data.latestSourceDocId,
+        createdAt: profileDoc.createdAt,
+        updatedAt: profileDoc.updatedAt,
+        kundliInput: profileDoc.kundliInput,
+        chartVersion: profileDoc.chartVersion,
+        latestSourceDocId: profileDoc.latestSourceDocId,
       },
     };
 
     const etag = buildKundaliEtag(
       ownerId,
-      profileDoc.data.profileId,
-      profileDoc.data.chartVersion,
-      profileDoc.data.updatedAt,
-      profileDoc.data.latestSourceDocId
+      profileDoc.profileId,
+      profileDoc.chartVersion,
+      profileDoc.updatedAt,
+      profileDoc.latestSourceDocId
     );
 
     const ifNoneMatch = getIfNoneMatchHeader(req.headers['if-none-match']);
@@ -177,57 +171,32 @@ router.patch('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =>
     const displayName = typeof req.body?.displayName === 'string' ? req.body.displayName.trim() : '';
     const place = typeof req.body?.place === 'string' ? req.body.place.trim() : '';
 
-    const store = getPostgresStore();
-    const matches = await store.runQuery<RagProfileDocument>(
-      COLLECTIONS.ragProfiles,
-      [
-        { field: 'ownerId', op: 'EQUAL', value: req.user!.uid },
-        { field: 'profileId', op: 'EQUAL', value: identifier },
-      ],
-      { limit: 1 }
-    );
-
-    const profileDoc = matches[0];
+    const profileId = extractProfileId(identifier, req.user!.uid);
+    const profileDoc = await ragProfiles.getByOwnerAndProfileId(req.user!.uid, profileId);
     if (!profileDoc) {
       return res.status(404).json({ error: 'Kundali not found' });
     }
 
-    const profilePatch: Record<string, unknown> = {
-      updatedAt: Date.now(),
-    };
-    if (displayName) profilePatch.displayName = displayName;
-    if (place) profilePatch.place = place;
+    const updatedAt = Date.now();
+    await ragProfiles.patchMetadata(req.user!.uid, profileDoc.profileId, {
+      displayName: displayName || undefined,
+      place: place || undefined,
+      updatedAt,
+    });
 
-    await store.setDocument(`${COLLECTIONS.ragProfiles}/${profileDoc.id}`, profilePatch, true);
-    await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.data.profileId}`);
+    await ragSources.patchMetadataForOwnerProfile(req.user!.uid, profileDoc.profileId, {
+      displayName: displayName || undefined,
+      place: place || undefined,
+    });
 
-    const sourceDocs = await store.runQuery<RagApiSourceDocument>(
-      COLLECTIONS.ragApiSources,
-      [
-        { field: 'ownerId', op: 'EQUAL', value: req.user!.uid },
-        { field: 'profileId', op: 'EQUAL', value: profileDoc.data.profileId },
-      ]
-    );
-
-    await Promise.all(
-      sourceDocs.map((doc) =>
-        store.setDocument(
-          `${COLLECTIONS.ragApiSources}/${doc.id}`,
-          {
-            ...(displayName ? { displayName } : {}),
-            ...(place ? { place } : {}),
-          },
-          true
-        )
-      )
-    );
+    await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.profileId}`);
 
     return res.json({
       ok: true,
-      kundaliId: profileDoc.data.profileId,
-      updatedAt: profilePatch.updatedAt,
-      displayName: displayName || profileDoc.data.displayName || profileDoc.data.profileId,
-      place: place || profileDoc.data.place || '',
+      kundaliId: profileDoc.profileId,
+      updatedAt,
+      displayName: displayName || profileDoc.displayName || profileDoc.profileId,
+      place: place || profileDoc.place || '',
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to update kundali', details: String(error) });
@@ -241,46 +210,26 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
       return res.status(400).json({ error: 'Missing kundaliId path parameter' });
     }
 
-    const store = getPostgresStore();
-
-    const profileMatches = await store.runQuery<RagProfileDocument>(
-      COLLECTIONS.ragProfiles,
-      [
-        { field: 'ownerId', op: 'EQUAL', value: req.user!.uid },
-        { field: 'profileId', op: 'EQUAL', value: identifier },
-      ],
-      { limit: 1 }
-    );
-
-    const profileDoc = profileMatches[0];
+    const profileId = extractProfileId(identifier, req.user!.uid);
+    const profileDoc = await ragProfiles.getByOwnerAndProfileId(req.user!.uid, profileId);
     if (!profileDoc) {
       return res.status(404).json({ error: 'Kundali not found' });
     }
 
-    const profilePath = `${COLLECTIONS.ragProfiles}/${profileDoc.id}`;
-    const sourceDocs = await store.runQuery<RagApiSourceDocument>(
-      COLLECTIONS.ragApiSources,
-      [
-        { field: 'ownerId', op: 'EQUAL', value: req.user!.uid },
-        { field: 'profileId', op: 'EQUAL', value: profileDoc.data.profileId },
-      ]
-    );
-
-    const chunkDocs = await store.runQuery<RagChunkDocument>(
-      COLLECTIONS.ragChunks,
-      [
-        { field: 'ownerId', op: 'EQUAL', value: req.user!.uid },
-        { field: 'profileId', op: 'EQUAL', value: profileDoc.data.profileId },
-      ]
-    );
-
     await Promise.all([
-      store.deleteDocument(profilePath),
-      ...sourceDocs.map((doc) => store.deleteDocument(`${COLLECTIONS.ragApiSources}/${doc.id}`)),
-      ...chunkDocs.map((doc) => store.deleteDocument(`${COLLECTIONS.ragChunks}/${doc.id}`)),
+      ragChunks.deleteByOwnerProfile(req.user!.uid, profileDoc.profileId),
+      ragSources.deleteByOwnerProfile(req.user!.uid, profileDoc.profileId),
+      ragProfiles.deleteByOwnerAndProfileId(req.user!.uid, profileDoc.profileId),
     ]);
 
-    await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.data.profileId}`);
+    const pool = getPostgresPool();
+    if (pool) {
+      await applyPendingMigrations(pool);
+      await pool.query(`DELETE FROM chart_vectors WHERE owner_id = $1 AND kundali_id = $2`, [req.user!.uid, profileDoc.profileId]);
+      await pool.query(`DELETE FROM charts WHERE owner_id = $1 AND kundali_id = $2`, [req.user!.uid, profileDoc.profileId]);
+    }
+
+    await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.profileId}`);
 
     return res.status(204).send();
   } catch (error) {

@@ -2,8 +2,8 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { COLLECTIONS, type UserSubscriptionDocument } from '../models/firestoreModels.js';
-import { getPostgresStore } from '../services/postgresStore.js';
+import type { UserSubscriptionDocument } from '../models/firestoreModels.js';
+import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 
 const router = Router();
 
@@ -85,7 +85,7 @@ router.post('/v1/billing/revenuecat/webhook', async (req, res) => {
       return res.status(202).json({ accepted: true, ignored: 'Missing app_user_id' });
     }
 
-    const store = getPostgresStore();
+    const subscriptions = getSubscriptionsRepository();
     const now = Date.now();
     const status = computeIsProStatus(event);
 
@@ -103,7 +103,7 @@ router.post('/v1/billing/revenuecat/webhook', async (req, res) => {
       lastEventId: event.id,
     };
 
-    await store.setDocument(`${COLLECTIONS.userSubscriptions}/${ownerId}`, subscriptionDoc, true);
+    await subscriptions.upsert(subscriptionDoc);
 
     return res.status(200).json({ ok: true });
   } catch (error) {
@@ -113,9 +113,9 @@ router.post('/v1/billing/revenuecat/webhook', async (req, res) => {
 
 router.get('/v1/billing/subscription', requireFirebaseAuth, async (req, res) => {
   try {
-    const store = getPostgresStore();
+    const subscriptions = getSubscriptionsRepository();
     const ownerId = req.user!.uid;
-    const doc = await store.getDocument<UserSubscriptionDocument>(`${COLLECTIONS.userSubscriptions}/${ownerId}`);
+    const doc = await subscriptions.getByOwnerId(ownerId);
 
     if (!doc) {
       return res.json({
@@ -126,7 +126,7 @@ router.get('/v1/billing/subscription', requireFirebaseAuth, async (req, res) => 
       });
     }
 
-    return res.json({ subscription: doc.data });
+    return res.json({ subscription: doc });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to load subscription', details: String(error) });
   }

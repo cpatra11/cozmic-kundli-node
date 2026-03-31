@@ -34,6 +34,62 @@ const EnvSchema = z.object({
   GOOGLE_GENAI_MODEL: z.string().default('gemini-2.0-flash'),
   GEMINI_API_KEY: z.string().optional(),
   LLM_PROVIDER: z.enum(['gemini-adk', 'deepseek-bedrock']).default('deepseek-bedrock'),
+  LLM_DECISION_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_MODE: z.preprocess(
+    (value) => (typeof value === 'string' ? value.toLowerCase() : value),
+    z.enum(['deterministic', 'hybrid', 'llm_first']).default('hybrid')
+  ),
+  LLM_DECISION_ROUTE_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_INTENT_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_MINI_SCOPE_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_FAST_ANSWER_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_TEMPORAL_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_SCOPE_SELECTOR_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_PLAN_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_TOOL_SELECTION_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_REFINEMENT_ROUTER_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_COVERAGE_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_RESPONSE_POLICY_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  LLM_DECISION_SHADOW_MODE: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'false').toLowerCase() === 'true'),
   AWS_REGION: z.string().default('us-east-1'),
   REDIS_URL: z.string().optional(),
   VALKEY_ENABLED: z

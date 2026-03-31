@@ -5,8 +5,8 @@ import { fetchBe1Json, fetchTransitChart } from '../services/be1Client.js';
 import { ingestChartPayloadForProfile, ingestKundliForProfile, queryRagChunks } from '../services/ragPipeline.js';
 import { stableHash } from '../services/hash.js';
 import { buildChartSnapshot } from '../services/chartSnapshot.js';
-import { COLLECTIONS, type ChartJobDocument } from '../models/firestoreModels.js';
-import { getPostgresStore } from '../services/postgresStore.js';
+import { type ChartJobDocument } from '../models/firestoreModels.js';
+import { getChartJobsRepository } from '../repositories/chartJobsRepository.js';
 
 const router = Router();
 
@@ -136,6 +136,7 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
   const chartSnapshot = buildChartSnapshot(chartData);
 
   let ingestion;
+  let ingestionError: string | undefined;
   try {
     ingestion = await ingestChartPayloadForProfile({
       ownerId,
@@ -158,14 +159,21 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
       tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
     });
   } catch (error) {
-    throw new Error(`Failed to persist chart payload to Postgres: ${String(error)}`);
+    ingestionError = `Failed to persist chart payload to Postgres: ${String(error)}`;
+    console.error('[chart/generate] non-fatal ingestion failure', {
+      ownerId,
+      profileId,
+      error: ingestionError,
+    });
   }
 
   return {
     profileId,
     kundaliId: profileId,
     chartData: chartSnapshot,
-    ingestion,
+    ingestion: ingestion ?? null,
+    ingestionStatus: ingestion ? 'ready' : 'degraded',
+    ingestionError,
   };
 }
 
@@ -232,11 +240,10 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
     const runAsync = shouldRunAsync((req.query as Record<string, unknown>)?.async ?? (req.body as Record<string, unknown>)?.async);
 
     if (runAsync) {
-      const store = getPostgresStore();
+      const chartJobs = getChartJobsRepository();
       const now = Date.now();
       const profileIdHint = parsed.data.profileId ?? 'pending';
       const jobId = `job_${stableHash(JSON.stringify({ ownerId: req.user!.uid, profileIdHint, now, request: parsed.data })).slice(0, 16)}`;
-      const jobPath = `${COLLECTIONS.chartJobs}/${req.user!.uid}__${jobId}`;
 
       const initialJob: ChartJobDocument = {
         ownerId: req.user!.uid,
@@ -247,24 +254,24 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
         updatedAt: now,
       };
 
-      await store.setDocument(jobPath, initialJob, false);
+      await chartJobs.create(req.user!.uid, jobId, initialJob);
 
       setImmediate(async () => {
         try {
-          await store.setDocument(jobPath, { status: 'running', updatedAt: Date.now() }, true);
+          await chartJobs.patch(req.user!.uid, jobId, { status: 'running', updatedAt: Date.now() });
           const result = await generateAndIngestChart(req.user!.uid, parsed.data);
-          await store.setDocument(jobPath, {
+          await chartJobs.patch(req.user!.uid, jobId, {
             status: 'completed',
             profileId: result.profileId,
             result,
             updatedAt: Date.now(),
-          }, true);
+          });
         } catch (error) {
-          await store.setDocument(jobPath, {
+          await chartJobs.patch(req.user!.uid, jobId, {
             status: 'failed',
             error: String(error),
             updatedAt: Date.now(),
-          }, true);
+          });
         }
       });
 
@@ -294,8 +301,8 @@ router.get('/v1/chart/jobs/:jobId', requireFirebaseAuth, async (req, res) => {
       return res.status(400).json({ error: 'Missing jobId path parameter' });
     }
 
-    const store = getPostgresStore();
-    const doc = await store.getDocument<ChartJobDocument>(`${COLLECTIONS.chartJobs}/${req.user!.uid}__${jobId}`);
+    const chartJobs = getChartJobsRepository();
+    const doc = await chartJobs.get(req.user!.uid, jobId);
     if (!doc) {
       return res.status(404).json({ error: 'Chart job not found' });
     }

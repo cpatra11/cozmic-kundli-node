@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient } from 'pg';
 import { env } from '../config/env.js';
 import { buildPostgresSslConfig, withPostgresSslOverrides } from './postgresSsl.js';
+import { applyPendingMigrations } from './postgresMigrations.js';
 
 type PostgresDocumentValue =
   | string
@@ -202,25 +203,7 @@ class PostgresStore {
   private async ensureSchema(): Promise<void> {
     if (!this.ready) {
       this.ready = (async () => {
-        await this.executeQuery(`
-          CREATE TABLE IF NOT EXISTS documents (
-            path TEXT PRIMARY KEY,
-            collection TEXT NOT NULL,
-            doc_id TEXT NOT NULL,
-            data JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-          );
-        `, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_idx ON documents (collection);`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_owner_idx ON documents (collection, ((data->>'ownerId')));`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_profile_idx ON documents (collection, ((data->>'profileId')));`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_updated_idx ON documents (collection, updated_at DESC);`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_owner_profile_idx ON documents (collection, ((data->>'ownerId')), ((data->>'profileId')));`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_latest_source_idx ON documents (collection, ((data->>'latestSourceDocId')));`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_collection_chart_version_idx ON documents (collection, ((data->>'chartVersion')));`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_chat_sessions_owner_updated_idx ON documents (((data->>'ownerId')), ((data->>'updatedAt')) DESC) WHERE collection = 'chat_sessions';`, [], { disableTimeout: true, retries: 0 });
-        await this.executeQuery(`CREATE INDEX IF NOT EXISTS documents_chat_messages_owner_session_created_idx ON documents (((data->>'ownerId')), ((data->>'sessionId')), ((data->>'createdAt'))) WHERE collection = 'chat_messages';`, [], { disableTimeout: true, retries: 0 });
+        await applyPendingMigrations(this.pool);
       })();
     }
 

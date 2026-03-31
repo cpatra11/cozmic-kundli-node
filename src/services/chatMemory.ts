@@ -1,6 +1,6 @@
 import { env } from '../config/env.js';
 import { cosineSimilarity, embedTextDeterministic } from './embeddings.js';
-import { getPostgresStore } from './postgresStore.js';
+import { getChatRepository } from '../repositories/chatRepository.js';
 
 interface ChatMessageMemoryDoc {
   ownerId: string;
@@ -36,28 +36,18 @@ export async function queryRelevantSessionMemories(input: {
   excludeRequestId?: string;
   topK?: number;
 }): Promise<RelevantChatMemory[]> {
-  const store = getPostgresStore();
+  const chatRepository = getChatRepository();
   const topK = Math.min(Math.max(input.topK ?? 6, 1), 12);
   const candidateWindow = Math.max(40, topK * 10);
 
-  const candidates = await store.runQuery<ChatMessageMemoryDoc>(
-    'chat_messages',
-    [
-      { field: 'ownerId', op: 'EQUAL', value: input.ownerId },
-      { field: 'sessionId', op: 'EQUAL', value: input.sessionId },
-    ],
-    {
-      orderBy: [{ field: 'createdAt', direction: 'DESCENDING' }],
-      limit: candidateWindow,
-    }
-  );
+  const candidates = await chatRepository.listMessagesForMemory(input.ownerId, input.sessionId, candidateWindow);
 
   if (candidates.length === 0) return [];
 
   const queryVector = embedTextDeterministic(input.message, env.EMBEDDING_DIM).vector;
 
   const scored = candidates
-    .map((doc) => doc.data)
+    .map((doc) => doc as ChatMessageMemoryDoc)
     .filter((doc) => doc.message && doc.message.trim().length > 0)
     .filter((doc) => (input.excludeRequestId ? doc.requestId !== input.excludeRequestId : true))
     .map((doc) => {

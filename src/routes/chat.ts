@@ -2,11 +2,12 @@ import { Router, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { runKundliAgent } from '../services/kundliAgent.js';
-import { getPostgresStore } from '../services/postgresStore.js';
-import { COLLECTIONS, type RagProfileDocument, type UserSubscriptionDocument } from '../models/firestoreModels.js';
+import { runKundliAgent, shouldBypassChartPipeline } from '../services/kundliAgent.js';
 import { env } from '../config/env.js';
 import { buildChatMessageEmbedding, queryRelevantSessionMemories } from '../services/chatMemory.js';
+import { getChatRepository } from '../repositories/chatRepository.js';
+import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
+import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 
 const CreateSessionSchema = z.object({
   title: z.string().min(1).max(120).optional(),
@@ -67,11 +68,10 @@ interface ChatMessageDoc {
 }
 
 async function ownerHasProEntitlement(ownerId: string): Promise<boolean> {
-  const store = getPostgresStore();
-  const doc = await store.getDocument<UserSubscriptionDocument>(`${COLLECTIONS.userSubscriptions}/${ownerId}`);
-  if (!doc) return false;
+  const subscriptionsRepository = getSubscriptionsRepository();
+  const subscription = await subscriptionsRepository.getByOwnerId(ownerId);
+  if (!subscription) return false;
 
-  const subscription = doc.data;
   if (!subscription.isPro) return false;
 
   if (typeof subscription.expiresAtMs === 'number' && subscription.expiresAtMs <= Date.now()) {
@@ -94,7 +94,7 @@ router.post('/v1/chat/sessions', requireFirebaseAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
     }
 
-    const store = getPostgresStore();
+    const chatRepository = getChatRepository();
     const now = Date.now();
     const sessionId = randomUUID();
 
@@ -106,7 +106,16 @@ router.post('/v1/chat/sessions', requireFirebaseAuth, async (req, res) => {
       updatedAt: now,
     };
 
-    await store.setDocument(`chat_sessions/${sessionId}`, sessionDoc, false);
+    await chatRepository.createSession({
+      id: sessionId,
+      ownerId: sessionDoc.ownerId,
+      title: sessionDoc.title,
+      kundaliId: sessionDoc.kundaliId,
+      chartVersion: sessionDoc.chartVersion,
+      createdAt: sessionDoc.createdAt,
+      updatedAt: sessionDoc.updatedAt,
+      lastMessagePreview: sessionDoc.lastMessagePreview,
+    });
 
     return res.status(201).json({ id: sessionId });
   } catch (error) {
@@ -116,17 +125,8 @@ router.post('/v1/chat/sessions', requireFirebaseAuth, async (req, res) => {
 
 router.get('/v1/chat/sessions', requireFirebaseAuth, async (req, res) => {
   try {
-    const store = getPostgresStore();
-    const snapshot = await store.runQuery<ChatSessionDoc>(
-      'chat_sessions',
-      [{ field: 'ownerId', op: 'EQUAL', value: req.user!.uid }],
-      {
-        orderBy: [{ field: 'updatedAt', direction: 'DESCENDING' }],
-        limit: 50,
-      }
-    );
-
-    const sessions = snapshot.map((doc) => ({ id: doc.id, ...doc.data }));
+    const chatRepository = getChatRepository();
+    const sessions = await chatRepository.listSessionsByOwner(req.user!.uid, 50);
     return res.json({ sessions });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to list sessions', details: String(error) });
@@ -135,7 +135,7 @@ router.get('/v1/chat/sessions', requireFirebaseAuth, async (req, res) => {
 
 router.get('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async (req, res) => {
   try {
-    const store = getPostgresStore();
+    const chatRepository = getChatRepository();
     const sessionIdParam = req.params.sessionId;
     const sessionId = Array.isArray(sessionIdParam) ? sessionIdParam[0] : sessionIdParam;
 
@@ -143,28 +143,17 @@ router.get('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async (
       return res.status(400).json({ error: 'Missing sessionId path parameter' });
     }
 
-    const session = await store.getDocument<ChatSessionDoc>(`chat_sessions/${sessionId}`);
+    const session = await chatRepository.getSessionById(sessionId);
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    if (session.data.ownerId !== req.user!.uid) {
+    if (session.ownerId !== req.user!.uid) {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const messages = await store.runQuery<ChatMessageDoc>(
-      'chat_messages',
-      [
-        { field: 'ownerId', op: 'EQUAL', value: req.user!.uid },
-        { field: 'sessionId', op: 'EQUAL', value: sessionId },
-      ],
-      {
-        orderBy: [{ field: 'createdAt', direction: 'ASCENDING' }],
-        limit: 500,
-      }
-    );
-
-    return res.json({ messages: messages.map((doc) => ({ id: doc.id, ...doc.data })) });
+    const messages = await chatRepository.listSessionMessages(req.user!.uid, sessionId, 500);
+    return res.json({ messages });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to list messages', details: String(error) });
   }
@@ -190,7 +179,8 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       return;
     }
 
-    const store = getPostgresStore();
+    const chatRepository = getChatRepository();
+    const ragProfilesRepository = getRagProfilesRepository();
     if ((parsed.data.mode ?? 'mini') === 'pro') {
       const hasPro = await ownerHasProEntitlement(req.user!.uid);
       if (!hasPro) {
@@ -213,8 +203,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       return;
     }
 
-    const sessionPath = `chat_sessions/${sessionId}`;
-    const session = await store.getDocument<ChatSessionDoc>(sessionPath);
+    const session = await chatRepository.getSessionById(sessionId);
 
     if (!session) {
       writeSseEvent(res, 'error', { error: 'Session not found' });
@@ -222,28 +211,37 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       return;
     }
 
-    if (session.data.ownerId !== req.user!.uid) {
+    if (session.ownerId !== req.user!.uid) {
       writeSseEvent(res, 'error', { error: 'Forbidden' });
       res.end();
       return;
     }
 
-    let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.data.kundaliId;
+    let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.kundaliId;
 
     if (!effectiveProfileId) {
-      const latestProfiles = await store.runQuery<RagProfileDocument>(
-        COLLECTIONS.ragProfiles,
-        [{ field: 'ownerId', op: 'EQUAL', value: req.user!.uid }],
-        {
-          orderBy: [{ field: 'updatedAt', direction: 'DESCENDING' }],
-          limit: 1,
-        }
-      );
-
-      effectiveProfileId = latestProfiles[0]?.data.profileId;
+      const latestProfiles = await ragProfilesRepository.listByOwner(req.user!.uid, 1);
+      effectiveProfileId = latestProfiles[0]?.profileId;
     }
 
-    if (!effectiveProfileId) {
+    const now = Date.now();
+    const requestId = parsed.data.requestId ?? randomUUID();
+
+    const relevantMemories = await queryRelevantSessionMemories({
+      ownerId: req.user!.uid,
+      sessionId,
+      message: parsed.data.message,
+      excludeRequestId: requestId,
+      topK: 6,
+    });
+
+    const bypassChartPipeline = await shouldBypassChartPipeline(
+      parsed.data.message,
+      parsed.data.mode ?? 'mini',
+      relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`)
+    );
+
+    if (!effectiveProfileId && !bypassChartPipeline) {
       writeSseEvent(res, 'error', {
         error: 'Missing canonical chart identity',
         details: 'Open or save a Kundli first so chat can load canonical payload.',
@@ -251,9 +249,6 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       res.end();
       return;
     }
-
-    const now = Date.now();
-    const requestId = parsed.data.requestId ?? randomUUID();
 
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
@@ -267,15 +262,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       ...buildChatMessageEmbedding(parsed.data.message),
     };
 
-    await store.createDocument('chat_messages', userMessage);
-
-    const relevantMemories = await queryRelevantSessionMemories({
-      ownerId: req.user!.uid,
-      sessionId,
-      message: parsed.data.message,
-      excludeRequestId: requestId,
-      topK: 6,
-    });
+    await chatRepository.createMessage(userMessage);
 
     writeSseEvent(res, 'ack', {
       requestId,
@@ -315,18 +302,14 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       ...buildChatMessageEmbedding(agent.answer),
     };
 
-    await store.createDocument('chat_messages', assistantMessage);
+    await chatRepository.createMessage(assistantMessage);
 
-    await store.setDocument(
-      sessionPath,
-      {
-        updatedAt: Date.now(),
-        lastMessagePreview: parsed.data.message.slice(0, 180),
-        kundaliId: effectiveProfileId,
-        chartVersion: agent.grounding?.chartVersion,
-      },
-      true
-    );
+    await chatRepository.updateSession(sessionId, req.user!.uid, {
+      updatedAt: Date.now(),
+      lastMessagePreview: parsed.data.message.slice(0, 180),
+      kundaliId: effectiveProfileId,
+      chartVersion: agent.grounding?.chartVersion,
+    });
 
     writeSseEvent(res, 'done', {
       answer: agent.answer,
@@ -334,6 +317,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       mode: parsed.data.mode ?? 'mini',
       executionPlan: agent.executionPlan,
       analysisStages: agent.analysisStages,
+      decisionTelemetry: agent.decisionTelemetry,
       grounding: agent.grounding,
       memoryContextUsed: relevantMemories,
       sessionId,
@@ -356,7 +340,8 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
     }
 
-    const store = getPostgresStore();
+    const chatRepository = getChatRepository();
+    const ragProfilesRepository = getRagProfilesRepository();
 
     if ((parsed.data.mode ?? 'mini') === 'pro') {
       const hasPro = await ownerHasProEntitlement(req.user!.uid);
@@ -376,42 +361,47 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       return res.status(400).json({ error: 'Missing sessionId path parameter' });
     }
 
-    const sessionPath = `chat_sessions/${sessionId}`;
-    const session = await store.getDocument<ChatSessionDoc>(sessionPath);
+    const session = await chatRepository.getSessionById(sessionId);
 
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    if (session.data.ownerId !== req.user!.uid) {
+    if (session.ownerId !== req.user!.uid) {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.data.kundaliId;
+    let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.kundaliId;
 
     if (!effectiveProfileId) {
-      const latestProfiles = await store.runQuery<RagProfileDocument>(
-        COLLECTIONS.ragProfiles,
-        [{ field: 'ownerId', op: 'EQUAL', value: req.user!.uid }],
-        {
-          orderBy: [{ field: 'updatedAt', direction: 'DESCENDING' }],
-          limit: 1,
-        }
-      );
-
-      effectiveProfileId = latestProfiles[0]?.data.profileId;
+      const latestProfiles = await ragProfilesRepository.listByOwner(req.user!.uid, 1);
+      effectiveProfileId = latestProfiles[0]?.profileId;
     }
 
-    if (!effectiveProfileId) {
+    const now = Date.now();
+    const requestId = parsed.data.requestId ?? randomUUID();
+
+    const relevantMemories = await queryRelevantSessionMemories({
+      ownerId: req.user!.uid,
+      sessionId,
+      message: parsed.data.message,
+      excludeRequestId: requestId,
+      topK: 6,
+    });
+
+    const bypassChartPipeline = await shouldBypassChartPipeline(
+      parsed.data.message,
+      parsed.data.mode ?? 'mini',
+      relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`)
+    );
+
+    if (!effectiveProfileId && !bypassChartPipeline) {
       return res.status(400).json({
         error: 'Missing canonical chart identity',
         details:
           'Open or save a Kundli first so chat can load the canonical raw payload from Postgres. If none exists yet, generate a chart via /v1/chart/generate first.',
       });
     }
-
-    const now = Date.now();
-    const requestId = parsed.data.requestId ?? randomUUID();
 
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
@@ -425,15 +415,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       ...buildChatMessageEmbedding(parsed.data.message),
     };
 
-    await store.createDocument('chat_messages', userMessage);
-
-    const relevantMemories = await queryRelevantSessionMemories({
-      ownerId: req.user!.uid,
-      sessionId,
-      message: parsed.data.message,
-      excludeRequestId: requestId,
-      topK: 6,
-    });
+    await chatRepository.createMessage(userMessage);
 
     const agent = await runKundliAgent({
       ownerId: req.user!.uid,
@@ -461,18 +443,14 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       ...buildChatMessageEmbedding(agent.answer),
     };
 
-    await store.createDocument('chat_messages', assistantMessage);
+    await chatRepository.createMessage(assistantMessage);
 
-    await store.setDocument(
-      sessionPath,
-      {
-        updatedAt: Date.now(),
-        lastMessagePreview: parsed.data.message.slice(0, 180),
-        kundaliId: effectiveProfileId,
-        chartVersion: agent.grounding?.chartVersion,
-      },
-      true
-    );
+    await chatRepository.updateSession(sessionId, req.user!.uid, {
+      updatedAt: Date.now(),
+      lastMessagePreview: parsed.data.message.slice(0, 180),
+      kundaliId: effectiveProfileId,
+      chartVersion: agent.grounding?.chartVersion,
+    });
 
     return res.json({
       answer: agent.answer,
@@ -480,6 +458,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       mode: parsed.data.mode ?? 'mini',
       executionPlan: agent.executionPlan,
       analysisStages: agent.analysisStages,
+      decisionTelemetry: agent.decisionTelemetry,
       grounding: agent.grounding,
       memoryContextUsed: relevantMemories,
       sessionId,

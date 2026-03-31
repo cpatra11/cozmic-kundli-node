@@ -58,6 +58,18 @@ async function main() {
   const data = await response.json();
   console.log('Status:', response.status);
   console.log('Body keys:', Object.keys(data));
+  if (data.error) {
+    console.log('Error:', data.error);
+  }
+  if (data.details) {
+    console.log('Details:', data.details);
+  }
+  if (data.ingestionStatus) {
+    console.log('Ingestion status:', data.ingestionStatus);
+  }
+  if (data.ingestionError) {
+    console.log('Ingestion error:', data.ingestionError);
+  }
   console.log('Profile ID:', data.profileId);
   console.log('Ingestion:', data.ingestion);
   console.log('Has chartData.chart:', Boolean(data.chartData?.chart));

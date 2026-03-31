@@ -1,10 +1,14 @@
 import { env } from '../config/env.js';
-import { COLLECTIONS, type RagApiSourceDocument, type RagChunkDocument, type RagChunkResult, type RagProfileDocument } from '../models/firestoreModels.js';
+import { type RagApiSourceDocument, type RagChunkDocument, type RagChunkResult, type RagProfileDocument } from '../models/firestoreModels.js';
+import { getRagChunksRepository } from '../repositories/ragChunksRepository.js';
+import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
+import { getRagSourcesRepository } from '../repositories/ragSourcesRepository.js';
 import { fetchKundliSnapshot, type KundliSnapshotInput } from './be1Client.js';
 import { cosineSimilarity, embedTextDeterministic } from './embeddings.js';
-import { getPostgresStore } from './postgresStore.js';
+import { getPostgresPool } from './postgresClient.js';
 import { stableHash, toDocId } from './hash.js';
 import { buildChartSnapshot } from './chartSnapshot.js';
+import { PostgresVectorStore } from './vector/postgresVectorStore.js';
 
 interface IngestInput {
   ownerId: string;
@@ -38,6 +42,11 @@ interface IngestResult {
   chunkCount: number;
   endpoint: string;
 }
+
+const pgVectorStore = new PostgresVectorStore();
+const ragProfiles = getRagProfilesRepository();
+const ragSources = getRagSourcesRepository();
+const ragChunks = getRagChunksRepository();
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -129,6 +138,138 @@ function toKundliInputDocument(kundli: KundliSnapshotInput): RagProfileDocument[
   };
 }
 
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function asText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+async function upsertChartRow(input: {
+  ownerId: string;
+  profileId: string;
+  displayName?: string;
+  place?: string;
+  sourceDocId: string;
+  requestKey: string;
+  payloadHash: string;
+  chartSnapshot: unknown;
+  kundliInput: RagProfileDocument['kundliInput'];
+  tags: string[];
+}): Promise<void> {
+  const pool = getPostgresPool();
+  if (!pool) return;
+
+  const snapshot = toRecord(input.chartSnapshot);
+  const panchanga = toRecord(snapshot.panchanga);
+  const dasha = toRecord(snapshot.dasha);
+
+  const now = Date.now();
+  const chartDateTime = `${input.kundliInput.year}-${String(input.kundliInput.month).padStart(2, '0')}-${String(
+    input.kundliInput.day
+  ).padStart(2, '0')}T${String(input.kundliInput.hour).padStart(2, '0')}:${String(input.kundliInput.min).padStart(2, '0')}:${String(
+    input.kundliInput.sec
+  ).padStart(2, '0')}`;
+
+  await pool.query(
+    `
+      INSERT INTO charts (
+        owner_id,
+        kundali_id,
+        request_key,
+        ingestion_status,
+        name,
+        place,
+        display_name,
+        tags,
+        panchanga,
+        chart_data,
+        raw_payload_ref,
+        chart_signature,
+        chart_datetime,
+        location_lat,
+        location_lng,
+        timezone,
+        tithi,
+        nakshatra,
+        dasha_current,
+        created_at,
+        updated_at,
+        deleted_at
+      ) VALUES (
+        $1,
+        $2,
+        $3,
+        'ready',
+        $4,
+        $5,
+        $6,
+        $7::jsonb,
+        $8::jsonb,
+        $9::jsonb,
+        $10,
+        $11,
+        $12,
+        $13,
+        $14,
+        $15,
+        $16,
+        $17,
+        $18,
+        $19,
+        $20,
+        NULL
+      )
+      ON CONFLICT (owner_id, kundali_id)
+      DO UPDATE SET
+        request_key = EXCLUDED.request_key,
+        ingestion_status = EXCLUDED.ingestion_status,
+        name = EXCLUDED.name,
+        place = EXCLUDED.place,
+        display_name = EXCLUDED.display_name,
+        tags = EXCLUDED.tags,
+        panchanga = EXCLUDED.panchanga,
+        chart_data = EXCLUDED.chart_data,
+        raw_payload_ref = EXCLUDED.raw_payload_ref,
+        chart_signature = EXCLUDED.chart_signature,
+        chart_datetime = EXCLUDED.chart_datetime,
+        location_lat = EXCLUDED.location_lat,
+        location_lng = EXCLUDED.location_lng,
+        timezone = EXCLUDED.timezone,
+        tithi = EXCLUDED.tithi,
+        nakshatra = EXCLUDED.nakshatra,
+        dasha_current = EXCLUDED.dasha_current,
+        updated_at = EXCLUDED.updated_at,
+        deleted_at = NULL
+    `,
+    [
+      input.ownerId,
+      input.profileId,
+      input.requestKey,
+      input.displayName ?? null,
+      input.place ?? null,
+      input.displayName ?? input.profileId,
+      JSON.stringify(input.tags),
+      Object.keys(panchanga).length > 0 ? JSON.stringify(panchanga) : null,
+      JSON.stringify(input.chartSnapshot),
+      input.sourceDocId,
+      input.payloadHash,
+      chartDateTime,
+      input.kundliInput.latitude,
+      input.kundliInput.longitude,
+      input.kundliInput.time_zone,
+      asText(panchanga.tithi),
+      asText(panchanga.nakshatra),
+      asText(dasha.current),
+      now,
+      now,
+    ]
+  );
+}
+
 export async function ingestKundliForProfile(input: IngestInput): Promise<IngestResult> {
   const payload = await fetchKundliSnapshot(input.kundli);
   return ingestChartPayloadForProfile({
@@ -144,7 +285,6 @@ export async function ingestKundliForProfile(input: IngestInput): Promise<Ingest
 }
 
 export async function ingestChartPayloadForProfile(input: IngestChartPayloadInput): Promise<IngestResult> {
-  const store = getPostgresStore();
   const now = Date.now();
   const endpoint = input.endpoint ?? 'calculate';
 
@@ -155,6 +295,8 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
   );
 
   const sourceDocId = toDocId('src', `${input.ownerId}:${input.profileId}:${requestKey}:${payloadHash}`);
+  const chartSnapshot = buildChartSnapshot(input.payload);
+
   const sourceDoc: RagApiSourceDocument = {
     ownerId: input.ownerId,
     profileId: input.profileId,
@@ -165,19 +307,50 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
     requestKey,
     payloadHash,
     rawPayload: input.payload,
-    chartSnapshot: buildChartSnapshot(input.payload),
+    chartSnapshot,
     preview: payloadRaw.slice(0, 1800),
     tags: input.tags ?? ['kundli', 'be1', endpoint],
     createdAt: now,
   };
 
-  await store.setDocument(`${COLLECTIONS.ragApiSources}/${sourceDocId}`, sourceDoc, false);
+  const existingProfile = await ragProfiles.getByOwnerAndProfileId(input.ownerId, input.profileId);
+  const profileDoc: RagProfileDocument = {
+    ownerId: input.ownerId,
+    profileId: input.profileId,
+    displayName: input.displayName,
+    place: input.place,
+    kundliSignature: makeKundliSignature(input.kundli),
+    chartVersion: payloadHash,
+    kundliInput: toKundliInputDocument(input.kundli),
+    latestSourceDocId: sourceDocId,
+    sourceCount: (existingProfile?.sourceCount ?? 0) + 1,
+    updatedAt: now,
+    createdAt: existingProfile?.createdAt ?? now,
+  };
+
+  // IMPORTANT: Upsert profile first so rag_api_sources FK (owner_id, profile_id) is always satisfied.
+  await ragProfiles.upsert(profileDoc);
+
+  await ragSources.upsert(sourceDocId, sourceDoc);
+
+  await upsertChartRow({
+    ownerId: input.ownerId,
+    profileId: input.profileId,
+    displayName: input.displayName,
+    place: input.place,
+    sourceDocId,
+    requestKey,
+    payloadHash,
+    chartSnapshot,
+    kundliInput: toKundliInputDocument(input.kundli),
+    tags: input.tags ?? ['kundli', 'be1', endpoint],
+  });
 
   const lines = flattenPayload(input.payload);
   const chunkTexts = chunkLines(lines, 900).slice(0, 200);
 
   const embeddingDim = env.EMBEDDING_DIM;
-  const writes = chunkTexts.map(async (chunkText, index) => {
+  const chunkRecords = chunkTexts.map((chunkText, index) => {
     const embedding = embedTextDeterministic(chunkText, embeddingDim);
     const chunkDoc: RagChunkDocument = {
       ownerId: input.ownerId,
@@ -197,29 +370,38 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
     };
 
     const chunkId = toDocId('chk', `${sourceDocId}:${index}`);
-    await store.setDocument(`${COLLECTIONS.ragChunks}/${chunkId}`, chunkDoc, false);
+    return {
+      id: chunkId,
+      data: chunkDoc,
+    };
   });
 
-  await Promise.all(writes);
+  await ragChunks.upsertMany(chunkRecords);
 
-  const profileDocPath = `${COLLECTIONS.ragProfiles}/${input.ownerId}__${input.profileId}`;
-  const existingProfile = await store.getDocument<RagProfileDocument>(profileDocPath);
-
-  const profileDoc: RagProfileDocument = {
-    ownerId: input.ownerId,
-    profileId: input.profileId,
-    displayName: input.displayName,
-    place: input.place,
-    kundliSignature: makeKundliSignature(input.kundli),
-    chartVersion: payloadHash,
-    kundliInput: toKundliInputDocument(input.kundli),
-    latestSourceDocId: sourceDocId,
-    sourceCount: (existingProfile?.data.sourceCount ?? 0) + 1,
-    updatedAt: now,
-    createdAt: existingProfile?.data.createdAt ?? now,
-  };
-
-  await store.setDocument(profileDocPath, profileDoc, true);
+  await pgVectorStore.upsertChunks(
+    chunkTexts.map((chunkText, index) => {
+      const embedding = embedTextDeterministic(chunkText, embeddingDim);
+      return {
+        data: {
+          ownerId: input.ownerId,
+          profileId: input.profileId,
+          kundaliId: input.profileId,
+          sourceDocId,
+          sourceType: 'be1' as const,
+          endpoint,
+          chunkIndex: index,
+          text: chunkText,
+          textPreview: chunkText.slice(0, 220),
+          embedding: embedding.vector,
+          embeddingModel: embedding.model,
+          embeddingDim: embedding.dimension,
+          tokenEstimate: estimateTokens(chunkText),
+          tags: input.tags ?? ['kundli', endpoint],
+          createdAt: now,
+        },
+      };
+    })
+  );
 
   return {
     profileId: input.profileId,
@@ -230,25 +412,29 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
 }
 
 export async function queryRagChunks(input: QueryInput): Promise<RagChunkResult[]> {
-  const store = getPostgresStore();
   const topK = Math.min(Math.max(input.topK ?? 8, 1), 20);
   const candidateWindow = Math.max(topK * 8, 40);
+  const queryEmbedding = embedTextDeterministic(input.message, env.EMBEDDING_DIM).vector;
 
-  const filters = [{ field: 'ownerId', op: 'EQUAL' as const, value: input.ownerId }];
-  if (input.profileId) {
-    filters.push({ field: 'profileId', op: 'EQUAL' as const, value: input.profileId });
+  if (env.PGVECTOR_ENABLED.trim().toLowerCase() === 'true') {
+    const vectorResults = (await pgVectorStore.searchChunks({
+      ownerId: input.ownerId,
+      kundaliId: input.profileId,
+      queryEmbedding,
+      topK,
+      candidateWindow,
+    })) as RagChunkResult[];
+
+    if (vectorResults.length > 0) {
+      return vectorResults;
+    }
   }
 
-  const candidates = await store.runQuery<RagChunkDocument>(COLLECTIONS.ragChunks, filters, {
-    orderBy: [{ field: 'createdAt', direction: 'DESCENDING' }],
-    limit: candidateWindow,
-  });
+  const candidates = await ragChunks.listForQuery(input.ownerId, input.profileId, candidateWindow);
 
   if (candidates.length === 0) {
     return [];
   }
-
-  const queryEmbedding = embedTextDeterministic(input.message, env.EMBEDDING_DIM).vector;
 
   const scored = candidates.map((candidate) => {
     const similarity = cosineSimilarity(queryEmbedding, candidate.data.embedding);
