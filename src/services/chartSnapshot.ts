@@ -2,6 +2,14 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+export type ChartSchemaVersion = 'mahadasha-first' | 'legacy-deep-dasha';
+
+export interface ChartSchemaInfo {
+  chartSchemaVersion: ChartSchemaVersion;
+  dashaDepth: number;
+  dashaPeriodKey?: string;
+}
+
 const NAKSHATRA_LORD_CYCLE = ['Ketu', 'Venus', 'Sun', 'Moon', 'Mars', 'Rahu', 'Jupiter', 'Saturn', 'Mercury'];
 
 const NAKSHATRA_NAME_TO_NUMBER: Record<string, number> = {
@@ -60,6 +68,15 @@ function getString(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function getByPath(value: unknown, path: string): unknown {
+  if (!isPlainObject(value)) return undefined;
+
+  return path.split('.').reduce<unknown>((current, segment) => {
+    if (!isPlainObject(current)) return undefined;
+    return current[segment];
+  }, value);
 }
 
 function normalizedLongitude(longitude: unknown): number | null {
@@ -132,6 +149,88 @@ function coerceDegreeFromLongitude(longitude: unknown): number | null {
   return degree >= 0 ? degree : degree + 30;
 }
 
+function measureDashaDepth(node: unknown): number {
+  if (!isPlainObject(node)) return 0;
+
+  const periods = node.periods;
+  if (!isPlainObject(periods)) return 0;
+
+  let deepestChild = 0;
+  for (const child of Object.values(periods)) {
+    const childDepth = measureDashaDepth(child);
+    if (childDepth > deepestChild) {
+      deepestChild = childDepth;
+    }
+  }
+
+  return deepestChild + 1;
+}
+
+function isDashaNode(node: unknown): node is Record<string, unknown> {
+  return isPlainObject(node)
+    && ('periods' in node || 'start' in node || 'end' in node || 'nesting' in node || 'type' in node || 'key' in node);
+}
+
+function stripNestedDashaPeriods(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripNestedDashaPeriods(item));
+  }
+
+  if (!isPlainObject(value)) {
+    return value;
+  }
+
+  const next: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === 'periods' && isPlainObject(entry)) {
+      next.periods = Object.fromEntries(
+        Object.entries(entry).map(([periodKey, periodValue]) => [periodKey, stripDashaBranch(periodValue)])
+      );
+      continue;
+    }
+
+    next[key] = stripNestedDashaPeriods(entry);
+  }
+
+  return next;
+}
+
+function stripDashaBranch(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripNestedDashaPeriods(item));
+  }
+
+  if (!isDashaNode(value)) {
+    return stripNestedDashaPeriods(value);
+  }
+
+  const next: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === 'periods') {
+      continue;
+    }
+
+    next[key] = stripNestedDashaPeriods(entry);
+  }
+
+  return next;
+}
+
+export function extractChartSchemaInfo(payload: unknown): ChartSchemaInfo {
+  const dasha = getByPath(payload, 'chart.dasha') ?? getByPath(payload, 'dasha');
+  const dashaDepth = Math.max(1, measureDashaDepth(dasha));
+  const periodKey = getString(getByPath(dasha, 'period_key'))
+    ?? getString(getByPath(dasha, 'periodKey'))
+    ?? getString(getByPath(dasha, 'key'))
+    ?? undefined;
+
+  return {
+    chartSchemaVersion: dashaDepth > 1 ? 'legacy-deep-dasha' : 'mahadasha-first',
+    dashaDepth,
+    dashaPeriodKey: periodKey,
+  };
+}
+
 function hydrateDegrees<T>(value: T, seen = new WeakMap<object, unknown>()): T {
   if (!isPlainObject(value) && !Array.isArray(value)) {
     return value;
@@ -191,5 +290,5 @@ function hydrateDegrees<T>(value: T, seen = new WeakMap<object, unknown>()): T {
 }
 
 export function buildChartSnapshot<T>(payload: T): T {
-  return hydrateDegrees(payload);
+  return stripNestedDashaPeriods(hydrateDegrees(payload)) as T;
 }

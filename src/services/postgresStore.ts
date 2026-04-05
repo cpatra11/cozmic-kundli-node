@@ -159,7 +159,17 @@ class PostgresStore {
       connectionString: withPostgresSslOverrides(databaseUrl),
       query_timeout: env.PG_QUERY_TIMEOUT_MS,
       connectionTimeoutMillis: env.PG_CONNECTION_TIMEOUT_MS,
+      idleTimeoutMillis: env.PG_IDLE_TIMEOUT_MS,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: env.PG_KEEPALIVE_INITIAL_DELAY_MS,
       ...buildPostgresSslConfig(),
+    });
+
+    this.pool.on('error', (error) => {
+      console.error('[postgres-store] idle client error (non-fatal)', {
+        message: error.message,
+        code: (error as NodeJS.ErrnoException).code,
+      });
     });
   }
 

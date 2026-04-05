@@ -126,6 +126,40 @@ export async function postBe1Json(path: string, body: Record<string, unknown>) {
   return response.json();
 }
 
+export interface CalculateChartOptions {
+  nesting?: number;
+  periodKey?: string;
+  infolevel?: string;
+  varga?: string;
+  ayanamsha?: string;
+  nodeType?: 'mean' | 'true';
+  dstHour?: number;
+  dstMin?: number;
+}
+
+export async function fetchCalculatedChart(input: KundliSnapshotInput, options: CalculateChartOptions = {}) {
+  return fetchBe1Json('calculate', {
+    latitude: input.latitude,
+    longitude: input.longitude,
+    year: input.year,
+    month: input.month,
+    day: input.day,
+    hour: input.hour,
+    min: input.min,
+    sec: input.sec ?? 0,
+    time_zone: input.time_zone,
+    dst_hour: options.dstHour ?? 0,
+    dst_min: options.dstMin ?? 0,
+    nesting: options.nesting ?? 1,
+    ...(options.periodKey ? { period_key: options.periodKey } : {}),
+    infolevel:
+      options.infolevel ?? 'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
+    varga: options.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
+    ...(options.ayanamsha ? { ayanamsha: options.ayanamsha } : {}),
+    ...(options.nodeType ? { node_type: options.nodeType } : {}),
+  });
+}
+
 export async function fetchKundliSnapshot(input: KundliSnapshotInput) {
   return fetchBe1Json('calculate', {
     latitude: input.latitude,

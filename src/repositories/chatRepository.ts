@@ -343,6 +343,17 @@ export class ChatRepository {
 
     return response.rows.map(mapMessageRow);
   }
+
+  async deleteSessionsByOwnerKundali(ownerId: string, kundaliId: string): Promise<void> {
+    const pool = await this.withPool();
+    await pool.query(
+      `
+      DELETE FROM chat_sessions
+      WHERE owner_id = $1 AND kundali_id = $2
+      `,
+      [ownerId, kundaliId]
+    );
+  }
 }
 
 let singletonChatRepository: ChatRepository | null = null;

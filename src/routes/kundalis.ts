@@ -5,7 +5,9 @@ import { type RagProfileDocument } from '../models/firestoreModels.js';
 import { getRagChunksRepository } from '../repositories/ragChunksRepository.js';
 import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
 import { getRagSourcesRepository } from '../repositories/ragSourcesRepository.js';
+import { getChatRepository } from '../repositories/chatRepository.js';
 import { buildChartSnapshot } from '../services/chartSnapshot.js';
+import { fetchCalculatedChart } from '../services/be1Client.js';
 import { getPostgresPool } from '../services/postgresClient.js';
 import { applyPendingMigrations } from '../services/postgresMigrations.js';
 import { cacheDelete, cacheGetJson, cacheSetJson } from '../services/valkeyCache.js';
@@ -60,6 +62,12 @@ function buildKundaliSummary(doc: RagProfileDocument) {
   };
 }
 
+function parseNestingParam(value: unknown, fallback = 5): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(5, Math.floor(parsed)));
+}
+
 router.get('/v1/kundalis', requireFirebaseAuth, async (req, res) => {
   try {
     const rows = await ragProfiles.listByOwner(req.user!.uid, 100);
@@ -111,7 +119,7 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
 
     const sourceDoc = await ragSources.getById(profileDoc.latestSourceDocId);
 
-    const rawPayload = sourceDoc?.data.rawPayload;
+    const rawPayload = buildChartSnapshot(sourceDoc?.data.rawPayload);
     const baseSnapshot = sourceDoc?.data.chartSnapshot ?? rawPayload;
     const chartData = buildChartSnapshot(baseSnapshot);
 
@@ -125,6 +133,9 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
         place: profileDoc.place,
         chartData,
         rawPayload,
+        chartSchemaVersion: sourceDoc?.data.chartSchemaVersion,
+        dashaDepth: sourceDoc?.data.dashaDepth,
+        dashaPeriodKey: sourceDoc?.data.dashaPeriodKey,
         createdAt: profileDoc.createdAt,
         updatedAt: profileDoc.updatedAt,
         kundliInput: profileDoc.kundliInput,
@@ -158,6 +169,54 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
     return res.json(responseBody);
   } catch (error) {
     return res.status(500).json({ error: 'Failed to load kundali', details: String(error) });
+  }
+});
+
+router.get('/v1/kundalis/:kundaliId/dasha', requireFirebaseAuth, async (req, res) => {
+  try {
+    const identifier = String(req.params.kundaliId ?? '').trim();
+    if (!identifier) {
+      return res.status(400).json({ error: 'Missing kundaliId path parameter' });
+    }
+
+    const ownerId = req.user!.uid;
+    const profileId = extractProfileId(identifier, ownerId);
+    const profileDoc = await ragProfiles.getByOwnerAndProfileId(ownerId, profileId);
+    if (!profileDoc) {
+      return res.status(404).json({ error: 'Kundali not found' });
+    }
+
+    const nesting = parseNestingParam((req.query as Record<string, unknown>)?.nesting, 5);
+    const rawPeriodKey = String((req.query as Record<string, unknown>)?.periodKey ?? '').trim();
+    const periodKey = rawPeriodKey ? rawPeriodKey.slice(0, 4) : undefined;
+
+    const input = profileDoc.kundliInput;
+    if (!input) {
+      return res.status(422).json({ error: 'Kundli input snapshot unavailable for this profile' });
+    }
+
+    const calculated = await fetchCalculatedChart(input, {
+      nesting,
+      ...(periodKey ? { periodKey } : {}),
+    });
+    // IMPORTANT: Do NOT run on-demand dasha through buildChartSnapshot here.
+    // Snapshot normalization intentionally strips nested dasha periods for storage,
+    // but this endpoint must return deep periods for frontend drill-down.
+    const dasha = (calculated as any)?.chart?.dasha;
+
+    if (!dasha || typeof dasha !== 'object') {
+      return res.status(502).json({ error: 'Dasha payload missing from calculated chart response' });
+    }
+
+    return res.json({
+      kundaliId: profileDoc.profileId,
+      dasha,
+      dashaDepth: nesting,
+      dashaPeriodKey: periodKey ?? null,
+      source: 'on-demand',
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load dasha on demand', details: String(error) });
   }
 });
 
@@ -216,10 +275,13 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
       return res.status(404).json({ error: 'Kundali not found' });
     }
 
+    const chatRepository = getChatRepository();
+
     await Promise.all([
       ragChunks.deleteByOwnerProfile(req.user!.uid, profileDoc.profileId),
       ragSources.deleteByOwnerProfile(req.user!.uid, profileDoc.profileId),
       ragProfiles.deleteByOwnerAndProfileId(req.user!.uid, profileDoc.profileId),
+      chatRepository.deleteSessionsByOwnerKundali(req.user!.uid, profileDoc.profileId),
     ]);
 
     const pool = getPostgresPool();

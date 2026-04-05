@@ -7,6 +7,8 @@ export const COLLECTIONS = {
   chartJobs: 'chart_jobs',
 } as const;
 
+export type ChartSchemaVersion = 'mahadasha-first' | 'legacy-deep-dasha';
+
 export interface AuthUserDocument {
   ownerId: string;
   email?: string;
@@ -64,6 +66,9 @@ export interface RagApiSourceDocument {
   endpoint: string;
   requestKey: string;
   payloadHash: string;
+  chartSchemaVersion: ChartSchemaVersion;
+  dashaDepth: number;
+  dashaPeriodKey?: string;
   rawPayload: unknown;
   chartSnapshot?: unknown;
   preview: string;

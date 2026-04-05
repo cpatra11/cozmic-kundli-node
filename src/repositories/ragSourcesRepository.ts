@@ -12,6 +12,9 @@ interface RagApiSourceRow {
   endpoint: string;
   request_key: string;
   payload_hash: string;
+  chart_schema_version: 'mahadasha-first' | 'legacy-deep-dasha';
+  dasha_depth: number;
+  dasha_period_key: string | null;
   raw_payload: unknown;
   chart_snapshot: unknown;
   preview: string;
@@ -29,6 +32,9 @@ function rowToDocument(row: RagApiSourceRow): RagApiSourceDocument {
     endpoint: row.endpoint,
     requestKey: row.request_key,
     payloadHash: row.payload_hash,
+    chartSchemaVersion: row.chart_schema_version,
+    dashaDepth: Number(row.dasha_depth),
+    dashaPeriodKey: row.dasha_period_key ?? undefined,
     rawPayload: row.raw_payload,
     chartSnapshot: row.chart_snapshot ?? undefined,
     preview: row.preview,
@@ -57,7 +63,7 @@ export class RagSourcesRepository {
     const pool = await this.withPool();
     const response = await pool.query<RagApiSourceRow>(
       `
-      SELECT id, owner_id, profile_id, display_name, place, source_type, endpoint, request_key, payload_hash, raw_payload, chart_snapshot, preview, tags, created_at
+      SELECT id, owner_id, profile_id, display_name, place, source_type, endpoint, request_key, payload_hash, chart_schema_version, dasha_depth, dasha_period_key, raw_payload, chart_snapshot, preview, tags, created_at
       FROM rag_api_sources
       WHERE id = $1
       LIMIT 1
@@ -73,7 +79,7 @@ export class RagSourcesRepository {
     const pool = await this.withPool();
     const response = await pool.query<RagApiSourceRow>(
       `
-      SELECT id, owner_id, profile_id, display_name, place, source_type, endpoint, request_key, payload_hash, raw_payload, chart_snapshot, preview, tags, created_at
+      SELECT id, owner_id, profile_id, display_name, place, source_type, endpoint, request_key, payload_hash, chart_schema_version, dasha_depth, dasha_period_key, raw_payload, chart_snapshot, preview, tags, created_at
       FROM rag_api_sources
       WHERE owner_id = $1 AND profile_id = $2
       ORDER BY created_at DESC
@@ -98,13 +104,16 @@ export class RagSourcesRepository {
         endpoint,
         request_key,
         payload_hash,
+        chart_schema_version,
+        dasha_depth,
+        dasha_period_key,
         raw_payload,
         chart_snapshot,
         preview,
         tags,
         created_at
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13::jsonb, $14
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16::jsonb, $17
       )
       ON CONFLICT (id)
       DO UPDATE SET
@@ -116,6 +125,9 @@ export class RagSourcesRepository {
         endpoint = EXCLUDED.endpoint,
         request_key = EXCLUDED.request_key,
         payload_hash = EXCLUDED.payload_hash,
+        chart_schema_version = EXCLUDED.chart_schema_version,
+        dasha_depth = EXCLUDED.dasha_depth,
+        dasha_period_key = EXCLUDED.dasha_period_key,
         raw_payload = EXCLUDED.raw_payload,
         chart_snapshot = EXCLUDED.chart_snapshot,
         preview = EXCLUDED.preview,
@@ -132,6 +144,9 @@ export class RagSourcesRepository {
         source.endpoint,
         source.requestKey,
         source.payloadHash,
+        source.chartSchemaVersion,
+        source.dashaDepth,
+        source.dashaPeriodKey ?? null,
         JSON.stringify(source.rawPayload),
         source.chartSnapshot ? JSON.stringify(source.chartSnapshot) : null,
         source.preview,

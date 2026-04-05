@@ -92,6 +92,7 @@ export async function resetAndReapplyMigrations(pool: Pool): Promise<void> {
   try {
     await client.query('BEGIN');
     await client.query(`DROP TABLE IF EXISTS chart_jobs CASCADE;`);
+    await client.query(`DROP TABLE IF EXISTS monthly_usage_counters CASCADE;`);
     await client.query(`DROP TABLE IF EXISTS rag_chunks CASCADE;`);
     await client.query(`DROP TABLE IF EXISTS rag_api_sources CASCADE;`);
     await client.query(`DROP TABLE IF EXISTS rag_profiles CASCADE;`);

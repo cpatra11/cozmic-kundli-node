@@ -1,12 +1,16 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { env } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { fetchBe1Json, fetchTransitChart } from '../services/be1Client.js';
+import { fetchCalculatedChart, fetchTransitChart } from '../services/be1Client.js';
 import { ingestChartPayloadForProfile, ingestKundliForProfile, queryRagChunks } from '../services/ragPipeline.js';
 import { stableHash } from '../services/hash.js';
-import { buildChartSnapshot } from '../services/chartSnapshot.js';
+import { buildChartSnapshot, extractChartSchemaInfo } from '../services/chartSnapshot.js';
 import { type ChartJobDocument } from '../models/firestoreModels.js';
 import { getChartJobsRepository } from '../repositories/chartJobsRepository.js';
+import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
+import { getUsageQuotasRepository, type QuotaStatusSnapshot } from '../repositories/usageQuotasRepository.js';
+import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
 
 const router = Router();
 
@@ -51,6 +55,7 @@ const GenerateChartSchema = z.object({
   dst_hour: z.number().optional(),
   dst_min: z.number().optional(),
   nesting: z.number().int().min(1).max(6).optional(),
+  periodKey: z.string().min(1).max(24).optional(),
   infolevel: z.string().optional(),
   varga: z.string().optional(),
   ayanamsha: z.string().optional(),
@@ -103,37 +108,38 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
       })
     ).slice(0, 12)}`;
 
-  const query: Record<string, number | string> = {
-    latitude: parsedData.latitude,
-    longitude: parsedData.longitude,
-    year: parsedData.year,
-    month: parsedData.month,
-    day: parsedData.day,
-    hour: parsedData.hour,
-    min: parsedData.min,
-    sec: parsedData.sec ?? 0,
-    time_zone: parsedData.time_zone,
-    dst_hour: parsedData.dst_hour ?? 0,
-    dst_min: parsedData.dst_min ?? 0,
-    nesting: parsedData.nesting ?? 5,
-    infolevel:
-      parsedData.infolevel ??
-      'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
-    varga: parsedData.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
-  };
-
-  if (parsedData.ayanamsha) {
-    query.ayanamsha = parsedData.ayanamsha;
-  }
-
   let chartData: unknown;
   try {
-    chartData = await fetchBe1Json('calculate', query);
+    chartData = await fetchCalculatedChart(
+      {
+        latitude: parsedData.latitude,
+        longitude: parsedData.longitude,
+        year: parsedData.year,
+        month: parsedData.month,
+        day: parsedData.day,
+        hour: parsedData.hour,
+        min: parsedData.min,
+        sec: parsedData.sec ?? 0,
+        time_zone: parsedData.time_zone,
+      },
+      {
+        nesting: parsedData.nesting ?? 1,
+        periodKey: parsedData.periodKey,
+        infolevel:
+          parsedData.infolevel ??
+          'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
+        varga: parsedData.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
+        ayanamsha: parsedData.ayanamsha,
+        dstHour: parsedData.dst_hour ?? 0,
+        dstMin: parsedData.dst_min ?? 0,
+      }
+    );
   } catch (error) {
     throw new Error(`Failed to fetch chart payload from BE1: ${String(error)}`);
   }
 
   const chartSnapshot = buildChartSnapshot(chartData);
+  const chartSchema = extractChartSchemaInfo(chartData);
 
   let ingestion;
   let ingestionError: string | undefined;
@@ -171,6 +177,9 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
     profileId,
     kundaliId: profileId,
     chartData: chartSnapshot,
+    chartSchemaVersion: chartSchema.chartSchemaVersion,
+    dashaDepth: chartSchema.dashaDepth,
+    dashaPeriodKey: chartSchema.dashaPeriodKey,
     ingestion: ingestion ?? null,
     ingestionStatus: ingestion ? 'ready' : 'degraded',
     ingestionError,
@@ -237,6 +246,27 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
     }
 
+    let quotaStatus: QuotaStatusSnapshot | undefined;
+    if (env.QUOTA_ENFORCEMENT_ENABLED) {
+      const subscriptions = getSubscriptionsRepository();
+      const usageQuotas = getUsageQuotasRepository();
+      const subscription = await subscriptions.getByOwnerId(req.user!.uid);
+      const hasPro = hasActiveProEntitlement(subscription);
+
+      const consumed = await usageQuotas.consumeQuota(req.user!.uid, hasPro, 'kundli_generate');
+      if (!consumed.allowed) {
+        return res.status(429).json({
+          error: 'Monthly quota exceeded',
+          details: 'Kundli generation monthly quota exceeded. Please wait for reset or upgrade your plan.',
+          code: 'MONTHLY_QUOTA_EXCEEDED',
+          quotaType: 'kundli_generate',
+          quotaStatus: consumed.status,
+        });
+      }
+
+      quotaStatus = consumed.status;
+    }
+
     const runAsync = shouldRunAsync((req.query as Record<string, unknown>)?.async ?? (req.body as Record<string, unknown>)?.async);
 
     if (runAsync) {
@@ -280,6 +310,7 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
         async: true,
         jobId,
         status: 'queued',
+        quotaStatus,
       });
     }
 
@@ -288,6 +319,7 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
     return res.status(201).json({
       ok: true,
       ...result,
+      quotaStatus,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to generate and ingest chart', details: String(error) });

@@ -11,7 +11,11 @@
     "db:migrate": "tsx scripts/migrate-db.ts",
     "db:reset:push": "tsx scripts/reset-db.ts",
     "test:integration:typed": "tsx scripts/integration-typed-persistence.ts",
-    "test:agent:decision-smoke": "tsx scripts/agent-decision-smoke.ts"
+    "test:agent:decision-smoke": "tsx scripts/agent-decision-smoke.ts",
+    "test:family:regression": "tsx scripts/family-regression.ts",
+    "test:dasha:regression": "tsx scripts/dasha-regression.ts",
+    "test:transit:regression": "tsx scripts/transit-regression.ts",
+    "test:regression": "npm run test:agent:decision-smoke && npm run test:family:regression && npm run test:dasha:regression && npm run test:transit:regression"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.1018.0",

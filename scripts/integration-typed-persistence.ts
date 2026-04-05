@@ -11,6 +11,7 @@ import { queryRagChunks } from '../src/services/ragPipeline.js';
 import { runKundliAgent } from '../src/services/kundliAgent.js';
 import { getPostgresPool } from '../src/services/postgresClient.js';
 import { applyPendingMigrations } from '../src/services/postgresMigrations.js';
+import { extractChartSchemaInfo } from '../src/services/chartSnapshot.js';
 
 dotenv.config();
 
@@ -65,6 +66,7 @@ async function cleanupOwner(ownerId: string): Promise<void> {
   await applyPendingMigrations(pool);
 
   await pool.query(`DELETE FROM chart_jobs WHERE owner_id = $1`, [ownerId]);
+  await pool.query(`DELETE FROM monthly_usage_counters WHERE owner_id = $1`, [ownerId]);
   await pool.query(`DELETE FROM chat_messages WHERE owner_id = $1`, [ownerId]);
   await pool.query(`DELETE FROM chat_sessions WHERE owner_id = $1`, [ownerId]);
   await pool.query(`DELETE FROM rag_chunks WHERE owner_id = $1`, [ownerId]);
@@ -154,12 +156,21 @@ async function main() {
       endpoint: 'calculate',
       requestKey: `req_${randomUUID().slice(0, 12)}`,
       payloadHash: `hash_${randomUUID().slice(0, 12)}`,
+      chartSchemaVersion: extractChartSchemaInfo(sampleRawPayload()).chartSchemaVersion,
+      dashaDepth: extractChartSchemaInfo(sampleRawPayload()).dashaDepth,
+      dashaPeriodKey: extractChartSchemaInfo(sampleRawPayload()).dashaPeriodKey,
       rawPayload: sampleRawPayload(),
       chartSnapshot: sampleRawPayload(),
       preview: 'integration preview',
       tags: ['integration', 'typed'],
       createdAt: now,
     });
+
+    const storedSource = await ragSources.getById(sourceDocId);
+    assert.ok(storedSource, 'Expected saved source document to be readable');
+    assert.equal(storedSource?.data.chartSchemaVersion, 'mahadasha-first', 'Saved source should default to mahadasha-first schema');
+    assert.equal(storedSource?.data.dashaDepth, 1, 'Saved source should record shallow dasha depth');
+    assert.equal(storedSource?.data.dashaPeriodKey, undefined, 'Saved source should not invent a dasha period key');
 
     await ragChunks.upsertMany([
       {

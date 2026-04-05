@@ -27,8 +27,20 @@ const EnvSchema = z.object({
   BE1_CIRCUIT_COOLDOWN_MS: z.coerce.number().default(30000),
   PG_QUERY_TIMEOUT_MS: z.coerce.number().default(30000),
   PG_CONNECTION_TIMEOUT_MS: z.coerce.number().default(5000),
+  PG_IDLE_TIMEOUT_MS: z.coerce.number().default(30000),
+  PG_KEEPALIVE_INITIAL_DELAY_MS: z.coerce.number().default(10000),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().default(60000),
   RATE_LIMIT_EXPENSIVE_MAX: z.coerce.number().default(20),
+  QUOTA_ENFORCEMENT_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  PRO_MONTHLY_MINI_REQUESTS: z.coerce.number().default(50),
+  PRO_MONTHLY_PRO_REQUESTS: z.coerce.number().default(50),
+  PRO_MONTHLY_KUNDLI_GENERATIONS: z.coerce.number().default(10),
+  NONPRO_MONTHLY_MINI_REQUESTS: z.coerce.number().default(10),
+  NONPRO_MONTHLY_PRO_REQUESTS: z.coerce.number().default(1),
+  NONPRO_MONTHLY_KUNDLI_GENERATIONS: z.coerce.number().default(1),
   GOOGLE_CLOUD_PROJECT: z.string().optional(),
   GOOGLE_CLOUD_LOCATION: z.string().default('us-central1'),
   GOOGLE_GENAI_MODEL: z.string().default('gemini-2.0-flash'),
@@ -97,6 +109,8 @@ const EnvSchema = z.object({
     .optional()
     .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
   VALKEY_COOLDOWN_MS: z.coerce.number().default(60_000),
+  AGENT_CACHE_TTL_SECONDS: z.coerce.number().default(300),
+  TIMING_CACHE_TTL_SECONDS: z.coerce.number().default(21_600),
   BEDROCK_DEEPSEEK_PLANNER_MODEL_ID: z.string().optional(),
   BEDROCK_DEEPSEEK_COMPOSER_MODEL_ID: z.string().optional(),
   EMBEDDING_DIM: z.coerce.number().default(192),

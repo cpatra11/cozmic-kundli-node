@@ -2,12 +2,14 @@ import { Router, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { runKundliAgent, shouldBypassChartPipeline } from '../services/kundliAgent.js';
+import { runKundliAgent } from '../services/kundliAgent.js';
 import { env } from '../config/env.js';
 import { buildChatMessageEmbedding, queryRelevantSessionMemories } from '../services/chatMemory.js';
 import { getChatRepository } from '../repositories/chatRepository.js';
 import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
+import { getUsageQuotasRepository, type QuotaStatusSnapshot } from '../repositories/usageQuotasRepository.js';
+import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
 
 const CreateSessionSchema = z.object({
   title: z.string().min(1).max(120).optional(),
@@ -67,19 +69,86 @@ interface ChatMessageDoc {
   createdAt: number;
 }
 
-async function ownerHasProEntitlement(ownerId: string): Promise<boolean> {
+interface ChatAccessDecision {
+  allowed: boolean;
+  hasPro: boolean;
+  quotaStatus?: QuotaStatusSnapshot;
+  statusCode?: number;
+  payload?: Record<string, unknown>;
+}
+
+function isObviousFastMessage(message: string): boolean {
+  const q = message.trim().toLowerCase();
+  return /^(h+i+|hello|hey|namaste|good\s+(morning|afternoon|evening)|thanks|thank\s+you|ok(?:ay)?|cool|bye|goodbye)\b/.test(q);
+}
+
+async function evaluateChatAccess(ownerId: string, mode: 'mini' | 'pro'): Promise<ChatAccessDecision> {
   const subscriptionsRepository = getSubscriptionsRepository();
+  const usageQuotasRepository = getUsageQuotasRepository();
   const subscription = await subscriptionsRepository.getByOwnerId(ownerId);
-  if (!subscription) return false;
+  const hasPro = hasActiveProEntitlement(subscription);
 
-  if (!subscription.isPro) return false;
+  if (!env.QUOTA_ENFORCEMENT_ENABLED) {
+    if (mode === 'pro' && !hasPro) {
+      return {
+        allowed: false,
+        hasPro,
+        statusCode: 402,
+        payload: {
+          error: 'Pro subscription required',
+          details: 'Pro mode requires an active subscription. Please purchase or restore your plan.',
+          code: 'PRO_SUBSCRIPTION_REQUIRED',
+        },
+      };
+    }
 
-  if (typeof subscription.expiresAtMs === 'number' && subscription.expiresAtMs <= Date.now()) {
-    return false;
+    return {
+      allowed: true,
+      hasPro,
+    };
   }
 
-  const expectedEntitlement = env.REVENUECAT_PRO_ENTITLEMENT_ID;
-  return subscription.entitlementId === expectedEntitlement || subscription.entitlementId === 'pro';
+  const quotaType = mode === 'pro' ? 'pro_chat' : 'mini_chat';
+  const consumed = await usageQuotasRepository.consumeQuota(ownerId, hasPro, quotaType);
+
+  if (consumed.allowed) {
+    return {
+      allowed: true,
+      hasPro,
+      quotaStatus: consumed.status,
+    };
+  }
+
+  if (mode === 'pro' && !hasPro) {
+    return {
+      allowed: false,
+      hasPro,
+      quotaStatus: consumed.status,
+      statusCode: 402,
+      payload: {
+        error: 'Pro subscription required',
+        details:
+          'Your monthly free Pro trial request is already used. Upgrade to Pro for more Pro-mode requests.',
+        code: 'PRO_SUBSCRIPTION_REQUIRED',
+        quotaStatus: consumed.status,
+      },
+    };
+  }
+
+  const modeLabel = mode === 'pro' ? 'Pro chat' : 'Mini chat';
+  return {
+    allowed: false,
+    hasPro,
+    quotaStatus: consumed.status,
+    statusCode: 429,
+    payload: {
+      error: 'Monthly quota exceeded',
+      details: `${modeLabel} monthly quota exceeded. Please wait for reset or switch plans.`,
+      code: 'MONTHLY_QUOTA_EXCEEDED',
+      quotaType,
+      quotaStatus: consumed.status,
+    },
+  };
 }
 
 function writeSseEvent(res: Response, event: string, payload: unknown): void {
@@ -174,31 +243,28 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
   try {
     const parsed = SendMessageSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      writeSseEvent(res, 'error', { error: 'Invalid body', details: parsed.error.flatten() });
+      writeSseEvent(res, 'error', {
+        error: 'Invalid body',
+        details: parsed.error.flatten(),
+        status: 400,
+      });
       res.end();
       return;
     }
 
+    const requestedMode = parsed.data.mode ?? 'mini';
+
     const chatRepository = getChatRepository();
     const ragProfilesRepository = getRagProfilesRepository();
-    if ((parsed.data.mode ?? 'mini') === 'pro') {
-      const hasPro = await ownerHasProEntitlement(req.user!.uid);
-      if (!hasPro) {
-        writeSseEvent(res, 'error', {
-          error: 'Pro subscription required',
-          details: 'Pro mode requires an active subscription. Please purchase or restore your plan.',
-          code: 'PRO_SUBSCRIPTION_REQUIRED',
-        });
-        res.end();
-        return;
-      }
-    }
 
     const sessionIdParam = req.params.sessionId;
     const sessionId = Array.isArray(sessionIdParam) ? sessionIdParam[0] : sessionIdParam;
 
     if (!sessionId) {
-      writeSseEvent(res, 'error', { error: 'Missing sessionId path parameter' });
+      writeSseEvent(res, 'error', {
+        error: 'Missing sessionId path parameter',
+        status: 400,
+      });
       res.end();
       return;
     }
@@ -206,20 +272,37 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
     const session = await chatRepository.getSessionById(sessionId);
 
     if (!session) {
-      writeSseEvent(res, 'error', { error: 'Session not found' });
+      writeSseEvent(res, 'error', {
+        error: 'Session not found',
+        status: 404,
+      });
       res.end();
       return;
     }
 
     if (session.ownerId !== req.user!.uid) {
-      writeSseEvent(res, 'error', { error: 'Forbidden' });
+      writeSseEvent(res, 'error', {
+        error: 'Forbidden',
+        status: 403,
+      });
+      res.end();
+      return;
+    }
+
+    const accessDecision = await evaluateChatAccess(req.user!.uid, requestedMode);
+    if (!accessDecision.allowed) {
+      writeSseEvent(res, 'error', {
+        ...(accessDecision.payload ?? { error: 'Chat access denied' }),
+        status: accessDecision.statusCode ?? 403,
+      });
       res.end();
       return;
     }
 
     let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.kundaliId;
+    const fastMessage = isObviousFastMessage(parsed.data.message);
 
-    if (!effectiveProfileId) {
+    if (!effectiveProfileId && !fastMessage) {
       const latestProfiles = await ragProfilesRepository.listByOwner(req.user!.uid, 1);
       effectiveProfileId = latestProfiles[0]?.profileId;
     }
@@ -227,35 +310,22 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
     const now = Date.now();
     const requestId = parsed.data.requestId ?? randomUUID();
 
-    const relevantMemories = await queryRelevantSessionMemories({
-      ownerId: req.user!.uid,
-      sessionId,
-      message: parsed.data.message,
-      excludeRequestId: requestId,
-      topK: 6,
-    });
-
-    const bypassChartPipeline = await shouldBypassChartPipeline(
-      parsed.data.message,
-      parsed.data.mode ?? 'mini',
-      relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`)
-    );
-
-    if (!effectiveProfileId && !bypassChartPipeline) {
-      writeSseEvent(res, 'error', {
-        error: 'Missing canonical chart identity',
-        details: 'Open or save a Kundli first so chat can load canonical payload.',
-      });
-      res.end();
-      return;
-    }
+    const relevantMemories = fastMessage
+      ? []
+      : await queryRelevantSessionMemories({
+          ownerId: req.user!.uid,
+          sessionId,
+          message: parsed.data.message,
+          excludeRequestId: requestId,
+          topK: 6,
+        });
 
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
       sessionId,
       role: 'user',
       message: parsed.data.message,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       requestId,
       kundaliId: effectiveProfileId,
       createdAt: now,
@@ -267,14 +337,15 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
     writeSseEvent(res, 'ack', {
       requestId,
       sessionId,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       kundaliId: effectiveProfileId,
+      quotaStatus: accessDecision.quotaStatus,
     });
 
     const agent = await runKundliAgent({
       ownerId: req.user!.uid,
       message: parsed.data.message,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
       clientTimestamp: parsed.data.clientTimestamp,
@@ -291,7 +362,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       sessionId,
       role: 'assistant',
       message: agent.answer,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       model: agent.model,
       requestId,
       kundaliId: effectiveProfileId,
@@ -314,7 +385,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
     writeSseEvent(res, 'done', {
       answer: agent.answer,
       model: agent.model,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       executionPlan: agent.executionPlan,
       analysisStages: agent.analysisStages,
       decisionTelemetry: agent.decisionTelemetry,
@@ -324,11 +395,22 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       kundaliId: effectiveProfileId,
       chartVersion: agent.grounding?.chartVersion,
       requestId,
+      quotaStatus: accessDecision.quotaStatus,
     });
 
     res.end();
   } catch (error) {
-    writeSseEvent(res, 'error', { error: 'Failed to process streamed message', details: String(error) });
+    const maybeError = error as { status?: unknown; code?: unknown; message?: unknown };
+    const status = typeof maybeError.status === 'number' && Number.isFinite(maybeError.status)
+      ? maybeError.status
+      : 500;
+
+    writeSseEvent(res, 'error', {
+      error: 'Failed to process streamed message',
+      details: String(error),
+      status,
+      ...(typeof maybeError.code === 'string' ? { code: maybeError.code } : {}),
+    });
     res.end();
   }
 });
@@ -340,19 +422,10 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
     }
 
+    const requestedMode = parsed.data.mode ?? 'mini';
+
     const chatRepository = getChatRepository();
     const ragProfilesRepository = getRagProfilesRepository();
-
-    if ((parsed.data.mode ?? 'mini') === 'pro') {
-      const hasPro = await ownerHasProEntitlement(req.user!.uid);
-      if (!hasPro) {
-        return res.status(402).json({
-          error: 'Pro subscription required',
-          details: 'Pro mode requires an active subscription. Please purchase or restore your plan.',
-          code: 'PRO_SUBSCRIPTION_REQUIRED',
-        });
-      }
-    }
 
     const sessionIdParam = req.params.sessionId;
     const sessionId = Array.isArray(sessionIdParam) ? sessionIdParam[0] : sessionIdParam;
@@ -371,9 +444,15 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.kundaliId;
+    const accessDecision = await evaluateChatAccess(req.user!.uid, requestedMode);
+    if (!accessDecision.allowed) {
+      return res.status(accessDecision.statusCode ?? 403).json(accessDecision.payload ?? { error: 'Chat access denied' });
+    }
 
-    if (!effectiveProfileId) {
+    let effectiveProfileId = parsed.data.profileId ?? parsed.data.kundaliId ?? session.kundaliId;
+    const fastMessage = isObviousFastMessage(parsed.data.message);
+
+    if (!effectiveProfileId && !fastMessage) {
       const latestProfiles = await ragProfilesRepository.listByOwner(req.user!.uid, 1);
       effectiveProfileId = latestProfiles[0]?.profileId;
     }
@@ -381,34 +460,22 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
     const now = Date.now();
     const requestId = parsed.data.requestId ?? randomUUID();
 
-    const relevantMemories = await queryRelevantSessionMemories({
-      ownerId: req.user!.uid,
-      sessionId,
-      message: parsed.data.message,
-      excludeRequestId: requestId,
-      topK: 6,
-    });
-
-    const bypassChartPipeline = await shouldBypassChartPipeline(
-      parsed.data.message,
-      parsed.data.mode ?? 'mini',
-      relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`)
-    );
-
-    if (!effectiveProfileId && !bypassChartPipeline) {
-      return res.status(400).json({
-        error: 'Missing canonical chart identity',
-        details:
-          'Open or save a Kundli first so chat can load the canonical raw payload from Postgres. If none exists yet, generate a chart via /v1/chart/generate first.',
-      });
-    }
+    const relevantMemories = fastMessage
+      ? []
+      : await queryRelevantSessionMemories({
+          ownerId: req.user!.uid,
+          sessionId,
+          message: parsed.data.message,
+          excludeRequestId: requestId,
+          topK: 6,
+        });
 
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
       sessionId,
       role: 'user',
       message: parsed.data.message,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       requestId,
       kundaliId: effectiveProfileId,
       createdAt: now,
@@ -420,7 +487,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
     const agent = await runKundliAgent({
       ownerId: req.user!.uid,
       message: parsed.data.message,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
       clientTimestamp: parsed.data.clientTimestamp,
@@ -432,7 +499,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       sessionId,
       role: 'assistant',
       message: agent.answer,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       model: agent.model,
       requestId,
       kundaliId: effectiveProfileId,
@@ -455,7 +522,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
     return res.json({
       answer: agent.answer,
       model: agent.model,
-      mode: parsed.data.mode ?? 'mini',
+      mode: requestedMode,
       executionPlan: agent.executionPlan,
       analysisStages: agent.analysisStages,
       decisionTelemetry: agent.decisionTelemetry,
@@ -465,6 +532,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       kundaliId: effectiveProfileId,
       chartVersion: agent.grounding?.chartVersion,
       requestId,
+      quotaStatus: accessDecision.quotaStatus,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to process message', details: String(error) });

@@ -7,7 +7,7 @@ import { fetchKundliSnapshot, type KundliSnapshotInput } from './be1Client.js';
 import { cosineSimilarity, embedTextDeterministic } from './embeddings.js';
 import { getPostgresPool } from './postgresClient.js';
 import { stableHash, toDocId } from './hash.js';
-import { buildChartSnapshot } from './chartSnapshot.js';
+import { buildChartSnapshot, extractChartSchemaInfo, type ChartSchemaInfo } from './chartSnapshot.js';
 import { PostgresVectorStore } from './vector/postgresVectorStore.js';
 
 interface IngestInput {
@@ -157,6 +157,7 @@ async function upsertChartRow(input: {
   requestKey: string;
   payloadHash: string;
   chartSnapshot: unknown;
+  chartSchema: ChartSchemaInfo;
   kundliInput: RagProfileDocument['kundliInput'];
   tags: string[];
 }): Promise<void> {
@@ -187,6 +188,9 @@ async function upsertChartRow(input: {
         tags,
         panchanga,
         chart_data,
+        chart_schema_version,
+        dasha_depth,
+        dasha_period_key,
         raw_payload_ref,
         chart_signature,
         chart_datetime,
@@ -221,6 +225,9 @@ async function upsertChartRow(input: {
         $18,
         $19,
         $20,
+        $21,
+        $22,
+        $23,
         NULL
       )
       ON CONFLICT (owner_id, kundali_id)
@@ -233,6 +240,9 @@ async function upsertChartRow(input: {
         tags = EXCLUDED.tags,
         panchanga = EXCLUDED.panchanga,
         chart_data = EXCLUDED.chart_data,
+        chart_schema_version = EXCLUDED.chart_schema_version,
+        dasha_depth = EXCLUDED.dasha_depth,
+        dasha_period_key = EXCLUDED.dasha_period_key,
         raw_payload_ref = EXCLUDED.raw_payload_ref,
         chart_signature = EXCLUDED.chart_signature,
         chart_datetime = EXCLUDED.chart_datetime,
@@ -255,6 +265,9 @@ async function upsertChartRow(input: {
       JSON.stringify(input.tags),
       Object.keys(panchanga).length > 0 ? JSON.stringify(panchanga) : null,
       JSON.stringify(input.chartSnapshot),
+      input.chartSchema.chartSchemaVersion,
+      input.chartSchema.dashaDepth,
+      input.chartSchema.dashaPeriodKey ?? null,
       input.sourceDocId,
       input.payloadHash,
       chartDateTime,
@@ -290,6 +303,7 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
 
   const payloadRaw = JSON.stringify(input.payload);
   const payloadHash = stableHash(payloadRaw);
+  const chartSchema = extractChartSchemaInfo(input.payload);
   const requestKey = stableHash(
     JSON.stringify({ endpoint, ownerId: input.ownerId, profileId: input.profileId, kundli: toKundliInputDocument(input.kundli) })
   );
@@ -306,6 +320,9 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
     endpoint,
     requestKey,
     payloadHash,
+    chartSchemaVersion: chartSchema.chartSchemaVersion,
+    dashaDepth: chartSchema.dashaDepth,
+    dashaPeriodKey: chartSchema.dashaPeriodKey,
     rawPayload: input.payload,
     chartSnapshot,
     preview: payloadRaw.slice(0, 1800),
@@ -342,6 +359,7 @@ export async function ingestChartPayloadForProfile(input: IngestChartPayloadInpu
     requestKey,
     payloadHash,
     chartSnapshot,
+    chartSchema,
     kundliInput: toKundliInputDocument(input.kundli),
     tags: input.tags ?? ['kundli', 'be1', endpoint],
   });

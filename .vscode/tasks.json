@@ -39,6 +39,39 @@
 				"$tsc"
 			],
 			"group": "build"
+		},
+		{
+			"label": "validate-transit-fallback",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"&&",
+				"npm",
+				"run",
+				"test:transit:regression"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "validate-transit-fallback",
+			"type": "shell",
+			"command": "sh",
+			"args": [
+				"-lc",
+				"npm run build && npm run test:transit:regression"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Validate deterministic-first refactor",
+			"type": "shell",
+			"command": "npm run build && npm run test:regression"
 		}
 	]
 }
