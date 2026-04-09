@@ -1195,6 +1195,18 @@ function miniScopeSeverity(mode: MiniScopeEnforcementMode): number {
   }
 }
 
+function isMiniTransitTimingHardBlock(question: string): boolean {
+  const q = question.toLowerCase();
+
+  const explicitTransit = /\b(transit|gochar)\b/.test(q);
+  const explicitTimingAnalysis = /\b(timing\s+analysis|predictive\s+analysis|prediction\s+analysis|forecast\s+analysis|future\s+prediction|astrological\s+prediction|transit\s+analysis|gochar\s+analysis)\b/.test(q);
+  const predictiveQuestionCue = /\b(when\s+will|by\s+when|which\s+year|what\s+age)\b/.test(q)
+    && /\b(marriage|relationship|partner|spouse|career|job|business|promotion|finance|money|health|property|travel|children|pregnancy|fertility)\b/.test(q);
+  const explicitDashaTiming = /\b(dasha|dasa|mahadasha|antardasha|vimshottari)\b/.test(q);
+
+  return explicitTransit || explicitTimingAnalysis || predictiveQuestionCue || explicitDashaTiming;
+}
+
 function evaluateMiniScope(question: string): {
   allowed: boolean;
   enforcementMode: MiniScopeEnforcementMode;
@@ -1221,6 +1233,15 @@ function evaluateMiniScope(question: string): {
 
   if (explicitProSections.some((pattern) => pattern.test(q))) {
     blockedReasons.push('This request is in Pro-only analysis scope.');
+  }
+
+  const hasAstroCue = /\b(kundli|chart|horoscope|astrology|vedic|rashi|lagna|nakshatra|graha|planet|d1|d9|dasha|gochar|transit|marriage|career|finance|health|remedy|relationship)\b/.test(q);
+  const hasTransitCue = /\b(transit|gochar)\b/.test(q);
+  const hasTimingCue = /\b(timing|timeline|prediction|predict|forecast|when\s+will|by\s+when|which\s+year|what\s+age|next\s+(week|month|year)|this\s+(week|month|year)|today|tomorrow|future|past)\b/.test(q);
+  const transitOrTimingAnalysisRequest = isMiniTransitTimingHardBlock(question) || hasTransitCue || (hasTimingCue && hasAstroCue);
+
+  if (transitOrTimingAnalysisRequest) {
+    blockedReasons.push('Transit, timing, and predictive analysis are available only in Pro mode.');
   }
 
   const intent = classifyQuestionIntent(question);
@@ -1253,7 +1274,7 @@ function evaluateMiniScope(question: string): {
   }
 
   const proTimingFlags = new Set(['timing', 'dasha', 'transit', 'forecast', 'history', 'career_timing']);
-  if (intent.flags.some((flag) => proTimingFlags.has(flag))) {
+  if (intent.flags.some((flag) => proTimingFlags.has(flag)) && (hasAstroCue || hasTransitCue || intent.topics.length > 0)) {
     blockedReasons.push('This requires predictive timing analysis (dasha/transit/forecast), which is Pro scope.');
   }
 
@@ -1281,10 +1302,21 @@ function evaluateMiniScope(question: string): {
 }
 
 function buildMiniUpgradeResponse(question: string, reasons: string[] = []): string {
-  const leadReason = reasons[0]?.trim();
+  const transitTimingBlock = isMiniTransitTimingHardBlock(question)
+    || reasons.some((reason) => /transit|gochar|timing|predict/i.test(reason));
+
+  if (transitTimingBlock) {
+    return [
+      'Transit, timing, and predictive analysis are not available in **Cozmic Mini**.',
+      'In Mini mode, I can help with small talk and basic D1/D9 astrology only.',
+      'Switch to **Cozmic Pro** for transit/gochar and timing analysis.',
+    ].join('\n');
+  }
+
+  const leadReason = reasons[0]?.replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ' ').trim();
   return [
     'This analysis is not available in **Cozmic Mini**.',
-    leadReason ? `Reason: ${leadReason}` : 'Mini supports D1/D9 foundational insights only.',
+    leadReason ? `Reason: ${truncateText(leadReason, 220)}` : 'Mini supports D1/D9 foundational insights only.',
     'Switch to **Cozmic Pro** to use this analysis.',
   ].join('\n');
 }
@@ -2178,7 +2210,7 @@ async function decideFastAnswerIntentDetailed(
       route,
       conversationContext: conversationContext.slice(-6),
       instruction:
-        'Classify the fast-answer intent for a non-pipeline astrology chat message. Pick exactly one intent kind.',
+        'Classify the fast-answer intent for a non-pipeline astrology chat message. Pick exactly one intent kind. Mini mode guardrail: never route transit/gochar/timing/predictive questions as fast-answer general_astro; those must be blocked via Pro-scope path.',
     },
     fallback: () => deterministic,
   });
@@ -2258,6 +2290,21 @@ async function directLLMRoute(
       usedFallback: false,
     };
   }
+
+  if (mode === 'mini') {
+    const miniScope = evaluateMiniScope(message);
+    if (!miniScope.allowed || miniScope.enforcementMode === 'blocked') {
+      return {
+        route: 'pipeline',
+        confidence: 0.99,
+        latencyMs: Date.now() - startTime,
+        responseStyle: deterministicStyle,
+        continuityIntent: isContinuationRequest(message),
+        model: 'deterministic-mini-scope-route-guard',
+        usedFallback: true,
+      };
+    }
+  }
   
   const result = await invokeDecisionNode<IntentRouteDecision>({
     node: 'route_top_level',
@@ -2274,7 +2321,8 @@ async function directLLMRoute(
 **pipeline** (full analysis): Personal requests with "my" (my chart, my career, my marriage), predictions (when will I), timing requests
 
     Mode policy:
-    - mini: keep non-pipeline astrology scope to D1, D9, and basic astrological insights.
+    - mini: allow only smalltalk and basic astrology explanations limited to D1/D9 foundations.
+    - mini: DO NOT route transit/gochar/timing/prediction/forecast questions to general_astro or smalltalk; route those to pipeline so mini-scope guard can block.
     - pro: allow all kinds of astrology answers and advanced topics.
 
     Brand rule:
@@ -2356,6 +2404,13 @@ async function decideTopLevelRouteDetailed(
 }
 
 export async function shouldBypassChartPipeline(message: string, mode: AgentMode = 'mini', conversationContext: string[] = []): Promise<boolean> {
+  if (mode === 'mini') {
+    const miniScope = evaluateMiniScope(message);
+    if (!miniScope.allowed || miniScope.enforcementMode === 'blocked') {
+      return false;
+    }
+  }
+
   if (shouldForcePipelineRoute(message)) {
     return false;
   }
@@ -2437,6 +2492,13 @@ async function generateGeneralAstroResponse(
   conversationContext: string[] = [],
   responseStyle: ResponseStyle = 'brief'
 ): Promise<string> {
+  if (mode === 'mini') {
+    const miniScope = evaluateMiniScope(message);
+    if (!miniScope.allowed || miniScope.enforcementMode === 'blocked') {
+      return buildMiniUpgradeResponse(message, miniScope.reasons);
+    }
+  }
+
   const styleInstruction = responseStyle === 'micro'
     ? 'Return a direct answer in 1-2 lines max.'
     : responseStyle === 'expand'
@@ -2450,7 +2512,7 @@ async function generateGeneralAstroResponse(
       systemPrompt: `You are Cozmic AI, a Vedic astrology assistant. ${styleInstruction}
 Identity rule: If the user asks who you are or who built you, say clearly: "I am Cozmic AI."
 ${mode === 'mini'
-  ? 'Mini mode policy: answer using D1, D9, and basic astrology insights only. Avoid deep advanced techniques.'
+  ? 'Mini mode policy: answer only smalltalk or basic D1/D9 foundational astrology. Never provide transit/gochar/timing/predictive analysis. If user asks those, reply that it is unavailable in Cozmic Mini and suggest Cozmic Pro.'
   : 'Pro mode policy: provide all kinds of astrology answers, including advanced divisional charts, dasha, transit, yogas, and timing.'}
 Answer only what user asked. Avoid extra sections unless explicitly requested.
 If chart-specific analysis is requested but Kundli context is unavailable, do NOT ask for date/time/place of birth. Ask the user to open or generate a Kundli in the app.` ,
@@ -2474,6 +2536,17 @@ async function answerSimpleWithoutChart(
   responseStyleHint: ResponseStyle = 'brief'
 ): Promise<Pick<AgentAnswer, 'answer' | 'model' | 'mode'>> {
   try {
+    if (mode === 'mini') {
+      const miniScope = evaluateMiniScope(message);
+      if (!miniScope.allowed || miniScope.enforcementMode === 'blocked') {
+        return {
+          answer: buildMiniUpgradeResponse(message, miniScope.reasons),
+          model: 'cozmic-mini-guard',
+          mode,
+        };
+      }
+    }
+
     const shouldShortcut = route === 'smalltalk' && isObviousSmalltalk(message);
     const decisionResult = shouldShortcut
       ? {
@@ -4527,6 +4600,13 @@ async function routeTopLevelNode(state: AgentStateType): Promise<AgentUpdateType
 }
 
 function routeFromTopLevel(state: AgentStateType): 'fast_answer' | 'classify_intent' {
+  if (state.mode === 'mini') {
+    const miniScope = evaluateMiniScope(state.question);
+    if (!miniScope.allowed || miniScope.enforcementMode === 'blocked') {
+      return 'classify_intent';
+    }
+  }
+
   if (shouldForcePipelineRoute(state.question)) {
     return 'classify_intent';
   }
@@ -4535,6 +4615,34 @@ function routeFromTopLevel(state: AgentStateType): 'fast_answer' | 'classify_int
 }
 
 async function fastAnswerNode(state: AgentStateType): Promise<AgentUpdateType> {
+  if (state.mode === 'mini') {
+    const miniScope = evaluateMiniScope(state.question);
+    if (!miniScope.allowed || miniScope.enforcementMode === 'blocked') {
+      return {
+        answer: buildMiniUpgradeResponse(state.question, miniScope.reasons),
+        model: 'cozmic-mini-guard',
+        executionPlan: {
+          family: 'general',
+          chartLayers: [],
+          includeTiming: false,
+          includeTransit: false,
+          includeDasha: false,
+          includeCareer: false,
+          includeRelationship: false,
+          includeMicroSignals: [],
+          seriesNodes: ['route_top_level', 'fast_answer'],
+          parallelBatches: [],
+        },
+        analysisStages: appendStage(
+          state,
+          'fast_answer',
+          'Returning direct LLM answer for non-pipeline route',
+          'mini scope blocked (transit/timing or pro-only request)'
+        ),
+      };
+    }
+  }
+
   const route = state.topLevelRoute ?? 'smalltalk';
   const styleHint = state.responseStyleHint ?? deriveResponseStyleHint(state.question, state.conversationContext ?? []);
   const fast = await answerSimpleWithoutChart(state.question, state.mode, route, state.conversationContext ?? [], styleHint);
@@ -5631,7 +5739,7 @@ function buildPrompt(state: AgentStateType): string {
           'MODE: MINI - Basic Astrological Insights',
           'In mini mode, focus insights on D1 (Rashi) and D9 (Navamsha) charts only.',
           'Provide foundational interpretations only for allowed mini scope.',
-          'Never provide D10, D8, D30, dasha, transit, longevity, arudha, or other pro-only analysis in mini mode.',
+          'Never provide timing, forecast, prediction, transit/gochar, D10, D8, D30, dasha, longevity, arudha, or other pro-only analysis in mini mode.',
           'If a pro-only analysis is requested, respond with one short deny line and Pro upgrade direction.',
           'Keep guidance practical and accessible for users new to astrology.',
         ]
@@ -5963,11 +6071,69 @@ function sanitizeBirthDetailRequests(answer: string): string {
   }
 
   const kundliFallback = 'For a personal chart reading, please open or generate a Kundli in the app.';
-  if (!/open\s+or\s+generate\s+a\s+kundli/i.test(next)) {
-    next = next.length > 0 ? `${next}\n\n${kundliFallback}` : kundliFallback;
+  if (next.length === 0 && !/open\s+or\s+generate\s+a\s+kundli/i.test(next)) {
+    next = kundliFallback;
   }
 
   return next;
+}
+
+function isTransitDetailsQuestion(question: string): boolean {
+  const q = question.toLowerCase();
+  return /\b(transit|gochar)\b/.test(q)
+    && /\b(details?|snapshot|current|full|all|complete)\b/.test(q);
+}
+
+function getTransitAnalyzerFinding(findings: ToolFinding[]): ToolFinding | null {
+  const finding = findings.find((item) => item.name === 'Transit analyzer' && item.status !== 'unavailable');
+  return finding ?? null;
+}
+
+function extractTransitPlanetFact(findings: ToolFinding[], planetLabel: string): string | null {
+  const transitFinding = getTransitAnalyzerFinding(findings);
+  if (!transitFinding) return null;
+
+  const line = transitFinding.facts.find((fact) => new RegExp(`^Transit\\s+${planetLabel}:`, 'i').test(fact));
+  return line?.trim() ?? null;
+}
+
+function sanitizeTransitProfileGateLeak(answer: string, findings: ToolFinding[], question: string): string {
+  if (!isTransitDetailsQuestion(question)) {
+    return answer;
+  }
+
+  if (!getTransitAnalyzerFinding(findings)) {
+    return answer;
+  }
+
+  return answer
+    .replace(/^\s*For a personal chart reading, please open or generate a Kundli in the app\.\s*$/gim, '')
+    .replace(/^\s*To answer this as a personal chart reading, I need your Kundli context first\.\s*$/gim, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function ensureTransitMercuryMention(answer: string, findings: ToolFinding[], question: string): string {
+  if (!isTransitDetailsQuestion(question)) {
+    return answer;
+  }
+
+  if (/\bMercury\b/i.test(answer)) {
+    return answer;
+  }
+
+  const mercuryFact = extractTransitPlanetFact(findings, 'Mercury');
+  if (!mercuryFact) {
+    return answer;
+  }
+
+  const trimmed = answer.trim();
+  if (!trimmed) {
+    return mercuryFact;
+  }
+
+  return `${trimmed}\n- ${mercuryFact}`;
 }
 
 function isHardshipQuestion(question: string): boolean {
@@ -6000,12 +6166,14 @@ function sanitizeHardshipTone(answer: string, question: string): string {
     .trim();
 }
 
-function enforceGroundingAnswerContract(answer: string, findings: ToolFinding[], question = ''): string {
+export function enforceGroundingAnswerContract(answer: string, findings: ToolFinding[], question = ''): string {
   const step0 = sanitizeBirthDetailRequests(answer);
   const step1 = sanitizeGenericMissingAnalysisClaims(step0, findings);
   const step2 = sanitizeMissingDataContradictions(step1, findings);
-  const step3 = sanitizeHardshipTone(step2, question);
-  return step3;
+  const step3 = sanitizeTransitProfileGateLeak(step2, findings, question);
+  const step4 = ensureTransitMercuryMention(step3, findings, question);
+  const step5 = sanitizeHardshipTone(step4, question);
+  return step5;
 }
 
 function buildKendraSignsFromLagna(lagnaRashi: number): { h1: number; h4: number; h7: number; h10: number } {
@@ -6409,6 +6577,17 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
   const ownerId = input.ownerId ?? 'anonymous';
   const mode: AgentMode = input.mode ?? 'mini';
 
+  if (mode === 'mini') {
+    const deterministicMiniScope = evaluateMiniScope(input.message);
+    if (!deterministicMiniScope.allowed || deterministicMiniScope.enforcementMode === 'blocked') {
+      return {
+        answer: buildMiniUpgradeResponse(input.message, deterministicMiniScope.reasons),
+        model: 'cozmic-mini-guard',
+        mode,
+      };
+    }
+  }
+
   const topRouteResult = await decideTopLevelRouteDetailed(input.message, mode, input.conversationContext ?? []);
   const topRouteDecision = topRouteResult.decision;
   const topLevelRoute = topRouteDecision.topRoute;
@@ -6417,7 +6596,7 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
   let miniScopeTelemetry: DecisionTelemetry | null = null;
   let miniScopeDecision: MiniScopeDecision | null = null;
 
-  if (mode === 'mini' && topLevelRoute === 'pipeline') {
+  if (mode === 'mini') {
     const miniScopeResult = await decideMiniScopeDetailed(input.message, mode, input.conversationContext ?? []);
     const deterministicMiniScope = evaluateMiniScope(input.message);
     miniScopeDecision = miniScopeResult.decision;

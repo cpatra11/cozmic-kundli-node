@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { env } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import { fetchCalculatedChart, fetchTransitChart } from '../services/be1Client.js';
+import { matchCompatibility, parseCompatibilityQuery } from '../services/compatibility.js';
 import { ingestChartPayloadForProfile, ingestKundliForProfile, queryRagChunks } from '../services/ragPipeline.js';
 import { stableHash } from '../services/hash.js';
 import { buildChartSnapshot, extractChartSchemaInfo } from '../services/chartSnapshot.js';
@@ -91,23 +92,7 @@ function shouldRunAsync(value: unknown): boolean {
   return false;
 }
 
-async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeof GenerateChartSchema>) {
-  const profileId =
-    parsedData.profileId ??
-    `p_${stableHash(
-      JSON.stringify({
-        uid: ownerId,
-        lat: parsedData.latitude,
-        lon: parsedData.longitude,
-        y: parsedData.year,
-        m: parsedData.month,
-        d: parsedData.day,
-        h: parsedData.hour,
-        min: parsedData.min,
-        sec: parsedData.sec ?? 0,
-      })
-    ).slice(0, 12)}`;
-
+async function calculateChartPreview(parsedData: z.infer<typeof GenerateChartSchema>) {
   let chartData: unknown;
   try {
     chartData = await fetchCalculatedChart(
@@ -141,6 +126,32 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
   const chartSnapshot = buildChartSnapshot(chartData);
   const chartSchema = extractChartSchemaInfo(chartData);
 
+  return {
+    rawChartData: chartData,
+    chartSnapshot,
+    chartSchema,
+  };
+}
+
+async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeof GenerateChartSchema>) {
+  const profileId =
+    parsedData.profileId ??
+    `p_${stableHash(
+      JSON.stringify({
+        uid: ownerId,
+        lat: parsedData.latitude,
+        lon: parsedData.longitude,
+        y: parsedData.year,
+        m: parsedData.month,
+        d: parsedData.day,
+        h: parsedData.hour,
+        min: parsedData.min,
+        sec: parsedData.sec ?? 0,
+      })
+    ).slice(0, 12)}`;
+
+  const { rawChartData, chartSnapshot, chartSchema } = await calculateChartPreview(parsedData);
+
   let ingestion;
   let ingestionError: string | undefined;
   try {
@@ -160,7 +171,7 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
         sec: parsedData.sec ?? 0,
         time_zone: parsedData.time_zone,
       },
-      payload: chartData,
+      payload: rawChartData,
       endpoint: 'calculate',
       tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
     });
@@ -185,6 +196,28 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
     ingestionError,
   };
 }
+
+router.post('/v1/chart/calculate', async (req, res) => {
+  try {
+    const parsed = GenerateChartSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
+    }
+
+    const { chartSnapshot, chartSchema } = await calculateChartPreview(parsed.data);
+
+    return res.status(200).json({
+      ok: true,
+      chartData: chartSnapshot,
+      chartSchemaVersion: chartSchema.chartSchemaVersion,
+      dashaDepth: chartSchema.dashaDepth,
+      dashaPeriodKey: chartSchema.dashaPeriodKey,
+      source: 'preview',
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to calculate chart preview', details: String(error) });
+  }
+});
 
 router.post('/v1/rag/ingest', requireFirebaseAuth, async (req, res) => {
   try {
@@ -323,6 +356,17 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to generate and ingest chart', details: String(error) });
+  }
+});
+
+router.get('/api/compatibility', async (req, res) => {
+  try {
+    const query = parseCompatibilityQuery(req.query as Record<string, unknown>);
+    const result = await matchCompatibility(query);
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to calculate compatibility', details: String(error) });
   }
 });
 

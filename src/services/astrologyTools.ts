@@ -824,7 +824,7 @@ async function buildTransitToolFindingForPlan(input: TransitToolInput, plan: Tra
       'Transit house contract: derive house from transit Lagna rashi and planet rashi using whole-sign formula ((planet_rashi - lagna_rashi + 12) % 12) + 1; treat backend house_number as auxiliary backend metadata.',
     ];
 
-    const wantsFullPlanetSnapshot = /\b(current\s+transit\s+details?|full\s+transit|all\s+transits?|complete\s+transit|transit\s+snapshot|current\s+gochar\s+details?)\b/i.test(input.question);
+    const wantsFullPlanetSnapshot = /\b((?:current\s+)?transit\s+details?|full\s+transit|all\s+transits?|complete\s+transit|transit\s+snapshot|(?:current\s+)?gochar\s+details?)\b/i.test(input.question);
 
     if (transitChart && typeof transitChart === 'object') {
       facts.push(...summarizeTransitChart(transitChart, input.question));
@@ -936,7 +936,7 @@ export async function buildTransitToolFinding(input: TransitToolInput): Promise<
 function getTransitFocusDetails(question: string): { label: string; planets: string[]; houses: string[] } {
   const q = question.toLowerCase();
 
-  if (/\b(current\s+transit\s+details?|full\s+transit|all\s+transits?|complete\s+transit|transit\s+snapshot|current\s+gochar\s+details?)\b/.test(q)) {
+  if (/\b((?:current\s+)?transit\s+details?|full\s+transit|all\s+transits?|complete\s+transit|transit\s+snapshot|(?:current\s+)?gochar\s+details?)\b/.test(q)) {
     return {
       label: 'current full transit snapshot',
       planets: ['Su', 'Mo', 'Ma', 'Me', 'Ju', 'Ve', 'Sa', 'Ra', 'Ke'],
@@ -969,7 +969,7 @@ function getTransitFocusDetails(question: string): { label: string; planets: str
     return { label: 'spiritual timing', planets: ['Ke', 'Ju', 'Sa', 'Mo'], houses: ['5', '9', '12'] };
   }
   if (/\b(transit|gochar|today|now|tomorrow|this month|next month|this year|next year)\b/.test(q)) {
-    return { label: 'transit timing', planets: ['Mo', 'Sa', 'Ju', 'Su', 'Ve'], houses: ['1', '4', '7', '10'] };
+    return { label: 'transit timing', planets: ['Mo', 'Sa', 'Ju', 'Su', 'Ve', 'Me'], houses: ['1', '4', '7', '10'] };
   }
 
   return { label: 'general timing', planets: ['Mo', 'Sa', 'Ra', 'Ju', 'Su'], houses: ['1', '4', '7', '10'] };
@@ -999,6 +999,39 @@ const TRANSIT_PLANET_LABELS: Record<string, string> = {
 };
 
 const ALL_TRANSIT_PLANET_CODES = ['Su', 'Mo', 'Ma', 'Me', 'Ju', 'Ve', 'Sa', 'Ra', 'Ke'] as const;
+
+const TRANSIT_PLANET_ALIASES: Record<string, string[]> = {
+  Su: ['Su', 'Sun', 'sun', 'Surya', 'SURYA'],
+  Mo: ['Mo', 'Moon', 'moon', 'Chandra', 'CHANDRA'],
+  Ma: ['Ma', 'Mars', 'mars', 'Mangal', 'MANGAL'],
+  Me: ['Me', 'Mercury', 'mercury', 'Budh', 'BUDH', 'Budha', 'BUDHA'],
+  Ju: ['Ju', 'Jupiter', 'jupiter', 'Guru', 'GURU'],
+  Ve: ['Ve', 'Venus', 'venus', 'Shukra', 'SHUKRA'],
+  Sa: ['Sa', 'Saturn', 'saturn', 'Shani', 'SHANI'],
+  Ra: ['Ra', 'Rahu', 'rahu'],
+  Ke: ['Ke', 'Ketu', 'ketu'],
+};
+
+function getTransitGrahaPlanet(graha: Record<string, unknown>, code: string): unknown {
+  const aliases = TRANSIT_PLANET_ALIASES[code] ?? [code];
+
+  for (const alias of aliases) {
+    if (alias in graha) {
+      return graha[alias];
+    }
+  }
+
+  for (const [key, value] of Object.entries(graha)) {
+    const keyLower = key.toLowerCase();
+    for (const alias of aliases) {
+      if (keyLower === alias.toLowerCase()) {
+        return value;
+      }
+    }
+  }
+
+  return undefined;
+}
 
 function getTransitByPath(value: unknown, path: string): unknown {
   const parts = path.split('.');
@@ -1094,7 +1127,7 @@ function summarizeFullTransitPlanetSnapshot(transitChart: unknown): string[] {
   const facts: string[] = [];
   for (const code of ALL_TRANSIT_PLANET_CODES) {
     const label = TRANSIT_PLANET_LABELS[code] ?? code;
-    const planet = (graha as Record<string, unknown>)[code];
+    const planet = getTransitGrahaPlanet(graha as Record<string, unknown>, code);
     if (isPlainObject(planet)) {
       facts.push(`Transit ${label}: ${formatTransitPlacementRelativeToLagna(planet, lagnaRashi)}.`);
     } else {
@@ -1128,8 +1161,8 @@ function summarizeTransitChart(transitChart: unknown, question: string): string[
     let matched = 0;
     let derivedHouseCount = 0;
 
-    for (const [code, planet] of Object.entries(graha)) {
-      if (!focusPlanets.has(code)) continue;
+    for (const code of [...focusPlanets]) {
+      const planet = getTransitGrahaPlanet(graha, code);
       if (!isPlainObject(planet)) continue;
 
       matched += 1;
@@ -1214,7 +1247,7 @@ function buildTransitIntervalSignals(
     const highlights: string[] = [];
 
     for (const code of focusPlanets) {
-      const planet = (graha as Record<string, unknown>)[code];
+      const planet = getTransitGrahaPlanet(graha as Record<string, unknown>, code);
       if (!isPlainObject(planet)) continue;
 
       const house = deriveWholeSignHouseFromLagna((planet as Record<string, unknown>).rashi, lagnaRashi);
