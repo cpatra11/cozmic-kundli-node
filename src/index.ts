@@ -39,6 +39,7 @@ app.use((req, res, next) => {
 });
 
 app.use('/v1/chart/generate', expensiveEndpointRateLimit);
+app.use('/v1/chart/calculate', expensiveEndpointRateLimit);
 app.use('/v1/rag/query', expensiveEndpointRateLimit);
 
 app.use(healthRoutes);

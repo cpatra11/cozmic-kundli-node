@@ -81,6 +81,44 @@ async function main(): Promise<void> {
     'Mini remedies block message should clearly state unavailability in Mini mode'
   );
 
+  const miniBlockedTransitTiming = await runKundliAgent({
+    ownerId: 'smoke',
+    mode: 'mini',
+    message: 'How will my Jupiter transit affect my marriage timing this year?',
+    conversationContext: [],
+  });
+
+  assert.equal(
+    miniBlockedTransitTiming.model,
+    'cozmic-mini-guard',
+    'Mini mode should block transit/timing analysis and force upgrade response'
+  );
+  assert.ok(
+    /not available in \*\*Cozmic Mini\*\*/i.test(miniBlockedTransitTiming.answer),
+    'Mini transit/timing block message should clearly state unavailability in Mini mode'
+  );
+
+  const miniBlockedTimingAnalysis = await runKundliAgent({
+    ownerId: 'smoke',
+    mode: 'mini',
+    message: 'Please do timing analysis for my marriage.',
+    conversationContext: [],
+  });
+
+  assert.equal(
+    miniBlockedTimingAnalysis.model,
+    'cozmic-mini-guard',
+    'Mini mode should hard-block explicit timing analysis phrasing'
+  );
+  assert.ok(
+    /not available in \*\*Cozmic Mini\*\*/i.test(miniBlockedTimingAnalysis.answer),
+    'Mini timing-analysis block message should clearly state unavailability in Mini mode'
+  );
+  assert.ok(
+    !/open or generate a Kundli in the app/i.test(miniBlockedTimingAnalysis.answer),
+    'Mini timing-analysis hard block should not fall through to profile gate wording'
+  );
+
   for (const entry of fast.decisionTelemetry ?? []) {
     assert.equal(typeof entry.node, 'string', 'Telemetry node must be a string');
     assert.equal(typeof entry.model, 'string', 'Telemetry model must be a string');

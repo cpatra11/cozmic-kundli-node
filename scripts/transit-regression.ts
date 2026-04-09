@@ -5,7 +5,7 @@ import {
   resolveTransitAt,
   resolveTransitRequestKind,
 } from '../src/services/astrologyTools.js';
-import { sanitizeMissingDataContradictions } from '../src/services/kundliAgent.js';
+import { enforceGroundingAnswerContract, sanitizeMissingDataContradictions } from '../src/services/kundliAgent.js';
 
 async function main(): Promise<void> {
   const referenceTimestamp = Date.parse('2026-04-03T00:00:00Z');
@@ -340,6 +340,52 @@ async function main(): Promise<void> {
     assert.ok(
       !currentDetailsFinding.facts.some((fact) => /^Transit\s+(Sun|Moon|Mars|Mercury|Jupiter|Venus|Saturn|Rahu|Ketu):.*backend\s+house_number/i.test(fact)),
       'Current transit details finding should not expose backend house_number metadata in user-facing facts'
+    );
+
+    const genericDetailsFinding = await buildTransitPointToolFinding({
+      kundli: mockKundli,
+      question: 'give me transit details',
+      referenceTimestamp,
+    });
+
+    assert.equal(
+      genericDetailsFinding.status,
+      'ok',
+      `Generic transit details finding should be available; got: ${genericDetailsFinding.facts.join(' | ')}`
+    );
+    assert.ok(
+      genericDetailsFinding.facts.some((fact) => /Transit Mercury:.*house\s+10\s*\(ascendant-relative\)/i.test(fact)),
+      'Generic transit details should include Mercury in ascendant-relative snapshot'
+    );
+
+    const llmStyleTransitAnswerWithoutMercury = [
+      'Current transits as of April 5, 2026:',
+      '',
+      '**Transit Lagna (Ascendant):** Taurus (rashi 2)',
+      '**Key Placements:**',
+      '- Jupiter in Gemini (rashi 3), house 2',
+      '- Saturn, Mars, and Sun in Pisces (rashi 12), house 11',
+      '- Rahu retrograde in Aquarius (rashi 11), house 10',
+      '- Ketu retrograde in Leo (rashi 5), house 4',
+      '- Moon in Libra (rashi 7), house 6',
+      '- Venus in Aries (rashi 1), house 12',
+      '',
+      'For a personal chart reading, please open or generate a Kundli in the app.',
+    ].join('\n');
+
+    const enforcedTransitAnswer = enforceGroundingAnswerContract(
+      llmStyleTransitAnswerWithoutMercury,
+      [genericDetailsFinding as any],
+      'give me transit details'
+    );
+
+    assert.ok(
+      /Mercury/i.test(enforcedTransitAnswer),
+      'Transit contract enforcement should inject Mercury when omitted from transit-details answers'
+    );
+    assert.ok(
+      !/open or generate a Kundli in the app/i.test(enforcedTransitAnswer),
+      'Transit contract enforcement should remove Kundli profile-gate leakage when transit data is available'
     );
 
     const intervalDetailsFinding = await buildTransitIntervalToolFinding({
