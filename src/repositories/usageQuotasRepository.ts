@@ -66,8 +66,8 @@ function getMonthlyQuotaLimits(isPro: boolean): MonthlyQuotaLimits {
   }
 
   return {
-    miniChat: toSafeLimit(env.NONPRO_MONTHLY_MINI_REQUESTS, 10),
-    proChat: toSafeLimit(env.NONPRO_MONTHLY_PRO_REQUESTS, 1),
+    miniChat: toSafeLimit(env.NONPRO_MONTHLY_MINI_REQUESTS, 5),
+    proChat: toSafeLimit(env.NONPRO_MONTHLY_PRO_REQUESTS, 0),
     kundliGenerations: toSafeLimit(env.NONPRO_MONTHLY_KUNDLI_GENERATIONS, 1),
   };
 }
