@@ -115,8 +115,27 @@ const EnvSchema = z.object({
   BEDROCK_DEEPSEEK_COMPOSER_MODEL_ID: z.string().optional(),
   EMBEDDING_DIM: z.coerce.number().default(192),
   MAX_AUDIO_BYTES: z.coerce.number().default(5 * 1024 * 1024),
+  PRO_ENTITLEMENT_ID: z.string().default('pro'),
+  BILLING_DIRECT_VALIDATION_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
+  BILLING_ALLOW_UNVERIFIED_SYNC: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'false').toLowerCase() === 'true'),
+  APPLE_IAP_BUNDLE_ID: z.string().optional(),
+  APPLE_IAP_ISSUER_ID: z.string().optional(),
+  APPLE_IAP_KEY_ID: z.string().optional(),
+  APPLE_IAP_PRIVATE_KEY: z.string().optional(),
+  APPLE_IAP_ENVIRONMENT: z.preprocess(
+    (value) => (typeof value === 'string' ? value.toLowerCase() : value),
+    z.enum(['auto', 'production', 'sandbox']).default('auto')
+  ),
+  GOOGLE_PLAY_PACKAGE_NAME: z.string().optional(),
+  GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: z.string().optional(),
   REVENUECAT_WEBHOOK_SECRET: z.string().optional(),
-  REVENUECAT_PRO_ENTITLEMENT_ID: z.string().default('Cozmic Astrology Pro'),
+  REVENUECAT_PRO_ENTITLEMENT_ID: z.string().optional(),
 });
 
 export const env = EnvSchema.parse(process.env);

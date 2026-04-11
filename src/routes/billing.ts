@@ -6,8 +6,12 @@ import type { UserSubscriptionDocument } from '../models/firestoreModels.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { getUsageQuotasRepository } from '../repositories/usageQuotasRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
+import { verifyBillingSyncPayload } from '../services/storePurchaseValidation.js';
+import type { BillingDirectVerificationResult } from '../services/storePurchaseValidation.js';
 
 const router = Router();
+
+const BillingSourceSchema = z.enum(['revenuecat', 'expo_iap', 'app_store', 'play_store']);
 
 const RevenueCatEventSchema = z.object({
   event: z
@@ -36,6 +40,19 @@ const RevenueCatSyncSchema = z.object({
   eventType: z.string().optional(),
   lastEventId: z.string().optional(),
 });
+
+const BillingSyncSchema = RevenueCatSyncSchema.extend({
+  source: BillingSourceSchema.default('expo_iap'),
+  purchaseToken: z.string().optional(),
+  transactionId: z.string().optional(),
+});
+
+export function shouldRejectUnverifiedSync(
+  verification: BillingDirectVerificationResult,
+  payload: z.infer<typeof BillingSyncSchema>
+): boolean {
+  return verification.status === 'skipped' && payload.isPro && !env.BILLING_ALLOW_UNVERIFIED_SYNC;
+}
 
 function isWebhookAuthorized(headers: Record<string, string | string[] | undefined>): boolean {
   const expected = env.REVENUECAT_WEBHOOK_SECRET?.trim();
@@ -73,11 +90,17 @@ function collectOwnerIds(event: { app_user_id?: string; aliases?: string[] }): s
   return [...ids];
 }
 
+function resolveConfiguredProEntitlementId(): string {
+  return env.PRO_ENTITLEMENT_ID || env.REVENUECAT_PRO_ENTITLEMENT_ID || 'pro';
+}
+
 function resolveEntitlementId(event: { entitlement_ids?: string[] }): string {
-  const expected = env.REVENUECAT_PRO_ENTITLEMENT_ID;
+  const expected = resolveConfiguredProEntitlementId();
+  const legacy = env.REVENUECAT_PRO_ENTITLEMENT_ID;
   const entitlementIds = event.entitlement_ids ?? [];
 
   if (entitlementIds.includes(expected)) return expected;
+  if (legacy && entitlementIds.includes(legacy)) return legacy;
   if (entitlementIds.includes('pro')) return 'pro';
   if (entitlementIds.length > 0) return entitlementIds[0]!;
 
@@ -90,13 +113,17 @@ function computeIsProStatus(event: {
   expiration_at_ms?: number;
   expires_date_ms?: number;
 }): { isPro: boolean; expiresAtMs?: number; hasEntitlementEvidence: boolean; revokedByType: boolean } {
-  const entitlementId = env.REVENUECAT_PRO_ENTITLEMENT_ID;
+  const entitlementId = resolveConfiguredProEntitlementId();
+  const legacyEntitlement = env.REVENUECAT_PRO_ENTITLEMENT_ID;
   const type = String(event.type ?? '').toUpperCase();
   const entitlementIds = event.entitlement_ids ?? [];
   const expiresAtMs = event.expiration_at_ms ?? event.expires_date_ms;
   const now = Date.now();
 
-  const hasEntitlement = entitlementIds.includes(entitlementId) || entitlementIds.includes('pro');
+  const hasEntitlement =
+    entitlementIds.includes(entitlementId) ||
+    (legacyEntitlement ? entitlementIds.includes(legacyEntitlement) : false) ||
+    entitlementIds.includes('pro');
   const hasEntitlementEvidence = entitlementIds.length > 0;
   const notExpired = !expiresAtMs || expiresAtMs > now;
   const revokedByType =
@@ -114,6 +141,86 @@ function computeIsProStatus(event: {
   };
 }
 
+async function upsertSubscriptionFromSyncPayload(
+  ownerId: string,
+  payload: z.infer<typeof BillingSyncSchema>
+) {
+  const subscriptions = getSubscriptionsRepository();
+  const usageQuotas = getUsageQuotasRepository();
+  const now = Date.now();
+
+  const subscriptionDoc: UserSubscriptionDocument = {
+    ownerId,
+    source: payload.source,
+    entitlementId: payload.entitlementId,
+    isPro: payload.isPro,
+    store: payload.store,
+    productId: payload.productId,
+    eventType: payload.eventType ?? 'client_sync',
+    expiresAtMs: payload.expiresAtMs,
+    updatedAt: now,
+    lastEventAt: now,
+    lastEventId: payload.lastEventId,
+  };
+
+  await subscriptions.upsert(subscriptionDoc);
+  const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, payload.isPro);
+
+  return {
+    subscription: subscriptionDoc,
+    quotaStatus,
+  };
+}
+
+router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, res) => {
+  try {
+    const parsed = BillingSyncSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid billing sync payload', details: parsed.error.flatten() });
+    }
+
+    const verification = await verifyBillingSyncPayload(parsed.data);
+    if (verification.status === 'invalid') {
+      return res.status(400).json({
+        error: 'Store purchase verification failed',
+        provider: verification.provider,
+        details: verification.reason,
+      });
+    }
+
+    if (shouldRejectUnverifiedSync(verification, parsed.data)) {
+      const skippedReason = verification.status === 'skipped' ? verification.reason : 'Store verification was skipped';
+      return res.status(400).json({
+        error: 'Unverified pro entitlement sync is not allowed',
+        details: skippedReason,
+        hint: 'Configure direct store validation credentials or set BILLING_ALLOW_UNVERIFIED_SYNC=true for local development only.',
+      });
+    }
+
+    const normalizedPayload: z.infer<typeof BillingSyncSchema> =
+      verification.status === 'verified'
+        ? {
+            ...parsed.data,
+            source: verification.provider,
+            isPro: verification.isPro,
+            expiresAtMs: verification.expiresAtMs ?? parsed.data.expiresAtMs,
+            productId: verification.productId ?? parsed.data.productId,
+            store: verification.store,
+            eventType: verification.eventType,
+            lastEventId: verification.lastEventId ?? parsed.data.lastEventId,
+          }
+        : parsed.data;
+
+    const result = await upsertSubscriptionFromSyncPayload(req.user!.uid, normalizedPayload);
+    return res.json({
+      ...result,
+      verification,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to sync billing subscription', details: String(error) });
+  }
+});
+
 router.post('/v1/billing/revenuecat/sync', requireFirebaseAuth, async (req, res) => {
   try {
     const parsed = RevenueCatSyncSchema.safeParse(req.body ?? {});
@@ -121,34 +228,13 @@ router.post('/v1/billing/revenuecat/sync', requireFirebaseAuth, async (req, res)
       return res.status(400).json({ error: 'Invalid sync payload', details: parsed.error.flatten() });
     }
 
-    const subscriptions = getSubscriptionsRepository();
-    const ownerId = req.user!.uid;
-    const now = Date.now();
-    const payload = parsed.data;
-
-    const subscriptionDoc: UserSubscriptionDocument = {
-      ownerId,
-      source: 'revenuecat',
-      entitlementId: payload.entitlementId,
-      isPro: payload.isPro,
-      store: payload.store,
-      productId: payload.productId,
-      eventType: payload.eventType ?? 'client_sync',
-      expiresAtMs: payload.expiresAtMs,
-      updatedAt: now,
-      lastEventAt: now,
-      lastEventId: payload.lastEventId,
+    const payload = {
+      ...parsed.data,
+      source: 'revenuecat' as const,
     };
 
-    await subscriptions.upsert(subscriptionDoc);
-
-    const usageQuotas = getUsageQuotasRepository();
-    const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, payload.isPro);
-
-    return res.json({
-      subscription: subscriptionDoc,
-      quotaStatus,
-    });
+    const result = await upsertSubscriptionFromSyncPayload(req.user!.uid, payload);
+    return res.json(result);
   } catch (error) {
     return res.status(500).json({ error: 'Failed to sync RevenueCat subscription', details: String(error) });
   }
@@ -221,7 +307,7 @@ router.get('/v1/billing/subscription', requireFirebaseAuth, async (req, res) => 
       return res.json({
         subscription: {
           isPro: false,
-          entitlementId: env.REVENUECAT_PRO_ENTITLEMENT_ID,
+          entitlementId: resolveConfiguredProEntitlementId(),
         },
         quotaStatus,
       });

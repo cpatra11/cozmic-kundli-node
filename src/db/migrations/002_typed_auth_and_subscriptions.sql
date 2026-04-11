@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   updated_at BIGINT NOT NULL,
   last_event_at BIGINT NOT NULL,
   last_event_id TEXT,
-  CONSTRAINT subscriptions_source_chk CHECK (source IN ('revenuecat'))
+  CONSTRAINT subscriptions_source_chk CHECK (source IN ('revenuecat', 'expo_iap', 'app_store', 'play_store'))
 );
 
 CREATE INDEX IF NOT EXISTS subscriptions_is_pro_idx ON subscriptions (is_pro);
