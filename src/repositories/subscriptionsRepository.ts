@@ -4,7 +4,7 @@ import { applyPendingMigrations } from '../services/postgresMigrations.js';
 
 interface SubscriptionRow {
   owner_id: string;
-  source: 'revenuecat' | 'expo_iap' | 'app_store' | 'play_store';
+  source: 'expo_iap' | 'app_store' | 'play_store';
   entitlement_id: string;
   is_pro: boolean;
   store: string | null;

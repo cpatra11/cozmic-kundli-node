@@ -21,7 +21,7 @@ export interface AuthUserDocument {
 
 export interface UserSubscriptionDocument {
   ownerId: string;
-  source: 'revenuecat' | 'expo_iap' | 'app_store' | 'play_store';
+  source: 'expo_iap' | 'app_store' | 'play_store';
   entitlementId: string;
   isPro: boolean;
   store?: string;

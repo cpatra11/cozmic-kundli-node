@@ -4,13 +4,14 @@ This document describes the database tables used by `cozmic-rag-agents`, what ea
 
 ## High-level shape
 
-The database uses **three physical tables**:
+The database uses **four physical tables**:
 
 1. `documents`
 2. `charts`
 3. `chart_vectors`
+4. `subscriptions`
 
-The app also uses **logical document collections** stored inside `documents`, such as `auth_users`, `chat_messages`, `chat_sessions`, `rag_profiles`, `rag_api_sources`, `rag_chunks`, and `user_subscriptions`.
+The app also uses **logical document collections** stored inside `documents`, such as `auth_users`, `chat_messages`, `chat_sessions`, `rag_profiles`, `rag_api_sources`, and `rag_chunks`.
 
 ## `public.documents`
 
@@ -32,7 +33,6 @@ This table acts like a Firestore-style document store. The backend uses it for:
 - rag profile documents
 - rag API source records
 - rag chunks
-- user subscriptions
 
 ### Important logical collections inside `documents`
 
@@ -76,8 +76,8 @@ Stores source payloads and chart snapshots used to build RAG content.
 #### `rag_chunks`
 Stores chunked text and embeddings for retrieval.
 
-#### `user_subscriptions`
-Stores billing/subscription state, including RevenueCat-derived entitlement data.
+#### `subscriptions`
+Stores store-native billing/subscription state, including `is_pro`, `entitlement_id`, `source`, and expiry metadata.
 
 Used by:
 - `GET /v1/billing/subscription`
@@ -191,7 +191,7 @@ The `auth_users` collection in `documents` stores the app’s user profile recor
 - `documents.chat_messages`
 
 ### Billing
-- `documents.user_subscriptions`
+- `subscriptions`
 
 ### Astrology charts and retrieval
 - `charts`

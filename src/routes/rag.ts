@@ -280,9 +280,9 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
     }
 
     let quotaStatus: QuotaStatusSnapshot | undefined;
+    const usageQuotas = env.QUOTA_ENFORCEMENT_ENABLED ? getUsageQuotasRepository() : null;
     if (env.QUOTA_ENFORCEMENT_ENABLED) {
       const subscriptions = getSubscriptionsRepository();
-      const usageQuotas = getUsageQuotasRepository();
       const subscription = await subscriptions.getByOwnerId(req.user!.uid);
       const hasPro = hasActiveProEntitlement(subscription);
 
@@ -299,6 +299,32 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
 
       quotaStatus = consumed.status;
     }
+
+    const refundKundliGenerationQuota = async () => {
+      if (!usageQuotas || !quotaStatus) {
+        return false;
+      }
+
+      try {
+        return await usageQuotas.refundQuota(req.user!.uid, 'kundli_generate', quotaStatus.yearMonth);
+      } catch (refundError) {
+        console.error('[chart/generate] failed to refund kundli quota after generation failure', {
+          ownerId: req.user!.uid,
+          yearMonth: quotaStatus.yearMonth,
+          error: String(refundError),
+        });
+        return false;
+      }
+    };
+
+    const generateChartWithQuotaRefund = async () => {
+      try {
+        return await generateAndIngestChart(req.user!.uid, parsed.data);
+      } catch (error) {
+        await refundKundliGenerationQuota();
+        throw error;
+      }
+    };
 
     const runAsync = shouldRunAsync((req.query as Record<string, unknown>)?.async ?? (req.body as Record<string, unknown>)?.async);
 
@@ -322,19 +348,32 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
       setImmediate(async () => {
         try {
           await chartJobs.patch(req.user!.uid, jobId, { status: 'running', updatedAt: Date.now() });
-          const result = await generateAndIngestChart(req.user!.uid, parsed.data);
-          await chartJobs.patch(req.user!.uid, jobId, {
-            status: 'completed',
-            profileId: result.profileId,
-            result,
-            updatedAt: Date.now(),
-          });
         } catch (error) {
-          await chartJobs.patch(req.user!.uid, jobId, {
-            status: 'failed',
-            error: String(error),
-            updatedAt: Date.now(),
-          });
+          console.error('[chart/generate] failed to mark job as running', { jobId, error: String(error) });
+        }
+
+        try {
+          const result = await generateChartWithQuotaRefund();
+          try {
+            await chartJobs.patch(req.user!.uid, jobId, {
+              status: 'completed',
+              profileId: result.profileId,
+              result,
+              updatedAt: Date.now(),
+            });
+          } catch (error) {
+            console.error('[chart/generate] failed to mark job as completed', { jobId, error: String(error) });
+          }
+        } catch (error) {
+          try {
+            await chartJobs.patch(req.user!.uid, jobId, {
+              status: 'failed',
+              error: String(error),
+              updatedAt: Date.now(),
+            });
+          } catch (patchError) {
+            console.error('[chart/generate] failed to mark job as failed', { jobId, error: String(patchError) });
+          }
         }
       });
 
@@ -347,7 +386,7 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
       });
     }
 
-    const result = await generateAndIngestChart(req.user!.uid, parsed.data);
+    const result = await generateChartWithQuotaRefund();
 
     return res.status(201).json({
       ok: true,

@@ -265,6 +265,37 @@ export class UsageQuotasRepository {
       client.release();
     }
   }
+
+  async refundQuota(ownerId: string, quotaType: UsageQuotaType, yearMonth?: string, nowMs = Date.now()): Promise<boolean> {
+    const pool = await this.withPool();
+    const targetYearMonth = yearMonth ?? resolveMonthlyWindow(nowMs).yearMonth;
+    const quotaColumn = QUOTA_FIELD_BY_TYPE[quotaType];
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const updatedResponse = await client.query<MonthlyUsageCounterRow>(
+        `
+        UPDATE monthly_usage_counters
+        SET ${quotaColumn} = GREATEST(${quotaColumn} - 1, 0),
+            updated_at = $3
+        WHERE owner_id = $1 AND year_month = $2 AND ${quotaColumn} > 0
+        RETURNING owner_id, year_month, mini_chat_used, pro_chat_used, kundli_generate_used, created_at, updated_at
+        `,
+        [ownerId, targetYearMonth, nowMs]
+      );
+
+      await client.query('COMMIT');
+
+      return (updatedResponse.rowCount ?? 0) > 0;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 }
 
 let singletonUsageQuotasRepository: UsageQuotasRepository | null = null;

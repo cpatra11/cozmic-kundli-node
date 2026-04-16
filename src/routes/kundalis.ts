@@ -6,6 +6,7 @@ import { getRagChunksRepository } from '../repositories/ragChunksRepository.js';
 import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
 import { getRagSourcesRepository } from '../repositories/ragSourcesRepository.js';
 import { getChatRepository } from '../repositories/chatRepository.js';
+import { getUsageQuotasRepository } from '../repositories/usageQuotasRepository.js';
 import { buildChartSnapshot } from '../services/chartSnapshot.js';
 import { fetchCalculatedChart } from '../services/be1Client.js';
 import { getPostgresPool } from '../services/postgresClient.js';
@@ -60,6 +61,15 @@ function buildKundaliSummary(doc: RagProfileDocument) {
     updatedAt: doc.updatedAt,
     kundliInput: doc.kundliInput,
   };
+}
+
+function toUtcYearMonth(timestampMs: number): string {
+  const date = new Date(timestampMs);
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function isSameUtcMonth(leftMs: number, rightMs: number): boolean {
+  return toUtcYearMonth(leftMs) === toUtcYearMonth(rightMs);
 }
 
 function parseNestingParam(value: unknown, fallback = 5): number {
@@ -275,6 +285,22 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
       return res.status(404).json({ error: 'Kundali not found' });
     }
 
+    let chartCreatedAt: number | null = null;
+    const pool = getPostgresPool();
+    if (pool) {
+      await applyPendingMigrations(pool);
+      const chartResponse = await pool.query<{ created_at: number }>(
+        `
+        SELECT created_at
+        FROM charts
+        WHERE owner_id = $1 AND kundali_id = $2 AND deleted_at IS NULL
+        LIMIT 1
+        `,
+        [req.user!.uid, profileDoc.profileId]
+      );
+      chartCreatedAt = chartResponse.rows[0]?.created_at ?? null;
+    }
+
     const chatRepository = getChatRepository();
 
     await Promise.all([
@@ -284,11 +310,25 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
       chatRepository.deleteSessionsByOwnerKundali(req.user!.uid, profileDoc.profileId),
     ]);
 
-    const pool = getPostgresPool();
     if (pool) {
-      await applyPendingMigrations(pool);
       await pool.query(`DELETE FROM chart_vectors WHERE owner_id = $1 AND kundali_id = $2`, [req.user!.uid, profileDoc.profileId]);
-      await pool.query(`DELETE FROM charts WHERE owner_id = $1 AND kundali_id = $2`, [req.user!.uid, profileDoc.profileId]);
+      const chartDeleteResponse = await pool.query(
+        `DELETE FROM charts WHERE owner_id = $1 AND kundali_id = $2`,
+        [req.user!.uid, profileDoc.profileId]
+      );
+
+      if (chartCreatedAt && isSameUtcMonth(chartCreatedAt, Date.now()) && (chartDeleteResponse.rowCount ?? 0) > 0) {
+        try {
+          const usageQuotas = getUsageQuotasRepository();
+          await usageQuotas.refundQuota(req.user!.uid, 'kundli_generate', toUtcYearMonth(chartCreatedAt));
+        } catch (refundError) {
+          console.warn('[kundalis/delete] failed to refund kundli generation quota', {
+            ownerId: req.user!.uid,
+            kundaliId: profileDoc.profileId,
+            error: String(refundError),
+          });
+        }
+      }
     }
 
     await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.profileId}`);

@@ -134,8 +134,6 @@ const EnvSchema = z.object({
   ),
   GOOGLE_PLAY_PACKAGE_NAME: z.string().optional(),
   GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: z.string().optional(),
-  REVENUECAT_WEBHOOK_SECRET: z.string().optional(),
-  REVENUECAT_PRO_ENTITLEMENT_ID: z.string().optional(),
 });
 
 export const env = EnvSchema.parse(process.env);

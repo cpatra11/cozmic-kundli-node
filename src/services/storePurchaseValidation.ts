@@ -3,7 +3,7 @@ import { decodeJwt, importPKCS8, SignJWT } from 'jose';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 
-type BillingSource = 'revenuecat' | 'expo_iap' | 'app_store' | 'play_store';
+type BillingSource = 'expo_iap' | 'app_store' | 'play_store';
 
 export interface BillingDirectVerificationInput {
   source: BillingSource;

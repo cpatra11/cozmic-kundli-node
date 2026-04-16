@@ -12,11 +12,9 @@ export function hasActiveProEntitlement(
   }
 
   const expectedEntitlement = env.PRO_ENTITLEMENT_ID;
-  const legacyEntitlement = env.REVENUECAT_PRO_ENTITLEMENT_ID;
 
   return (
     subscription.entitlementId === expectedEntitlement ||
-    subscription.entitlementId === 'pro' ||
-    (legacyEntitlement ? subscription.entitlementId === legacyEntitlement : false)
+    subscription.entitlementId === 'pro'
   );
 }
