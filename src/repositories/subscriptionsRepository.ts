@@ -84,10 +84,11 @@ export class SubscriptionsRepository {
 
     const existingEventType = existingResponse.rows[0]?.event_type ?? null;
     // Allow purchase_update and other valid events to override admin_revoke
-    // when iapkitValid is true (verified purchase)
+    // when iapkitValid is true (verified purchase) OR when isPro is true (device has active subscription)
     const shouldSkipUpdate = existingEventType === 'admin_revoke' && 
       subscription.eventType !== 'admin_revoke' &&
-      subscription.iapkitValid !== true;
+      subscription.iapkitValid !== true &&
+      subscription.isPro !== true;
     
     if (shouldSkipUpdate) {
       console.log('[subscriptions] Skipping update due to admin_revoke', {
