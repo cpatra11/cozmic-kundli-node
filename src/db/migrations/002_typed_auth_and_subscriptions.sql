@@ -19,7 +19,7 @@ WHERE phone_number IS NOT NULL AND NULLIF(trim(phone_number), '') IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS subscriptions (
   owner_id TEXT PRIMARY KEY,
-  source TEXT NOT NULL DEFAULT 'revenuecat',
+  source TEXT NOT NULL DEFAULT 'iapkit',
   entitlement_id TEXT NOT NULL,
   is_pro BOOLEAN NOT NULL DEFAULT FALSE,
   store TEXT,
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   updated_at BIGINT NOT NULL,
   last_event_at BIGINT NOT NULL,
   last_event_id TEXT,
-  CONSTRAINT subscriptions_source_chk CHECK (source IN ('revenuecat'))
+  CONSTRAINT subscriptions_source_chk CHECK (source IN ('iapkit', 'app_store', 'play_store'))
 );
 
 CREATE INDEX IF NOT EXISTS subscriptions_is_pro_idx ON subscriptions (is_pro);

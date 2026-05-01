@@ -77,7 +77,7 @@ Stores source payloads and chart snapshots used to build RAG content.
 Stores chunked text and embeddings for retrieval.
 
 #### `user_subscriptions`
-Stores billing/subscription state, including RevenueCat-derived entitlement data.
+Stores billing/subscription state, including store/IAPKit-derived entitlement data.
 
 Used by:
 - `GET /v1/billing/subscription`

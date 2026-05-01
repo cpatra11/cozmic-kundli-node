@@ -21,12 +21,17 @@ export interface AuthUserDocument {
 
 export interface UserSubscriptionDocument {
   ownerId: string;
-  source: 'revenuecat';
+  source: 'iapkit' | 'app_store' | 'play_store';
   entitlementId: string;
   isPro: boolean;
   store?: string;
   productId?: string;
   eventType?: string;
+  purchaseToken?: string;
+  transactionId?: string;
+  iapkitState?: string;
+  iapkitValid?: boolean;
+  iapkitStore?: 'apple' | 'google' | 'unknown';
   expiresAtMs?: number;
   updatedAt: number;
   lastEventAt: number;

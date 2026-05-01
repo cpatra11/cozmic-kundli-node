@@ -10,6 +10,8 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "tsx scripts/migrate-db.ts",
     "db:reset:push": "tsx scripts/reset-db.ts",
+    "db:set-subscription-free": "node scripts/set-subscription-free.mjs",
+    "disable-pro": "npm run db:set-subscription-free --",
     "test:integration:typed": "tsx scripts/integration-typed-persistence.ts",
     "test:agent:decision-smoke": "tsx scripts/agent-decision-smoke.ts",
     "test:family:regression": "tsx scripts/family-regression.ts",
@@ -27,8 +29,6 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "firebase-admin": "^13.1.0",
-    "google-auth-library": "^10.6.2",
-    "jose": "^6.2.2",
     "pg": "^8.13.3",
     "redis": "^5.11.0",
     "zod": "^3.24.2"

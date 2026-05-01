@@ -4,12 +4,17 @@ import { applyPendingMigrations } from '../services/postgresMigrations.js';
 
 interface SubscriptionRow {
   owner_id: string;
-  source: 'revenuecat';
+  source: 'iapkit' | 'app_store' | 'play_store';
   entitlement_id: string;
   is_pro: boolean;
   store: string | null;
   product_id: string | null;
   event_type: string | null;
+  purchase_token: string | null;
+  transaction_id: string | null;
+  iapkit_state: string | null;
+  iapkit_valid: boolean | null;
+  iapkit_store: 'apple' | 'google' | 'unknown' | null;
   expires_at_ms: number | null;
   updated_at: number;
   last_event_at: number;
@@ -25,6 +30,11 @@ function rowToDocument(row: SubscriptionRow): UserSubscriptionDocument {
     store: row.store ?? undefined,
     productId: row.product_id ?? undefined,
     eventType: row.event_type ?? undefined,
+    purchaseToken: row.purchase_token ?? undefined,
+    transactionId: row.transaction_id ?? undefined,
+    iapkitState: row.iapkit_state ?? undefined,
+    iapkitValid: typeof row.iapkit_valid === 'boolean' ? row.iapkit_valid : undefined,
+    iapkitStore: row.iapkit_store ?? undefined,
     expiresAtMs: row.expires_at_ms ?? undefined,
     updatedAt: Number(row.updated_at),
     lastEventAt: Number(row.last_event_at),
@@ -47,7 +57,7 @@ export class SubscriptionsRepository {
     const pool = await this.withPool();
     const response = await pool.query<SubscriptionRow>(
       `
-      SELECT owner_id, source, entitlement_id, is_pro, store, product_id, event_type, expires_at_ms, updated_at, last_event_at, last_event_id
+      SELECT owner_id, source, entitlement_id, is_pro, store, product_id, event_type, purchase_token, transaction_id, iapkit_state, iapkit_valid, iapkit_store, expires_at_ms, updated_at, last_event_at, last_event_id
       FROM subscriptions
       WHERE owner_id = $1
       LIMIT 1
@@ -61,6 +71,34 @@ export class SubscriptionsRepository {
 
   async upsert(subscription: UserSubscriptionDocument): Promise<void> {
     const pool = await this.withPool();
+
+    const existingResponse = await pool.query<{ event_type: string | null }>(
+      `
+      SELECT event_type
+      FROM subscriptions
+      WHERE owner_id = $1
+      LIMIT 1
+      `,
+      [subscription.ownerId]
+    );
+
+    const existingEventType = existingResponse.rows[0]?.event_type ?? null;
+    // Allow purchase_update and other valid events to override admin_revoke
+    // when iapkitValid is true (verified purchase)
+    const shouldSkipUpdate = existingEventType === 'admin_revoke' && 
+      subscription.eventType !== 'admin_revoke' &&
+      subscription.iapkitValid !== true;
+    
+    if (shouldSkipUpdate) {
+      console.log('[subscriptions] Skipping update due to admin_revoke', {
+        ownerId: subscription.ownerId,
+        existingEventType,
+        newEventType: subscription.eventType,
+        iapkitValid: subscription.iapkitValid,
+      });
+      return;
+    }
+
     await pool.query(
       `
       INSERT INTO subscriptions (
@@ -71,12 +109,17 @@ export class SubscriptionsRepository {
         store,
         product_id,
         event_type,
+        purchase_token,
+        transaction_id,
+        iapkit_state,
+        iapkit_valid,
+        iapkit_store,
         expires_at_ms,
         updated_at,
         last_event_at,
         last_event_id
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
       )
       ON CONFLICT (owner_id)
       DO UPDATE SET
@@ -86,6 +129,11 @@ export class SubscriptionsRepository {
         store = EXCLUDED.store,
         product_id = EXCLUDED.product_id,
         event_type = EXCLUDED.event_type,
+        purchase_token = EXCLUDED.purchase_token,
+        transaction_id = EXCLUDED.transaction_id,
+        iapkit_state = EXCLUDED.iapkit_state,
+        iapkit_valid = EXCLUDED.iapkit_valid,
+        iapkit_store = EXCLUDED.iapkit_store,
         expires_at_ms = EXCLUDED.expires_at_ms,
         updated_at = EXCLUDED.updated_at,
         last_event_at = EXCLUDED.last_event_at,
@@ -99,6 +147,11 @@ export class SubscriptionsRepository {
         subscription.store ?? null,
         subscription.productId ?? null,
         subscription.eventType ?? null,
+        subscription.purchaseToken ?? null,
+        subscription.transactionId ?? null,
+        subscription.iapkitState ?? null,
+        typeof subscription.iapkitValid === 'boolean' ? subscription.iapkitValid : null,
+        subscription.iapkitStore ?? null,
         subscription.expiresAtMs ?? null,
         subscription.updatedAt,
         subscription.lastEventAt,

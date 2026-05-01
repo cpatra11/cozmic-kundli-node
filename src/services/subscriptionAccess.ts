@@ -6,11 +6,12 @@ export function hasActiveProEntitlement(
   nowMs = Date.now()
 ): boolean {
   if (!subscription?.isPro) return false;
+  if (subscription.eventType === 'admin_revoke') return false;
 
   if (typeof subscription.expiresAtMs === 'number' && subscription.expiresAtMs <= nowMs) {
     return false;
   }
 
-  const expectedEntitlement = env.REVENUECAT_PRO_ENTITLEMENT_ID;
+  const expectedEntitlement = env.PRO_ENTITLEMENT_ID;
   return subscription.entitlementId === expectedEntitlement || subscription.entitlementId === 'pro';
 }

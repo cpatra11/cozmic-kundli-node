@@ -115,8 +115,15 @@ const EnvSchema = z.object({
   BEDROCK_DEEPSEEK_COMPOSER_MODEL_ID: z.string().optional(),
   EMBEDDING_DIM: z.coerce.number().default(192),
   MAX_AUDIO_BYTES: z.coerce.number().default(5 * 1024 * 1024),
-  REVENUECAT_WEBHOOK_SECRET: z.string().optional(),
-  REVENUECAT_PRO_ENTITLEMENT_ID: z.string().default('Cozmic Astrology Pro'),
+  PRO_ENTITLEMENT_ID: z.string().default('pro'),
+  BILLING_DIRECT_VALIDATION_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'false').toLowerCase() === 'true'),
+  BILLING_ALLOW_UNVERIFIED_SYNC: z
+    .string()
+    .optional()
+    .transform((value) => (value ?? 'true').toLowerCase() === 'true'),
 });
 
 export const env = EnvSchema.parse(process.env);
