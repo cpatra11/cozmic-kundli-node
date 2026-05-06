@@ -49,12 +49,19 @@ type AgentStateType = typeof AgentState.State;
 function getLastHumanMessage(messages: any[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    // Handle LangChain message format: { lc:1, type:"constructor", kwargs:{ content, role } }
-    const role = msg.role || msg.kwargs?.role;
-    const content = msg.content || msg.kwargs?.content;
+    const directRole = msg.role;
+    const kwargRole = msg.kwargs?.role;
+    const directContent = msg.content;
+    const kwargContent = msg.kwargs?.content;
+    
+    console.log('[getLastHumanMessage] msg:', JSON.stringify(msg).slice(0, 200));
+    console.log('[getLastHumanMessage] directRole:', directRole, 'kwargRole:', kwargRole);
+    console.log('[getLastHumanMessage] directContent:', directContent, 'kwargContent:', kwargContent);
+    
+    const role = directRole || kwargRole;
+    const content = directContent || kwargContent;
     
     if (role === 'user') {
-      // Handle array content format (ContentBlocks)
       if (Array.isArray(content)) {
         return content[0]?.text || '';
       }
