@@ -84,9 +84,14 @@ function extractClaims(text: string): string[] {
 // -- Node 1: route_and_plan --
 async function routeAndPlan(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
+  const fullMessages = JSON.stringify(state.messages);
+  
+  console.log('[routeAndPlan] Full messages:', fullMessages);
+  console.log('[routeAndPlan] Question:', question);
   
   // Handle empty question
   if (!question?.trim()) {
+    console.log('[routeAndPlan] Empty question - returning smalltalk');
     return {
       route: 'smalltalk',
       routeConfidence: 0.5,
