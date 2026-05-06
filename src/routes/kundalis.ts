@@ -117,11 +117,11 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
       return res.status(422).json({ error: 'Kundli input snapshot unavailable for this profile' });
     }
 
-    // Request full chart data (all vargas and all info levels)
+    // Request full chart data - use same settings as generate endpoint
     const calculated = await fetchBe1Calculate(input, {
-      varga: 'D1,D2,D3,D4,D5,D6,D7,D8,D9,D10,D11,D12,D16,D20,D24,D27,D30,D40,D45,D60',
+      varga: 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
       infolevel: 'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
-      nesting: 4,
+      nesting: 2,
     });
     const chartData = buildChartSnapshot(calculated);
 
@@ -192,11 +192,11 @@ router.get('/v1/kundalis/:kundaliId/dasha', requireFirebaseAuth, async (req, res
       return res.status(422).json({ error: 'Kundli input snapshot unavailable for this profile' });
     }
 
-    // Request full chart data for dasha details
+    // Request chart data with focus on dasha
     const calculated = await fetchBe1Calculate(input, {
       nesting,
-      varga: 'D1,D7,D9,D10,D12',
-      infolevel: 'basic,ashtakavarga,dasha,yogas',
+      varga: 'D1,D7,D9,D10',
+      infolevel: 'basic,dasha,yogas',
       ...(periodKey ? { periodKey } : {}),
     });
     // IMPORTANT: Do NOT run on-demand dasha through buildChartSnapshot here.
