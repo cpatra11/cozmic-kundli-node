@@ -7,8 +7,6 @@ import { matchCompatibility, parseCompatibilityQuery } from '../services/compati
 import { ingestChartPayloadForProfile, ingestKundliForProfile, queryRagChunks } from '../services/ragPipeline.js';
 import { stableHash } from '../services/hash.js';
 import { buildChartSnapshot, extractChartSchemaInfo } from '../services/chartSnapshot.js';
-import { type ChartJobDocument } from '../models/firestoreModels.js';
-import { getChartJobsRepository } from '../repositories/chartJobsRepository.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { getUsageQuotasRepository, type QuotaStatusSnapshot } from '../repositories/usageQuotasRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
@@ -60,6 +58,7 @@ const GenerateChartSchema = z.object({
   infolevel: z.string().optional(),
   varga: z.string().optional(),
   ayanamsha: z.string().optional(),
+  ingest: z.boolean().optional(),
 });
 
 const TransitChartSchema = z.object({
@@ -83,15 +82,6 @@ const TransitChartSchema = z.object({
   nesting: z.number().int().min(1).max(6).optional(),
 });
 
-function shouldRunAsync(value: unknown): boolean {
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') {
-    const normalized = value.trim().toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-  }
-  return false;
-}
-
 async function calculateChartPreview(parsedData: z.infer<typeof GenerateChartSchema>) {
   let chartData: unknown;
   try {
@@ -110,9 +100,10 @@ async function calculateChartPreview(parsedData: z.infer<typeof GenerateChartSch
       {
         nesting: parsedData.nesting ?? 1,
         periodKey: parsedData.periodKey,
+        // Simplified infolevel for faster chart-only generation (without RAG/AI chat)
         infolevel:
           parsedData.infolevel ??
-          'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
+            'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
         varga: parsedData.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
         ayanamsha: parsedData.ayanamsha,
         dstHour: parsedData.dst_hour ?? 0,
@@ -134,6 +125,7 @@ async function calculateChartPreview(parsedData: z.infer<typeof GenerateChartSch
 }
 
 async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeof GenerateChartSchema>) {
+  const startTime = Date.now();
   const profileId =
     parsedData.profileId ??
     `p_${stableHash(
@@ -150,10 +142,18 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
       })
     ).slice(0, 12)}`;
 
+  console.log('[generateAndIngestChart] Starting for profileId:', profileId, 'ingest flag:', parsedData.ingest);
+  
+  const chartStart = Date.now();
   const { rawChartData, chartSnapshot, chartSchema } = await calculateChartPreview(parsedData);
+  console.log('[generateAndIngestChart] calculateChartPreview took:', Date.now() - chartStart, 'ms');
 
   let ingestion;
   let ingestionError: string | undefined;
+  
+// Always save chart to DB for saved charts list, but skip embeddings for faster generation
+  const shouldSkipEmbeddings = parsedData.ingest === false;
+  
   try {
     ingestion = await ingestChartPayloadForProfile({
       ownerId,
@@ -174,7 +174,11 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
       payload: rawChartData,
       endpoint: 'calculate',
       tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
+      skipEmbeddings: shouldSkipEmbeddings,
     });
+    if (shouldSkipEmbeddings) {
+      console.log('[generateAndIngestChart] Skipped embeddings for profileId:', profileId);
+    }
   } catch (error) {
     ingestionError = `Failed to persist chart payload to Postgres: ${String(error)}`;
     console.error('[chart/generate] non-fatal ingestion failure', {
@@ -300,51 +304,9 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
       quotaStatus = consumed.status;
     }
 
-    const runAsync = shouldRunAsync((req.query as Record<string, unknown>)?.async ?? (req.body as Record<string, unknown>)?.async);
-
-    if (runAsync) {
-      const chartJobs = getChartJobsRepository();
-      const now = Date.now();
-      const profileIdHint = parsed.data.profileId ?? 'pending';
-      const jobId = `job_${stableHash(JSON.stringify({ ownerId: req.user!.uid, profileIdHint, now, request: parsed.data })).slice(0, 16)}`;
-
-      const initialJob: ChartJobDocument = {
-        ownerId: req.user!.uid,
-        profileId: profileIdHint,
-        status: 'queued',
-        request: parsed.data as unknown as Record<string, unknown>,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      await chartJobs.create(req.user!.uid, jobId, initialJob);
-
-      setImmediate(async () => {
-        try {
-          await chartJobs.patch(req.user!.uid, jobId, { status: 'running', updatedAt: Date.now() });
-          const result = await generateAndIngestChart(req.user!.uid, parsed.data);
-          await chartJobs.patch(req.user!.uid, jobId, {
-            status: 'completed',
-            profileId: result.profileId,
-            result,
-            updatedAt: Date.now(),
-          });
-        } catch (error) {
-          await chartJobs.patch(req.user!.uid, jobId, {
-            status: 'failed',
-            error: String(error),
-            updatedAt: Date.now(),
-          });
-        }
-      });
-
-      return res.status(202).json({
-        ok: true,
-        async: true,
-        jobId,
-        status: 'queued',
-        quotaStatus,
-      });
+    const queryIngest = (req.query as Record<string, unknown>)?.ingest;
+    if (queryIngest === 'false' || queryIngest === false) {
+      parsed.data.ingest = false;
     }
 
     const result = await generateAndIngestChart(req.user!.uid, parsed.data);
@@ -367,28 +329,6 @@ router.get('/api/compatibility', async (req, res) => {
     return res.json(result);
   } catch (error) {
     return res.status(500).json({ error: 'Failed to calculate compatibility', details: String(error) });
-  }
-});
-
-router.get('/v1/chart/jobs/:jobId', requireFirebaseAuth, async (req, res) => {
-  try {
-    const jobId = String(req.params.jobId ?? '').trim();
-    if (!jobId) {
-      return res.status(400).json({ error: 'Missing jobId path parameter' });
-    }
-
-    const chartJobs = getChartJobsRepository();
-    const doc = await chartJobs.get(req.user!.uid, jobId);
-    if (!doc) {
-      return res.status(404).json({ error: 'Chart job not found' });
-    }
-
-    return res.json({
-      jobId,
-      ...doc.data,
-    });
-  } catch (error) {
-    return res.status(500).json({ error: 'Failed to load chart job', details: String(error) });
   }
 });
 
