@@ -128,17 +128,25 @@ Return ONLY valid JSON.`;
   });
 
   const parsed = parseJsonSafely(result.text);
+  
+  // Default to pipeline for chart-related questions, not smalltalk
+  const isChartRelated = /chart|d9|d1|d7|d10| astrology|kundli|planet|house|sign| nakshatra|dasha|transit|arudha/i.test(question);
+  
   if (!parsed) {
+    // If LLM fails to return valid JSON, still try to route based on question content
     return {
-      route: 'smalltalk',
-      routeConfidence: 0.5,
-      answer: result.text,
-      finalAnswer: result.text,
+      route: isChartRelated ? 'pipeline' : 'smalltalk',
+      routeConfidence: 0.3,
+      intent: isChartRelated ? { primary: 'general', flags: [], domains: [], isFollowUp: false } : null,
+      dataPlan: isChartRelated ? { varga: ['D1'], infolevel: ['basic'], needsTransit: false, nesting: 1 } : null,
+      answer: isChartRelated ? null : result.text,
+      finalAnswer: isChartRelated ? null : result.text,
     };
   }
 
   const update: Partial<AgentStateType> = {
-    route: parsed.route || 'smalltalk',
+    // If LLM says smalltalk but question is chart-related, override to pipeline
+    route: (parsed.route === 'smalltalk' && isChartRelated) ? 'pipeline' : (parsed.route || (isChartRelated ? 'pipeline' : 'smalltalk')),
     routeConfidence: parsed.confidence || 0.5,
     decisionTelemetry: [
       ...(state.decisionTelemetry || []),
@@ -150,6 +158,13 @@ Return ONLY valid JSON.`;
   if (parsed.dataPlan) update.dataPlan = parsed.dataPlan;
   if (parsed.toolGroups) update.toolGroups = parsed.toolGroups;
   if (parsed.clarificationQuestion) update.clarificationQuestion = parsed.clarificationQuestion;
+
+  // If we overrode to pipeline, ensure intent and dataPlan are set
+  if (isChartRelated && update.route === 'pipeline' && !update.intent) {
+    update.intent = { primary: 'general', flags: [], domains: [], isFollowUp: false };
+    update.dataPlan = { varga: ['D1'], infolevel: ['basic'], needsTransit: false, nesting: 1 };
+    update.toolGroups = [];
+  }
 
   return update;
 }
