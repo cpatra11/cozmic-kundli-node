@@ -192,16 +192,13 @@ router.get('/v1/kundalis/:kundaliId/dasha', requireFirebaseAuth, async (req, res
       return res.status(422).json({ error: 'Kundli input snapshot unavailable for this profile' });
     }
 
-    // Request chart data with focus on dasha
+    // Dasha: request with full nesting when user opens dasha tab
     const calculated = await fetchBe1Calculate(input, {
       nesting,
-      varga: 'D1,D7,D9,D10',
+      varga: 'D1,D9',
       infolevel: 'basic,dasha,yogas',
       ...(periodKey ? { periodKey } : {}),
     });
-    // IMPORTANT: Do NOT run on-demand dasha through buildChartSnapshot here.
-    // Snapshot normalization intentionally strips nested dasha periods for storage,
-    // but this endpoint must return deep periods for frontend drill-down.
     const dasha = (calculated as any)?.chart?.dasha;
 
     if (!dasha || typeof dasha !== 'object') {
