@@ -447,12 +447,13 @@ export async function runKundliAgentV2(
   }
 
   try {
+    // Always include the user's message - the messages channel reducer will append it to any conversation history
     const config = input.sessionId
       ? { configurable: { thread_id: input.sessionId } }
       : {};
 
     const initialState: any = {
-      messages: input.sessionId ? [] : [{ role: 'user', content: input.message }],
+      messages: [{ role: 'user', content: input.message }],
       ownerId: input.ownerId || 'anonymous',
       profileId: input.profileId || null,
       mode: input.mode || 'mini',
