@@ -54,17 +54,10 @@ function getLastHumanMessage(messages: any[]): string {
     const directContent = msg.content;
     const kwargContent = msg.kwargs?.content;
     
-    // LangChain message type after rehydration: check type, lc, id fields
-    // Original: type="constructor", id=["langchain_core","messages","HumanMessage"]
-    // After rehydrated: id becomes UUID, but type is still "constructor"
-    const lcType = msg.type; // Should be "constructor"
-    const lcCategory = msg.lc?.category; // serialization category
-    
-    // For HumanMessage: type is "constructor", need to check category or additional kwargs
-    const isHumanMessage = lcType === 'constructor' && (!lcCategory || lcCategory === 'message');
-    const isAIMessage = msg.type === 'constructor'; // similar check for AI
-    
-    console.log('[getLastHumanMessage] msg.type:', msg.type, 'lc:', msg.lc);
+    // LangChain uses msg.type: "human" | "ai" for message roles
+    const msgType = msg.type;
+    const isHumanMessage = msgType === 'human' || msgType === 'human';
+    const isAIMessage = msgType === 'ai' || msgType === 'ai';
     
     const role = directRole || kwargRole || (isHumanMessage ? 'user' : isAIMessage ? 'assistant' : undefined);
     const content = directContent || kwargContent;
