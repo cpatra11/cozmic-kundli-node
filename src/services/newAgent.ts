@@ -473,29 +473,32 @@ export async function runKundliAgentV2(
 ): Promise<{ answer: string; model?: string }> {
   if (!compiledGraph) {
     const graph = buildGraph();
-    const checkpointer = await getCheckpointer();
-    const pool = getPostgresPool();
-    const cache = pool ? new PostgresCache(pool) : undefined;
+    // Skip checkpointer for now - causes message serialization issues
+    // const checkpointer = await getCheckpointer();
+    const pgPool = getPostgresPool();
+    const cache = pgPool ? new PostgresCache(pgPool) : undefined;
 
     compiledGraph = graph.compile({
-      ...(checkpointer ? { checkpointer } : {}),
+      // ...(checkpointer ? { checkpointer } : {}),
       ...(cache ? { cache } : {}),
     });
+
+    // Preload graph so subsequent calls don't recompile
+    // This also ensures the graph is ready before any state issues
+  }
+
+  // Skip thread_id config to avoid checkpointer loading old state
+  const config = {};
+
+  // Validate input
+  if (!input.message?.trim()) {
+    return {
+      answer: 'Please provide a message to chat about your chart.',
+      model: 'cozmic-agent-v2',
+    };
   }
 
   try {
-    // Validate input
-    if (!input.message?.trim()) {
-      return {
-        answer: 'Please provide a message to chat about your chart.',
-        model: 'cozmic-agent-v2',
-      };
-    }
-
-    const config = input.sessionId
-      ? { configurable: { thread_id: input.sessionId } }
-      : {};
-
     // Explicitly format messages as ContentBlocks to prevent checkpointer issues
     const initialState: any = {
       messages: [{ role: 'user', content: [{ type: 'text', text: input.message }] }],
