@@ -348,6 +348,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       mode: requestedMode,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
+      sessionId: sessionId,
     });
 
     const assistantMessage: ChatMessageDoc = {
@@ -473,6 +474,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       mode: requestedMode,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
+      sessionId: sessionId,
     });
 
     const assistantMessage: ChatMessageDoc = {

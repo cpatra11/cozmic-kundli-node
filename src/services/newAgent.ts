@@ -1,14 +1,16 @@
-import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
+import { Annotation, END, START, StateGraph, MessagesAnnotation } from '@langchain/langgraph';
 import type { KundliSnapshotInput } from './be1Client.js';
 import { fetchBe1Calculate, fetchBe1Transit } from './be1Client.js';
-import { buildGroundingCacheKey } from './cacheKey.js';
+import { buildGroundingCacheKey, getTimeBucketForIntent } from './cacheKey.js';
 import { invokeDeepSeekBedrock } from './deepseekBedrock.js';
 import { getPostgresPool } from './postgresClient.js';
 import { PostgresCache } from './postgresCache.js';
+import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
 
 // -- State definition --
 const AgentState = Annotation.Root({
-  messages: Annotation<any[]>,
+  ...MessagesAnnotation.spec,
+
   ownerId: Annotation<string>,
   profileId: Annotation<string | null>,
   mode: Annotation<'mini' | 'pro'>,
@@ -24,7 +26,7 @@ const AgentState = Annotation.Root({
   atlas: Annotation<any[]>,
   toolFindings: Annotation<any[]>,
 
-  priorClaims: Annotation<any[]>,
+  priorClaims: Annotation<string[]>,
 
   answerTemplate: Annotation<string | null>,
   answer: Annotation<string | null>,
@@ -60,9 +62,21 @@ function parseJsonSafely(text: string): any {
   }
 }
 
+function extractClaims(text: string): string[] {
+  const claims: string[] = [];
+  const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 10);
+  for (const sentence of sentences) {
+    if (/will|is|are|has|have|shows|indicates|suggests/i.test(sentence)) {
+      claims.push(sentence.trim());
+    }
+  }
+  return claims.slice(0, 10);
+}
+
 // -- Node 1: route_and_plan --
 async function routeAndPlan(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
+  const priorContext = (state.priorClaims || []).slice(-5).join(' ');
 
   const systemPrompt = `You are the routing and planning engine for a Vedic astrology assistant called Cozmic.
 
@@ -80,6 +94,9 @@ ROUTING RULES:
 - smalltalk: Greetings, thanks, farewells, casual chat
 - general_astro: Concept questions ("What is D9?"), capabilities, "who are you"
 - clarify: Ambiguous — needs follow-up (use sparingly)
+
+PRIOR CLAIMS (be consistent with these):
+${priorContext}
 
 INTENT FLAGS: marriage, career, health, finance, timing, transit, dasha, forecast, education, children, property, travel, spirituality, longevity, remedies
 
@@ -174,6 +191,7 @@ async function sendClarification(state: AgentStateType): Promise<Partial<AgentSt
 async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const kundli = state.kundliInput;
   const dataPlan = state.dataPlan;
+  const intent = state.intent;
 
   if (!kundli || !dataPlan) {
     return {
@@ -196,8 +214,14 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
       rawPayload = { ...rawPayload, transit: (transitResponse as any).transit };
     }
 
+    const cacheKey = buildGroundingCacheKey({
+      profileId: state.profileId,
+      intent: intent,
+      dataPlan: dataPlan,
+    } as any);
+
     return {
-      grounding: { rawPayload },
+      grounding: { rawPayload, cacheKey },
       atlas: [],
     };
   } catch (error) {
@@ -212,27 +236,77 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
 async function gatherData(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const toolGroups = state.toolGroups || [];
   const rawPayload = state.grounding?.rawPayload;
+  const intent = state.intent;
 
   if (toolGroups.length === 0 || !rawPayload) {
     return { toolFindings: [] };
   }
 
-  const findings = toolGroups.map((group: string) => ({
-    name: group,
-    status: 'ok',
-    facts: [],
-    evidencePaths: [],
-  }));
+  const findings: any[] = [];
+
+  for (const group of toolGroups) {
+    try {
+      const finding = await analyzeToolGroup(group, rawPayload, intent);
+      findings.push(finding);
+    } catch (error) {
+      findings.push({
+        name: group,
+        status: 'error',
+        facts: [`Failed to analyze: ${String(error)}`],
+        evidencePaths: [],
+      });
+    }
+  }
 
   return { toolFindings: findings };
+}
+
+async function analyzeToolGroup(group: string, rawPayload: any, intent: any): Promise<any> {
+  const systemPrompt = `You are a Vedic astrology data analyzer.
+
+Analyze the chart data for the tool group: "${group}"
+
+Return a JSON object with:
+- "status": "ok" | "partial" | "insufficient_data"
+- "facts": string[] (3-7 key facts from the data)
+- "evidencePaths": string[] (JSON paths to supporting data)
+
+Focus on: ${intent?.flags?.join(', ') || 'general analysis'}
+
+Chart data preview: ${JSON.stringify(rawPayload).slice(0, 2000)}`;
+
+  const result = await invokeDeepSeekBedrock({
+    systemPrompt,
+    userPrompt: `Analyze ${group} based on the chart data.`,
+    maxTokens: 1024,
+  });
+
+  const parsed = parseJsonSafely(result.text);
+  if (!parsed) {
+    return {
+      name: group,
+      status: 'partial',
+      facts: [result.text.slice(0, 200)],
+      evidencePaths: [],
+    };
+  }
+
+  return {
+    name: group,
+    status: parsed.status || 'ok',
+    facts: parsed.facts || [],
+    evidencePaths: parsed.evidencePaths || [],
+  };
 }
 
 // -- Node 6: generate_answer --
 async function generateAnswer(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
   const toolFindings = state.toolFindings || [];
+  const priorClaims = state.priorClaims || [];
 
   const context = toolFindings.map((f: any) => `${f.name}: ${f.facts?.join(', ') || 'N/A'}`).join('\n');
+  const priorContext = priorClaims.slice(-5).join('\n');
 
   const systemPrompt = `You are an expert Vedic astrologer. Answer the user's question based on the chart data.
 
@@ -245,6 +319,9 @@ RULES:
 - NEVER suggest consulting a professional astrologer
 - Be consistent with prior conversation — do not contradict previous answers
 - End with actionable insight or forward-looking guidance
+
+PRIOR CLAIMS (be consistent with these):
+${priorContext}
 
 CONTEXT:
 ${context}`;
@@ -265,6 +342,7 @@ ${context}`;
 async function finalize(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const answer = state.answer || '';
   const question = getLastHumanMessage(state.messages || []);
+  const priorClaims = state.priorClaims || [];
 
   const systemPrompt = `Review the answer and ensure quality:
 1. Does it address the user's question?
@@ -276,7 +354,8 @@ Return a JSON object with:
 - "finalAnswer": string (the final answer, possibly refined)
 - "shouldCondense": boolean
 - "condensedAnswer": string (only if shouldCondense is true)
-- "qualityFlags": { "addressesQuestion": boolean, "noMissingDataLanguage": boolean, "hasForwardGuidance": boolean, "consistentWithPrior": boolean }`;
+- "qualityFlags": { "addressesQuestion": boolean, "noMissingDataLanguage": boolean, "hasForwardGuidance": boolean, "consistentWithPrior": boolean }
+- "extractedClaims": string[] (key claims made in the answer for future reference)`;
 
   const result = await invokeDeepSeekBedrock({
     systemPrompt,
@@ -286,8 +365,13 @@ Return a JSON object with:
 
   const parsed = parseJsonSafely(result.text);
   if (!parsed) {
-    return { finalAnswer: answer };
+    return {
+      finalAnswer: answer,
+      priorClaims: [...priorClaims, ...extractClaims(answer)],
+    };
   }
+
+  const newClaims = extractClaims(parsed.finalAnswer || answer);
 
   return {
     finalAnswer: parsed.shouldCondense && parsed.condensedAnswer
@@ -296,32 +380,49 @@ Return a JSON object with:
     shouldCondense: parsed.shouldCondense || false,
     condensedAnswer: parsed.condensedAnswer || null,
     qualityFlags: parsed.qualityFlags || null,
+    priorClaims: [...priorClaims, ...newClaims],
   };
 }
 
 // -- Build Graph --
-const graph = new StateGraph(AgentState)
-  .addNode('route_and_plan', routeAndPlan)
-  .addNode('fast_answer', fastAnswer)
-  .addNode('send_clarification', sendClarification)
-  .addNode('load_grounding', loadGrounding)
-  .addNode('gather_data', gatherData)
-  .addNode('generate_answer', generateAnswer)
-  .addNode('finalize', finalize)
-  .addEdge(START, 'route_and_plan')
-  .addConditionalEdges('route_and_plan', routeAfterPlan, {
-    fast_answer: 'fast_answer',
-    send_clarification: 'send_clarification',
-    load_grounding: 'load_grounding',
-  })
-  .addEdge('load_grounding', 'gather_data')
-  .addEdge('gather_data', 'generate_answer')
-  .addEdge('generate_answer', 'finalize')
-  .addEdge('fast_answer', END)
-  .addEdge('send_clarification', END)
-  .addEdge('finalize', END);
+function buildGraph() {
+  const graph = new StateGraph(AgentState)
+    .addNode('route_and_plan', routeAndPlan)
+    .addNode('fast_answer', fastAnswer)
+    .addNode('send_clarification', sendClarification)
+    .addNode('load_grounding', loadGrounding)
+    .addNode('gather_data', gatherData)
+    .addNode('generate_answer', generateAnswer)
+    .addNode('finalize', finalize)
+    .addEdge(START, 'route_and_plan')
+    .addConditionalEdges('route_and_plan', routeAfterPlan, {
+      fast_answer: 'fast_answer',
+      send_clarification: 'send_clarification',
+      load_grounding: 'load_grounding',
+    })
+    .addEdge('load_grounding', 'gather_data')
+    .addEdge('gather_data', 'generate_answer')
+    .addEdge('generate_answer', 'finalize')
+    .addEdge('fast_answer', END)
+    .addEdge('send_clarification', END)
+    .addEdge('finalize', END);
+
+  return graph;
+}
 
 let compiledGraph: any = null;
+let checkpointer: PostgresSaver | null = null;
+
+async function getCheckpointer(): Promise<PostgresSaver | undefined> {
+  if (checkpointer) return checkpointer;
+
+  const pool = getPostgresPool();
+  if (!pool) return undefined;
+
+  checkpointer = new PostgresSaver(pool);
+  await checkpointer.setup();
+  return checkpointer;
+}
 
 export async function runKundliAgentV2(
   input: {
@@ -330,44 +431,35 @@ export async function runKundliAgentV2(
     profileId?: string;
     kundli?: KundliSnapshotInput;
     mode?: 'mini' | 'pro';
+    sessionId?: string;
   }
 ): Promise<{ answer: string; model?: string }> {
   if (!compiledGraph) {
+    const graph = buildGraph();
+    const checkpointer = await getCheckpointer();
     const pool = getPostgresPool();
     const cache = pool ? new PostgresCache(pool) : undefined;
 
     compiledGraph = graph.compile({
+      ...(checkpointer ? { checkpointer } : {}),
       ...(cache ? { cache } : {}),
     });
   }
 
   try {
-    const result = await compiledGraph.invoke({
-      messages: [{ role: 'user', content: input.message }],
+    const config = input.sessionId
+      ? { configurable: { thread_id: input.sessionId } }
+      : {};
+
+    const initialState: any = {
+      messages: input.sessionId ? [] : [{ role: 'user', content: input.message }],
       ownerId: input.ownerId || 'anonymous',
       profileId: input.profileId || null,
       mode: input.mode || 'mini',
       kundliInput: input.kundli || null,
-      route: null,
-      intent: null,
-      dataPlan: null,
-      toolGroups: [],
-      routeConfidence: 0,
-      grounding: null,
-      atlas: [],
-      toolFindings: [],
-      priorClaims: [],
-      answerTemplate: null,
-      answer: null,
-      coverageGaps: [],
-      finalAnswer: null,
-      shouldCondense: null,
-      condensedAnswer: null,
-      qualityFlags: null,
-      clarificationQuestion: null,
-      decisionTelemetry: [],
-      stageReporter: null,
-    });
+    };
+
+    const result = await compiledGraph.invoke(initialState, config);
 
     return {
       answer: result.finalAnswer || result.answer || 'I apologize, but I was unable to generate a response.',

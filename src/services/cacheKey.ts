@@ -8,7 +8,7 @@ function stableHash(input: string): string {
   return Math.abs(hash).toString(36);
 }
 
-function getTimeBucketForIntent(intentPrimary: string): number {
+export function getTimeBucketForIntent(intentPrimary: string): number {
   const now = Date.now();
   switch (intentPrimary) {
     case 'transit':
