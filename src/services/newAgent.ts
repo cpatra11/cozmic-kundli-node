@@ -48,7 +48,15 @@ type AgentStateType = typeof AgentState.State;
 // -- Helpers --
 function getLastHumanMessage(messages: any[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === 'user') return messages[i].content || '';
+    if (messages[i].role === 'user') {
+      const content = messages[i].content;
+      // Handle both string and array content formats
+      if (Array.isArray(content)) {
+        // ContentBlocks format: [{ type: 'text', text: '...' }]
+        return content[0]?.text || '';
+      }
+      return content || '';
+    }
   }
   return '';
 }
@@ -514,9 +522,9 @@ export async function runKundliAgentV2(
   }
 
   try {
-    // Explicitly format messages as ContentBlocks to prevent checkpointer issues
+    // Use simple string format for messages - avoids ContentBlock complexity
     const initialState: any = {
-      messages: [{ role: 'user', content: [{ type: 'text', text: input.message }] }],
+      messages: [{ role: 'user', content: input.message }],
       ownerId: input.ownerId || 'anonymous',
       profileId: input.profileId || null,
       mode: input.mode || 'mini',
