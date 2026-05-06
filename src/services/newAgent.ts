@@ -55,12 +55,17 @@ function getLastHumanMessage(messages: any[]): string {
     const kwargContent = msg.kwargs?.content;
     
     // LangChain encodes role in id array: ["langchain_core","messages","HumanMessage"]
-    const typeId = msg.id || msg.lc?.id;
+    const typeId = msg.id || (msg.lc && msg.lc.id);
     const isHumanMessage = Array.isArray(typeId) && typeId.includes('HumanMessage');
     const isAIMessage = Array.isArray(typeId) && typeId.includes('AIMessage');
     
+    console.log('[getLastHumanMessage] typeId:', typeId, 'isHuman:', isHumanMessage);
+    console.log('[getLastHumanMessage] directContent:', directContent);
+    
     const role = directRole || kwargRole || (isHumanMessage ? 'user' : isAIMessage ? 'assistant' : undefined);
     const content = directContent || kwargContent;
+    
+    console.log('[getLastHumanMessage] resolved role:', role, 'content:', content);
     
     if (role === 'user') {
       if (Array.isArray(content)) {
