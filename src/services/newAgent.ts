@@ -54,12 +54,15 @@ function getLastHumanMessage(messages: any[]): string {
     const directContent = msg.content;
     const kwargContent = msg.kwargs?.content;
     
-    // LangChain encodes type in lc.id: ["langchain_core","messages","HumanMessage"]
-    const lcId = msg.lc?.id;
-    const isHumanMessage = Array.isArray(lcId) && lcId.includes('HumanMessage');
-    const isAIMessage = Array.isArray(lcId) && lcId.includes('AIMessage');
+    // LangChain message: type is in id array at top level or lc.id
+    // Original: "id":["langchain_core","messages","HumanMessage"] 
+    // After parse: might be in different places
+    const typeId = msg.lc?.id || msg.id;
+    const isHumanMessage = Array.isArray(typeId) && typeId.includes('HumanMessage');
+    const isAIMessage = Array.isArray(typeId) && typeId.includes('AIMessage');
     
-    console.log('[getLastHumanMessage] lcId:', lcId, 'isHuman:', isHumanMessage);
+    console.log('[getLastHumanMessage] msg.id:', msg.id, 'msg.lc:', msg.lc);
+    console.log('[getLastHumanMessage] typeId:', typeId, 'isHuman:', isHumanMessage);
     
     const role = directRole || kwargRole || (isHumanMessage ? 'user' : isAIMessage ? 'assistant' : undefined);
     const content = directContent || kwargContent;
