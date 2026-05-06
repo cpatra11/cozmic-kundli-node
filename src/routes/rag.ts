@@ -2,9 +2,9 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { fetchCalculatedChart, fetchTransitChart } from '../services/be1Client.js';
-import { matchCompatibility, parseCompatibilityQuery } from '../services/compatibility.js';
-import { ingestChartPayloadForProfile, ingestKundliForProfile, queryRagChunks } from '../services/ragPipeline.js';
+import { fetchBe1Calculate, fetchTransitChart } from '../services/be1Client.js';
+
+import { ingestKundliForProfile } from '../services/ragPipeline.js';
 import { stableHash } from '../services/hash.js';
 import { buildChartSnapshot, extractChartSchemaInfo } from '../services/chartSnapshot.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
@@ -85,7 +85,7 @@ const TransitChartSchema = z.object({
 async function calculateChartPreview(parsedData: z.infer<typeof GenerateChartSchema>) {
   let chartData: unknown;
   try {
-    chartData = await fetchCalculatedChart(
+    chartData = await fetchBe1Calculate(
       {
         latitude: parsedData.latitude,
         longitude: parsedData.longitude,
@@ -151,36 +151,34 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
   let ingestion;
   let ingestionError: string | undefined;
   
-// Always save chart to DB for saved charts list, but skip embeddings for faster generation
-  const shouldSkipEmbeddings = parsedData.ingest === false;
+  // Simplified: only save birth details to rag_profiles, not full chart
+  const shouldSaveProfile = parsedData.ingest !== false;
   
   try {
-    ingestion = await ingestChartPayloadForProfile({
-      ownerId,
-      profileId,
-      displayName: parsedData.name,
-      place: parsedData.place,
-      kundli: {
-        latitude: parsedData.latitude,
-        longitude: parsedData.longitude,
-        year: parsedData.year,
-        month: parsedData.month,
-        day: parsedData.day,
-        hour: parsedData.hour,
-        min: parsedData.min,
-        sec: parsedData.sec ?? 0,
-        time_zone: parsedData.time_zone,
-      },
-      payload: rawChartData,
-      endpoint: 'calculate',
-      tags: ['chart-generate', 'kundli', 'be1', 'calculate'],
-      skipEmbeddings: shouldSkipEmbeddings,
-    });
-    if (shouldSkipEmbeddings) {
-      console.log('[generateAndIngestChart] Skipped embeddings for profileId:', profileId);
+    if (shouldSaveProfile) {
+      ingestion = await ingestKundliForProfile({
+        ownerId,
+        profileId,
+        displayName: parsedData.name,
+        place: parsedData.place,
+        kundli: {
+          latitude: parsedData.latitude,
+          longitude: parsedData.longitude,
+          year: parsedData.year,
+          month: parsedData.month,
+          day: parsedData.day,
+          hour: parsedData.hour,
+          min: parsedData.min,
+          sec: parsedData.sec ?? 0,
+          time_zone: parsedData.time_zone,
+        },
+      });
+      console.log('[generateAndIngestChart] Saved profile for profileId:', profileId);
+    } else {
+      console.log('[generateAndIngestChart] Skipped profile save for profileId:', profileId);
     }
   } catch (error) {
-    ingestionError = `Failed to persist chart payload to Postgres: ${String(error)}`;
+    ingestionError = `Failed to persist birth details to Postgres: ${String(error)}`;
     console.error('[chart/generate] non-fatal ingestion failure', {
       ownerId,
       profileId,
@@ -247,33 +245,9 @@ router.post('/v1/rag/ingest', requireFirebaseAuth, async (req, res) => {
   }
 });
 
-router.post('/v1/rag/query', requireFirebaseAuth, async (req, res) => {
-  try {
-    const parsed = QuerySchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
-    }
-
-    const chunks = await queryRagChunks({
-      ownerId: req.user!.uid,
-      profileId: parsed.data.profileId,
-      message: parsed.data.message,
-      topK: parsed.data.topK,
-    });
-
-    return res.json({
-      chunks: chunks.map((chunk) => ({
-        id: chunk.id,
-        profileId: chunk.profileId,
-        endpoint: chunk.endpoint,
-        text: chunk.text,
-        similarity: chunk.similarity,
-        sourceDocId: chunk.sourceDocId,
-      })),
-    });
-  } catch (error) {
-    return res.status(500).json({ error: 'Failed to query vectors', details: String(error) });
-  }
+router.post('/v1/rag/query', requireFirebaseAuth, async (_req, res) => {
+  // Vector search disabled - agent uses direct PHP API calls
+  return res.json({ chunks: [] });
 });
 
 router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
@@ -321,15 +295,9 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
   }
 });
 
-router.get('/api/compatibility', async (req, res) => {
-  try {
-    const query = parseCompatibilityQuery(req.query as Record<string, unknown>);
-    const result = await matchCompatibility(query);
-
-    return res.json(result);
-  } catch (error) {
-    return res.status(500).json({ error: 'Failed to calculate compatibility', details: String(error) });
-  }
+router.get('/api/compatibility', (_req, res) => {
+  // Compatibility endpoint disabled - use agent for compatibility questions
+  return res.status(501).json({ error: 'Compatibility endpoint deprecated. Use /v1/rag/agent instead.' });
 });
 
 router.post('/v1/transit-chart', requireFirebaseAuth, async (req, res) => {

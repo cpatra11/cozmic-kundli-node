@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { runKundliAgent } from '../services/kundliAgent.js';
+import { runKundliAgentV2 } from '../services/newAgent.js';
 import { NOVA_SONIC_MODEL_ID, synthesizeVoiceTurn } from '../services/novaSonicSpeech.js';
 
 const router = Router();
@@ -63,13 +63,12 @@ router.post('/v1/voice/turn', requireFirebaseAuth, async (req, res) => {
   }
 
   try {
-    const answer = await runKundliAgent({
+    const answer = await runKundliAgentV2({
       ownerId: req.user!.uid,
       message: parsed.data.message,
       mode: parsed.data.mode ?? 'mini',
       profileId: parsed.data.profileId,
       kundli: parsed.data.kundli,
-      clientTimestamp: parsed.data.clientTimestamp,
     });
 
     const speech = await synthesizeVoiceTurn({
@@ -82,9 +81,6 @@ router.post('/v1/voice/turn', requireFirebaseAuth, async (req, res) => {
     return res.json({
       answer: answer.answer,
       model: answer.model,
-      executionPlan: answer.executionPlan,
-      analysisStages: answer.analysisStages,
-      grounding: answer.grounding,
       voiceModel: speech.model || NOVA_SONIC_MODEL_ID,
       audioBase64: speech.audioBase64,
       audioMimeType: speech.mimeType,

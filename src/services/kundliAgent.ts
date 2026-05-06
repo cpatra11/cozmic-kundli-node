@@ -1,9 +1,8 @@
 import { Annotation, END, START, StateGraph } from '@langchain/langgraph';
-import { fetchCalculatedChart, type KundliSnapshotInput } from './be1Client.js';
+import { fetchBe1Calculate, fetchCalculatedChart, type KundliSnapshotInput } from './be1Client.js';
 import { env } from '../config/env.js';
 import type { RagProfileDocument } from '../models/firestoreModels.js';
 import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
-import { getRagSourcesRepository, type RagApiSourceRecord } from '../repositories/ragSourcesRepository.js';
 import { stableHash } from './hash.js';
 import { invokeDeepSeekBedrock } from './deepseekBedrock.js';
 import { buildChartSnapshot } from './chartSnapshot.js';
@@ -15,6 +14,15 @@ import {
 } from './astrologyTools.js';
 import { cacheGetJson, cacheSetJson } from './valkeyCache.js';
 import { z } from 'zod';
+
+interface RagApiSourceRecord {
+  data: {
+    chartSnapshot?: unknown;
+    rawPayload: unknown;
+    requestKey: string;
+    payloadHash: string;
+  };
+}
 
 export interface AgentAnswerInput {
   ownerId?: string;
@@ -3070,7 +3078,6 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
   }
 
   const ragProfiles = getRagProfilesRepository();
-  const ragSources = getRagSourcesRepository();
 
   const profileCacheKey = buildGroundingProfileCacheKey(state.ownerId, profileId);
   const cachedProfile = await cacheGetJson<GroundingProfileCacheEntry>(profileCacheKey);
@@ -3113,11 +3120,39 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
     throw new Error(`No canonical profile snapshot found for ${profileId}. Regenerate the Kundli first.`);
   }
 
-  const sourceCacheKey = buildGroundingSourceCacheKey(profileDoc.latestSourceDocId);
-  const cachedSource = await cacheGetJson<GroundingSourceCacheEntry>(sourceCacheKey);
-  const sourceDoc = cachedSource?.record ?? await ragSources.getById(profileDoc.latestSourceDocId);
+  const latestSourceDocId = profileDoc.latestSourceDocId;
+  if (!latestSourceDocId) {
+    if (state.kundliInput) {
+      const rawPayload = {};
+      const toolAvailabilityPreflight = buildToolAvailabilityPreflight(rawPayload, state.mode);
+      return {
+        grounding: {
+          ownerId: state.ownerId,
+          profileId,
+          sourceDocId: 'inline-kundli',
+          chartVersion: 'inline',
+          kundliSignature: `inline_${stableHash(JSON.stringify(state.kundliInput)).slice(0, 10)}`,
+          kundli: state.kundliInput,
+          requestKey: 'inline',
+          payloadHash: 'inline',
+          referenceTimestamp: state.referenceTimestamp ?? Date.now(),
+          referenceTimeSource: state.referenceTimeSource ?? 'server',
+          rawPayload,
+          selectedPaths: [],
+          selectedSections: [],
+        },
+        toolAvailabilityPreflight,
+      };
+    }
+    throw new Error(`No canonical raw payload found for profile ${profileId}. Regenerate the Kundali first.`);
+  }
 
-  if (!cachedSource && sourceDoc) {
+  const sourceCacheKey = buildGroundingSourceCacheKey(latestSourceDocId);
+  const cachedSource = await cacheGetJson<GroundingSourceCacheEntry>(sourceCacheKey);
+
+  let sourceDoc: RagApiSourceRecord | null = cachedSource?.record ?? null;
+
+  if (!cachedSource && !sourceDoc) {
     await cacheSetJson(
       sourceCacheKey,
       { cachedAt: Date.now(), record: sourceDoc },
@@ -3149,7 +3184,7 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
       };
     }
 
-    throw new Error(`No canonical raw payload found for profile ${profileId}. Regenerate the Kundli first.`);
+    throw new Error(`No canonical raw payload found for profile ${profileId}. Regenerate the Kundali first.`);
   }
 
   const rawPayload = normalizeRawPayload(sourceDoc.data.chartSnapshot ?? sourceDoc.data.rawPayload);
@@ -3163,7 +3198,7 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
     grounding: {
       ownerId: state.ownerId,
       profileId,
-      sourceDocId: profileDoc.latestSourceDocId,
+      sourceDocId: profileDoc.latestSourceDocId ?? 'unknown',
       chartVersion: profileDoc.chartVersion,
       kundliSignature: profileDoc.kundliSignature,
       kundli,

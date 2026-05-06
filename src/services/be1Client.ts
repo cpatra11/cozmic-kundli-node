@@ -204,3 +204,74 @@ export async function fetchTransitChart(
     nesting: options?.nesting ?? 4,
   });
 }
+
+export interface Be1CalculateOptions {
+  varga?: string;
+  infolevel?: string;
+  nesting?: number;
+  ayanamsha?: string;
+  nodeType?: 'mean' | 'true';
+  dstHour?: number;
+  dstMin?: number;
+  periodKey?: string;
+}
+
+const DEFAULT_VARGA = 'D1,D9,D10';
+const DEFAULT_INFOLEVEL = 'basic,dasha,yogas';
+
+export async function fetchBe1Calculate(
+  input: KundliSnapshotInput,
+  options: Be1CalculateOptions = {}
+): Promise<unknown> {
+  return fetchBe1Json('calculate', {
+    latitude: input.latitude,
+    longitude: input.longitude,
+    year: input.year,
+    month: input.month,
+    day: input.day,
+    hour: input.hour,
+    min: input.min,
+    sec: input.sec ?? 0,
+    time_zone: input.time_zone,
+    dst_hour: options.dstHour ?? 0,
+    dst_min: options.dstMin ?? 0,
+    nesting: options.nesting ?? 1,
+    ...(options.periodKey ? { period_key: options.periodKey } : {}),
+    infolevel: options.infolevel ?? DEFAULT_INFOLEVEL,
+    varga: options.varga ?? DEFAULT_VARGA,
+    ...(options.ayanamsha ? { ayanamsha: options.ayanamsha } : {}),
+    ...(options.nodeType ? { node_type: options.nodeType } : {}),
+  });
+}
+
+export interface Be1TransitOptions {
+  transitAt?: Date;
+  nesting?: number;
+  ayanamsha?: string;
+}
+
+export async function fetchBe1Transit(
+  input: KundliSnapshotInput,
+  transitAt: Date = new Date(),
+  options?: Be1TransitOptions
+): Promise<unknown> {
+  return postBe1Json('transit-chart', {
+    latitude: input.latitude,
+    longitude: input.longitude,
+    time_zone: input.time_zone,
+    year: input.year,
+    month: input.month,
+    day: input.day,
+    hour: input.hour,
+    min: input.min,
+    sec: input.sec ?? 0,
+    t_year: transitAt.getUTCFullYear(),
+    t_month: transitAt.getUTCMonth() + 1,
+    t_day: transitAt.getUTCDate(),
+    t_hour: transitAt.getUTCHours(),
+    t_min: transitAt.getUTCMinutes(),
+    t_sec: transitAt.getUTCSeconds(),
+    nesting: options?.nesting ?? 4,
+    ...(options?.ayanamsha ? { ayanamsha: options.ayanamsha } : {}),
+  });
+}

@@ -56,7 +56,7 @@ export interface RagProfileDocument {
     sec: number;
     time_zone: string;
   };
-  latestSourceDocId: string;
+  latestSourceDocId?: string;
   sourceCount: number;
   updatedAt: number;
   createdAt: number;

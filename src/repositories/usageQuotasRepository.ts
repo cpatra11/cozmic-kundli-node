@@ -265,6 +265,20 @@ export class UsageQuotasRepository {
       client.release();
     }
   }
+
+  async refundQuota(ownerId: string, quotaType: UsageQuotaType, nowMs = Date.now()): Promise<void> {
+    const pool = await this.withPool();
+    const { yearMonth } = resolveMonthlyWindow(nowMs);
+    const quotaColumn = QUOTA_FIELD_BY_TYPE[quotaType];
+
+    await pool.query(
+      `UPDATE monthly_usage_counters 
+       SET ${quotaColumn} = GREATEST(0, ${quotaColumn} - 1),
+           updated_at = $3
+       WHERE owner_id = $1 AND year_month = $2`,
+      [ownerId, yearMonth, nowMs]
+    );
+  }
 }
 
 let singletonUsageQuotasRepository: UsageQuotasRepository | null = null;

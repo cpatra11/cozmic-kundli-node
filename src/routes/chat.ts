@@ -2,7 +2,7 @@ import { Router, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { runKundliAgent } from '../services/kundliAgent.js';
+import { runKundliAgentV2 } from '../services/newAgent.js';
 import { env } from '../config/env.js';
 import { buildChatMessageEmbedding, queryRelevantSessionMemories } from '../services/chatMemory.js';
 import { getChatRepository } from '../repositories/chatRepository.js';
@@ -342,19 +342,12 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       quotaStatus: accessDecision.quotaStatus,
     });
 
-    const agent = await runKundliAgent({
+    const agent = await runKundliAgentV2({
       ownerId: req.user!.uid,
       message: parsed.data.message,
       mode: requestedMode,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
-      clientTimestamp: parsed.data.clientTimestamp,
-      conversationContext: relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`),
-      onStage: (stage) => {
-        if (!closed) {
-          writeSseEvent(res, 'stage', stage);
-        }
-      },
     });
 
     const assistantMessage: ChatMessageDoc = {
@@ -366,9 +359,6 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       model: agent.model,
       requestId,
       kundaliId: effectiveProfileId,
-      bindingId: agent.grounding?.sourceDocId,
-      bindingChartVersion: agent.grounding?.chartVersion,
-      bindingKundliSignature: agent.grounding?.kundliSignature,
       createdAt: Date.now(),
       ...buildChatMessageEmbedding(agent.answer),
     };
@@ -379,21 +369,14 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       updatedAt: Date.now(),
       lastMessagePreview: parsed.data.message.slice(0, 180),
       kundaliId: effectiveProfileId,
-      chartVersion: agent.grounding?.chartVersion,
     });
 
     writeSseEvent(res, 'done', {
       answer: agent.answer,
       model: agent.model,
       mode: requestedMode,
-      executionPlan: agent.executionPlan,
-      analysisStages: agent.analysisStages,
-      decisionTelemetry: agent.decisionTelemetry,
-      grounding: agent.grounding,
-      memoryContextUsed: relevantMemories,
       sessionId,
       kundaliId: effectiveProfileId,
-      chartVersion: agent.grounding?.chartVersion,
       requestId,
       quotaStatus: accessDecision.quotaStatus,
     });
@@ -484,14 +467,12 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
 
     await chatRepository.createMessage(userMessage);
 
-    const agent = await runKundliAgent({
+    const agent = await runKundliAgentV2({
       ownerId: req.user!.uid,
       message: parsed.data.message,
       mode: requestedMode,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
-      clientTimestamp: parsed.data.clientTimestamp,
-      conversationContext: relevantMemories.map((m) => `${m.role.toUpperCase()}: ${m.text}`),
     });
 
     const assistantMessage: ChatMessageDoc = {
@@ -503,9 +484,6 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       model: agent.model,
       requestId,
       kundaliId: effectiveProfileId,
-      bindingId: agent.grounding?.sourceDocId,
-      bindingChartVersion: agent.grounding?.chartVersion,
-      bindingKundliSignature: agent.grounding?.kundliSignature,
       createdAt: Date.now(),
       ...buildChatMessageEmbedding(agent.answer),
     };
@@ -516,23 +494,15 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       updatedAt: Date.now(),
       lastMessagePreview: parsed.data.message.slice(0, 180),
       kundaliId: effectiveProfileId,
-      chartVersion: agent.grounding?.chartVersion,
     });
 
     return res.json({
       answer: agent.answer,
       model: agent.model,
       mode: requestedMode,
-      executionPlan: agent.executionPlan,
-      analysisStages: agent.analysisStages,
-      decisionTelemetry: agent.decisionTelemetry,
-      grounding: agent.grounding,
-      memoryContextUsed: relevantMemories,
       sessionId,
       kundaliId: effectiveProfileId,
-      chartVersion: agent.grounding?.chartVersion,
       requestId,
-      quotaStatus: accessDecision.quotaStatus,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to process message', details: String(error) });

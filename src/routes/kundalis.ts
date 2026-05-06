@@ -1,21 +1,19 @@
 import { Router } from 'express';
 import { createHash } from 'crypto';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { type RagProfileDocument } from '../models/firestoreModels.js';
-import { getRagChunksRepository } from '../repositories/ragChunksRepository.js';
+import type { RagProfileDocument } from '../models/firestoreModels.js';
 import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
-import { getRagSourcesRepository } from '../repositories/ragSourcesRepository.js';
 import { getChatRepository } from '../repositories/chatRepository.js';
+import { getUsageQuotasRepository } from '../repositories/usageQuotasRepository.js';
 import { buildChartSnapshot } from '../services/chartSnapshot.js';
-import { fetchCalculatedChart } from '../services/be1Client.js';
+import { fetchBe1Calculate } from '../services/be1Client.js';
 import { getPostgresPool } from '../services/postgresClient.js';
 import { applyPendingMigrations } from '../services/postgresMigrations.js';
 import { cacheDelete, cacheGetJson, cacheSetJson } from '../services/valkeyCache.js';
 
 const router = Router();
 const ragProfiles = getRagProfilesRepository();
-const ragSources = getRagSourcesRepository();
-const ragChunks = getRagChunksRepository();
+const usageQuotas = getUsageQuotasRepository();
 
 const KUNDALI_CACHE_TTL_MS = 20_000;
 
@@ -28,12 +26,9 @@ function buildKundaliEtag(
   ownerId: string,
   kundaliId: string,
   chartVersion: unknown,
-  updatedAt: unknown,
-  latestSourceDocId: unknown
+  updatedAt: unknown
 ): string {
-  const payload = `${ownerId}:${kundaliId}:${String(chartVersion ?? '')}:${String(updatedAt ?? '')}:${String(
-    latestSourceDocId ?? ''
-  )}`;
+  const payload = `${ownerId}:${kundaliId}:${String(chartVersion ?? '')}:${String(updatedAt ?? '')}`;
   const digest = createHash('sha1').update(payload).digest('hex');
   return `W/"${digest}"`;
 }
@@ -117,11 +112,13 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
       return res.status(404).json({ error: 'Kundali not found' });
     }
 
-    const sourceDoc = await ragSources.getById(profileDoc.latestSourceDocId);
+    const input = profileDoc.kundliInput;
+    if (!input) {
+      return res.status(422).json({ error: 'Kundli input snapshot unavailable for this profile' });
+    }
 
-    const rawPayload = buildChartSnapshot(sourceDoc?.data.rawPayload);
-    const baseSnapshot = sourceDoc?.data.chartSnapshot ?? rawPayload;
-    const chartData = buildChartSnapshot(baseSnapshot);
+    const calculated = await fetchBe1Calculate(input);
+    const chartData = buildChartSnapshot(calculated);
 
     const responseBody = {
       kundali: {
@@ -132,15 +129,11 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
         displayName: profileDoc.displayName ?? profileDoc.profileId,
         place: profileDoc.place,
         chartData,
-        rawPayload,
-        chartSchemaVersion: sourceDoc?.data.chartSchemaVersion,
-        dashaDepth: sourceDoc?.data.dashaDepth,
-        dashaPeriodKey: sourceDoc?.data.dashaPeriodKey,
+        rawPayload: calculated,
         createdAt: profileDoc.createdAt,
         updatedAt: profileDoc.updatedAt,
         kundliInput: profileDoc.kundliInput,
         chartVersion: profileDoc.chartVersion,
-        latestSourceDocId: profileDoc.latestSourceDocId,
       },
     };
 
@@ -148,8 +141,7 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
       ownerId,
       profileDoc.profileId,
       profileDoc.chartVersion,
-      profileDoc.updatedAt,
-      profileDoc.latestSourceDocId
+      profileDoc.updatedAt
     );
 
     const ifNoneMatch = getIfNoneMatchHeader(req.headers['if-none-match']);
@@ -195,7 +187,7 @@ router.get('/v1/kundalis/:kundaliId/dasha', requireFirebaseAuth, async (req, res
       return res.status(422).json({ error: 'Kundli input snapshot unavailable for this profile' });
     }
 
-    const calculated = await fetchCalculatedChart(input, {
+    const calculated = await fetchBe1Calculate(input, {
       nesting,
       ...(periodKey ? { periodKey } : {}),
     });
@@ -243,11 +235,6 @@ router.patch('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =>
       updatedAt,
     });
 
-    await ragSources.patchMetadataForOwnerProfile(req.user!.uid, profileDoc.profileId, {
-      displayName: displayName || undefined,
-      place: place || undefined,
-    });
-
     await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.profileId}`);
 
     return res.json({
@@ -278,8 +265,6 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
     const chatRepository = getChatRepository();
 
     await Promise.all([
-      ragChunks.deleteByOwnerProfile(req.user!.uid, profileDoc.profileId),
-      ragSources.deleteByOwnerProfile(req.user!.uid, profileDoc.profileId),
       ragProfiles.deleteByOwnerAndProfileId(req.user!.uid, profileDoc.profileId),
       chatRepository.deleteSessionsByOwnerKundali(req.user!.uid, profileDoc.profileId),
     ]);
@@ -290,6 +275,8 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
       await pool.query(`DELETE FROM chart_vectors WHERE owner_id = $1 AND kundali_id = $2`, [req.user!.uid, profileDoc.profileId]);
       await pool.query(`DELETE FROM charts WHERE owner_id = $1 AND kundali_id = $2`, [req.user!.uid, profileDoc.profileId]);
     }
+
+    await usageQuotas.refundQuota(req.user!.uid, 'kundli_generate');
 
     await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.profileId}`);
 
