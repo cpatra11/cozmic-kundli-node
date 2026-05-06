@@ -492,13 +492,13 @@ export async function runKundliAgentV2(
       };
     }
 
-    // Always include the user's message - the messages channel reducer will append it to any conversation history
     const config = input.sessionId
       ? { configurable: { thread_id: input.sessionId } }
       : {};
 
+    // Explicitly format messages as ContentBlocks to prevent checkpointer issues
     const initialState: any = {
-      messages: [{ role: 'user', content: input.message }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: input.message }] }],
       ownerId: input.ownerId || 'anonymous',
       profileId: input.profileId || null,
       mode: input.mode || 'mini',
