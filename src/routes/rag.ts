@@ -151,8 +151,9 @@ async function generateAndIngestChart(ownerId: string, parsedData: z.infer<typeo
   let ingestion;
   let ingestionError: string | undefined;
   
-  // Simplified: only save birth details to rag_profiles, not full chart
-  const shouldSaveProfile = parsedData.ingest !== false;
+  // ALWAYS save birth details to rag_profiles (ignore the ingest flag for now)
+  // This ensures users can see their kundalis in the saved list
+  const shouldSaveProfile = true;
   
   try {
     if (shouldSaveProfile) {
