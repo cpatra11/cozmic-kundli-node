@@ -76,6 +76,17 @@ function extractClaims(text: string): string[] {
 // -- Node 1: route_and_plan --
 async function routeAndPlan(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
+  
+  // Handle empty question
+  if (!question?.trim()) {
+    return {
+      route: 'smalltalk',
+      routeConfidence: 0.5,
+      answer: 'Hello! Please share your birth details (date, time, place) or ask me about your chart.',
+      finalAnswer: 'Hello! Please share your birth details (date, time, place) or ask me about your chart.',
+    };
+  }
+  
   const priorContext = (state.priorClaims || []).slice(-5).join(' ');
 
   const systemPrompt = `You are the routing and planning engine for a Vedic astrology assistant called Cozmic.
@@ -160,6 +171,15 @@ function routeAfterPlan(state: AgentStateType) {
 // -- Node 2: fast_answer --
 async function fastAnswer(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
+  
+  // Handle empty question
+  if (!question?.trim()) {
+    return {
+      answer: 'Hello! How can I help you with your chart today?',
+      finalAnswer: 'Hello! How can I help you with your chart today?',
+    };
+  }
+  
   const isSmalltalk = state.route === 'smalltalk';
 
   const systemPrompt = isSmalltalk
@@ -302,6 +322,15 @@ Chart data preview: ${JSON.stringify(rawPayload).slice(0, 2000)}`;
 // -- Node 6: generate_answer --
 async function generateAnswer(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
+  
+  // Handle empty question
+  if (!question?.trim()) {
+    return {
+      answer: 'Hello! Please tell me about your chart question.',
+      answerTemplate: 'general_chart_reading',
+    };
+  }
+  
   const toolFindings = state.toolFindings || [];
   const priorClaims = state.priorClaims || [];
 
@@ -342,6 +371,14 @@ ${context}`;
 async function finalize(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const answer = state.answer || '';
   const question = getLastHumanMessage(state.messages || []);
+  
+  // Skip finalization if no answer
+  if (!answer?.trim()) {
+    return {
+      finalAnswer: state.answer || 'I apologize, but I was unable to generate a response.',
+    };
+  }
+  
   const priorClaims = state.priorClaims || [];
 
   const systemPrompt = `Review the answer and ensure quality:
@@ -447,6 +484,14 @@ export async function runKundliAgentV2(
   }
 
   try {
+    // Validate input
+    if (!input.message?.trim()) {
+      return {
+        answer: 'Please provide a message to chat about your chart.',
+        model: 'cozmic-agent-v2',
+      };
+    }
+
     // Always include the user's message - the messages channel reducer will append it to any conversation history
     const config = input.sessionId
       ? { configurable: { thread_id: input.sessionId } }
