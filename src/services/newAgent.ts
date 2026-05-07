@@ -282,8 +282,10 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
     if (dataPlan.needsTransit) {
       try {
         const transitResponse = await fetchBe1Transit(kundli, new Date(), { nesting: 1 });
-        transitData = (transitResponse as any)?.transit;
-        if (transitData) {
+        // Response has { chart: {...}, transit: {...} - extract just the transit data
+        const transitResponseObj = transitResponse as any;
+        transitData = transitResponseObj.transit || transitResponseObj;
+        if (transitData && transitData.graha) {
           rawPayload = { ...rawPayload, transit: transitData };
         }
       } catch (tErr) {
