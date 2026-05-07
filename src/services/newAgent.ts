@@ -359,30 +359,47 @@ async function analyzeToolGroup(group: string, rawPayload: any, intent: any): Pr
   
   const focusArea = intent?.flags?.join(', ') || 'general analysis';
   
-  let chartDataPreview = JSON.stringify(rawPayload).slice(0, 2500);
+  let natalChart = '';
+  let transitChart = '';
+  
+  if (rawPayload.chart) {
+    natalChart = JSON.stringify(rawPayload.chart, null, 2).slice(0, 1500);
+  }
   
   if (isTransit && transitData) {
-    chartDataPreview = `=== NATAL CHART ===\n${JSON.stringify(rawPayload.chart || rawPayload).slice(0, 1200)}\n\n=== CURRENT TRANSITS ===\n${JSON.stringify(transitData).slice(0, 1200)}`;
+    const tChart = transitData.chart || transitData;
+    transitChart = JSON.stringify(tChart, null, 2).slice(0, 1500);
   }
+
+  const chartDataPreview = isTransit && transitChart
+    ? `=== NATAL CHART ( Birth Chart ) ===\n${natalChart}\n\n=== CURRENT TRANSITS ( Today: ${new Date().toISOString().slice(0,10)} ) ===\n${transitChart}\n\nCompare transit planets to natal houses to determine which house each planet is transiting through.`
+    : natalChart || JSON.stringify(rawPayload, null, 2).slice(0, 2000);
 
   const systemPrompt = `You are a Vedic astrology data analyzer.
 
 Analyze the chart data for the tool group: "${group}"
 
-Return a JSON object with:
-- "status": "ok" | "partial" | "insufficient_data"
-- "facts": string[] (3-7 key facts from the data)
-- "evidencePaths": string[] (JSON paths to supporting data)
+CRITICAL RULES:
+1. NEVER make up planetary positions or house numbers
+2. ALWAYS use exact values from the data provided below
+3. For transit analysis: compare transit.graha positions to natal lagna to determine transit house
+4. Cite specific values (longitude, rashi, house_number) from the data
+
+${isTransit ? 'IMPORTANT: Use TRANSIT CHART data only for current analysis. Transit chart shows planetary positions as of today.' : ''}
 
 Focus on: ${focusArea}
 
-${isTransit ? 'IMPORTANT: Analyze CURRENT TRANSITS (not natal chart). Compare transit positions to natal chart houses to show how transiting planets affect the native.' : ''}
-
-Chart data preview: ${chartDataPreview}`;
+Chart data:
+${chartDataPreview}`;
 
   const userPrompt = isTransit
-    ? `Analyze ${group} - focus on how CURRENT planetary transits (not natal chart) are affecting the native right now. Use the transit data to identify active transit influences.`
-    : `Analyze ${group} based on the chart data.`;
+    ? `Analyze current planetary transits. For each planet, identify:
+1. Its current rashi (1-12)
+2. Which natal house it's transiting through (compare transit longitudes to natal lagna)
+3. The specific longitude in degrees
+
+Use ONLY the TRANSIT CHART data provided above. Do NOT use natal chart for current transits.`
+    : `Analyze ${group} based on the chart data provided. Use exact values, never make up numbers.`;
 
   const result = await invokeDeepSeekBedrock({
     systemPrompt,
