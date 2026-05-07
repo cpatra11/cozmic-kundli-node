@@ -6,6 +6,7 @@ import { invokeDeepSeekBedrock } from './deepseekBedrock.js';
 import { getPostgresPool } from './postgresClient.js';
 import { PostgresCache } from './postgresCache.js';
 import { PostgresSaver } from '@langchain/langgraph-checkpoint-postgres';
+import { logNodeStart, logNodeEnd } from '../utils/debugLog.js';
 
 // -- State definition --
 const AgentState = Annotation.Root({
@@ -56,8 +57,8 @@ function getLastHumanMessage(messages: any[]): string {
     
     // LangChain uses msg.type: "human" | "ai" for message roles
     const msgType = msg.type;
-    const isHumanMessage = msgType === 'human' || msgType === 'human';
-    const isAIMessage = msgType === 'ai' || msgType === 'ai';
+    const isHumanMessage = msgType === 'human';
+    const isAIMessage = msgType === 'ai';
     
     const role = directRole || kwargRole || (isHumanMessage ? 'user' : isAIMessage ? 'assistant' : undefined);
     const content = directContent || kwargContent;
@@ -95,14 +96,11 @@ function extractClaims(text: string): string[] {
 // -- Node 1: route_and_plan --
 async function routeAndPlan(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
-  const fullMessages = JSON.stringify(state.messages);
   
-  console.log('[routeAndPlan] Full messages:', fullMessages);
-  console.log('[routeAndPlan] Question:', question);
+  logNodeStart('route_and_plan', { question, state: { route: state.route, intent: state.intent, dataPlan: state.dataPlan } });
   
   // Handle empty question
   if (!question?.trim()) {
-    console.log('[routeAndPlan] Empty question - returning smalltalk');
     return {
       route: 'smalltalk',
       routeConfidence: 0.5,
@@ -178,6 +176,8 @@ Return ONLY valid JSON.`;
     ],
   };
 
+  logNodeEnd('route_and_plan', { parsedJson: parsed, update });
+
   if (parsed.intent) update.intent = parsed.intent;
   if (parsed.dataPlan) update.dataPlan = parsed.dataPlan;
   if (parsed.toolGroups) update.toolGroups = parsed.toolGroups;
@@ -211,11 +211,15 @@ function routeAfterPlan(state: AgentStateType) {
 async function fastAnswer(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
   
+  logNodeStart('fast_answer', { question, route: state.route });
+  
   // Handle empty question
   if (!question?.trim()) {
+    const answer = 'Hello! How can I help you with your chart today?';
+    logNodeEnd('fast_answer', { answer });
     return {
-      answer: 'Hello! How can I help you with your chart today?',
-      finalAnswer: 'Hello! How can I help you with your chart today?',
+      answer,
+      finalAnswer: answer,
     };
   }
   
@@ -230,6 +234,8 @@ async function fastAnswer(state: AgentStateType): Promise<Partial<AgentStateType
     userPrompt: question,
     maxTokens: 1024,
   });
+
+  logNodeEnd('fast_answer', { answer: result.text });
 
   return {
     answer: result.text,
@@ -252,7 +258,10 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
   const dataPlan = state.dataPlan;
   const intent = state.intent;
 
+  logNodeStart('load_grounding', { kundli, dataPlan, intent });
+
   if (!kundli || !dataPlan) {
+    logNodeEnd('load_grounding', { grounding: null, reason: 'no kundli or dataPlan' });
     return {
       grounding: null,
       toolFindings: [{ name: 'Grounding', status: 'unavailable', facts: ['No birth data available.'] }],
@@ -279,11 +288,14 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
       dataPlan: dataPlan,
     } as any);
 
+    logNodeEnd('load_grounding', { grounding: { cacheKey, varga: dataPlan.varga, infolevel: dataPlan.infolevel } });
+
     return {
       grounding: { rawPayload, cacheKey },
       atlas: [],
     };
   } catch (error) {
+    logNodeEnd('load_grounding', { error: (error as Error).message });
     return {
       grounding: null,
       toolFindings: [{ name: 'Grounding', status: 'error', facts: [(error as Error).message] }],
@@ -297,7 +309,10 @@ async function gatherData(state: AgentStateType): Promise<Partial<AgentStateType
   const rawPayload = state.grounding?.rawPayload;
   const intent = state.intent;
 
+  logNodeStart('gather_data', { toolGroups, intent });
+
   if (toolGroups.length === 0 || !rawPayload) {
+    logNodeEnd('gather_data', { toolFindings: [], reason: 'no toolGroups or rawPayload' });
     return { toolFindings: [] };
   }
 
@@ -316,6 +331,8 @@ async function gatherData(state: AgentStateType): Promise<Partial<AgentStateType
       });
     }
   }
+
+  logNodeEnd('gather_data', { toolFindings: findings });
 
   return { toolFindings: findings };
 }
@@ -362,10 +379,14 @@ Chart data preview: ${JSON.stringify(rawPayload).slice(0, 2000)}`;
 async function generateAnswer(state: AgentStateType): Promise<Partial<AgentStateType>> {
   const question = getLastHumanMessage(state.messages || []);
   
+  logNodeStart('generate_answer', { question, intent: state.intent, dataPlan: state.dataPlan, toolFindings: state.toolFindings });
+  
   // Handle empty question
   if (!question?.trim()) {
+    const answer = 'Hello! Please tell me about your chart question.';
+    logNodeEnd('generate_answer', { answer });
     return {
-      answer: 'Hello! Please tell me about your chart question.',
+      answer,
       answerTemplate: 'general_chart_reading',
     };
   }
@@ -400,6 +421,8 @@ ${context}`;
     maxTokens: 2048,
   });
 
+  logNodeEnd('generate_answer', { answer: result.text, context });
+
   return {
     answer: result.text,
     answerTemplate: 'general_chart_reading',
@@ -411,10 +434,14 @@ async function finalize(state: AgentStateType): Promise<Partial<AgentStateType>>
   const answer = state.answer || '';
   const question = getLastHumanMessage(state.messages || []);
   
+  logNodeStart('finalize', { question, answer, priorClaims: state.priorClaims });
+  
   // Skip finalization if no answer
   if (!answer?.trim()) {
+    const finalAnswer = 'I apologize, but I was unable to generate a response.';
+    logNodeEnd('finalize', { finalAnswer });
     return {
-      finalAnswer: state.answer || 'I apologize, but I was unable to generate a response.',
+      finalAnswer,
     };
   }
   
@@ -441,6 +468,7 @@ Return a JSON object with:
 
   const parsed = parseJsonSafely(result.text);
   if (!parsed) {
+    logNodeEnd('finalize', { finalAnswer: answer, parsedFailed: true });
     return {
       finalAnswer: answer,
       priorClaims: [...priorClaims, ...extractClaims(answer)],
@@ -448,6 +476,8 @@ Return a JSON object with:
   }
 
   const newClaims = extractClaims(parsed.finalAnswer || answer);
+
+  logNodeEnd('finalize', { parsedJson: parsed, finalAnswer: parsed.finalAnswer || answer, newClaims });
 
   return {
     finalAnswer: parsed.shouldCondense && parsed.condensedAnswer

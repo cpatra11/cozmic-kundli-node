@@ -1,5 +1,6 @@
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
 import { env } from '../config/env.js';
+import { logLLMCall } from '../utils/debugLog.js';
 
 let singletonClient: BedrockRuntimeClient | null = null;
 
@@ -35,6 +36,9 @@ export async function invokeDeepSeekBedrock(params: {
   const modelId = resolveDeepSeekModelId();
   const client = getBedrockClient();
 
+  // Log LLM input
+  logLLMCall(params.systemPrompt, params.userPrompt, '');
+
   const response = await client.send(
     new ConverseCommand({
       modelId,
@@ -56,6 +60,9 @@ export async function invokeDeepSeekBedrock(params: {
   if (!text) {
     throw new Error('DeepSeek Bedrock returned an empty response');
   }
+
+  // Log LLM output (append to same entry via logLLMCall - logLLMCall expects to log response separately)
+  logLLMCall('', '', text);
 
   return {
     text,
