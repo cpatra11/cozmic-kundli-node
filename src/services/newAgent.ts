@@ -276,10 +276,12 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
     });
 
     let rawPayload: any = apiResponse;
+    let transitData: any = null;
 
     if (dataPlan.needsTransit) {
       const transitResponse = await fetchBe1Transit(kundli, new Date(), { nesting: 1 });
-      rawPayload = { ...rawPayload, transit: (transitResponse as any).transit };
+      transitData = (transitResponse as any).transit;
+      rawPayload = { ...rawPayload, transit: transitData };
     }
 
     const cacheKey = buildGroundingCacheKey({
@@ -288,7 +290,10 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
       dataPlan: dataPlan,
     } as any);
 
-    logNodeEnd('load_grounding', { grounding: { cacheKey, varga: dataPlan.varga, infolevel: dataPlan.infolevel } });
+    logNodeEnd('load_grounding', { 
+      grounding: { cacheKey, varga: dataPlan.varga, infolevel: dataPlan.infolevel },
+      hasTransitData: !!transitData 
+    });
 
     return {
       grounding: { rawPayload, cacheKey },
@@ -338,6 +343,17 @@ async function gatherData(state: AgentStateType): Promise<Partial<AgentStateType
 }
 
 async function analyzeToolGroup(group: string, rawPayload: any, intent: any): Promise<any> {
+  const isTransit = intent?.flags?.includes('transit') || intent?.primary === 'transit';
+  const transitData = rawPayload.transit;
+  
+  const focusArea = intent?.flags?.join(', ') || 'general analysis';
+  
+  let chartDataPreview = JSON.stringify(rawPayload).slice(0, 2500);
+  
+  if (isTransit && transitData) {
+    chartDataPreview = `=== NATAL CHART ===\n${JSON.stringify(rawPayload.chart || rawPayload).slice(0, 1200)}\n\n=== CURRENT TRANSITS ===\n${JSON.stringify(transitData).slice(0, 1200)}`;
+  }
+
   const systemPrompt = `You are a Vedic astrology data analyzer.
 
 Analyze the chart data for the tool group: "${group}"
@@ -347,13 +363,19 @@ Return a JSON object with:
 - "facts": string[] (3-7 key facts from the data)
 - "evidencePaths": string[] (JSON paths to supporting data)
 
-Focus on: ${intent?.flags?.join(', ') || 'general analysis'}
+Focus on: ${focusArea}
 
-Chart data preview: ${JSON.stringify(rawPayload).slice(0, 2000)}`;
+${isTransit ? 'IMPORTANT: Analyze CURRENT TRANSITS (not natal chart). Compare transit positions to natal chart houses to show how transiting planets affect the native.' : ''}
+
+Chart data preview: ${chartDataPreview}`;
+
+  const userPrompt = isTransit
+    ? `Analyze ${group} - focus on how CURRENT planetary transits (not natal chart) are affecting the native right now. Use the transit data to identify active transit influences.`
+    : `Analyze ${group} based on the chart data.`;
 
   const result = await invokeDeepSeekBedrock({
     systemPrompt,
-    userPrompt: `Analyze ${group} based on the chart data.`,
+    userPrompt,
     maxTokens: 1024,
   });
 
@@ -393,9 +415,18 @@ async function generateAnswer(state: AgentStateType): Promise<Partial<AgentState
   
   const toolFindings = state.toolFindings || [];
   const priorClaims = state.priorClaims || [];
+  const isTransit = state.intent?.primary === 'transit' || state.intent?.flags?.includes('transit');
 
   const context = toolFindings.map((f: any) => `${f.name}: ${f.facts?.join(', ') || 'N/A'}`).join('\n');
   const priorContext = priorClaims.slice(-5).join('\n');
+
+  const transitInstruction = isTransit
+    ? `\n\nIMPORTANT: The user asked about CURRENT TRANSITS. In your answer:
+- Focus on how transiting planets (from transit.graha) are affecting the natal chart houses
+- Compare transit positions to natal chart to show their impact
+- Use the current date (May 2026) for timing - explain what's happening NOW
+- Don't use old transit periods like 2020-2023 - use 2025-2027 instead`
+    : '';
 
   const systemPrompt = `You are an expert Vedic astrologer. Answer the user's question based on the chart data.
 
@@ -407,7 +438,7 @@ RULES:
 - NEVER mention missing data, unavailable tools, or backend limitations
 - NEVER suggest consulting a professional astrologer
 - Be consistent with prior conversation — do not contradict previous answers
-- End with actionable insight or forward-looking guidance
+- End with actionable insight or forward-looking guidance${transitInstruction}
 
 PRIOR CLAIMS (be consistent with these):
 ${priorContext}
