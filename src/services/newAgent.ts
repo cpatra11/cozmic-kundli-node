@@ -277,11 +277,19 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
 
     let rawPayload: any = apiResponse;
     let transitData: any = null;
+    let transitError: string | null = null;
 
     if (dataPlan.needsTransit) {
-      const transitResponse = await fetchBe1Transit(kundli, new Date(), { nesting: 1 });
-      transitData = (transitResponse as any).transit;
-      rawPayload = { ...rawPayload, transit: transitData };
+      try {
+        const transitResponse = await fetchBe1Transit(kundli, new Date(), { nesting: 1 });
+        transitData = (transitResponse as any)?.transit;
+        if (transitData) {
+          rawPayload = { ...rawPayload, transit: transitData };
+        }
+      } catch (tErr) {
+        transitError = String(tErr);
+        console.error('[load_grounding] Transit fetch error:', transitError);
+      }
     }
 
     const cacheKey = buildGroundingCacheKey({
@@ -292,7 +300,8 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
 
     logNodeEnd('load_grounding', { 
       grounding: { cacheKey, varga: dataPlan.varga, infolevel: dataPlan.infolevel },
-      hasTransitData: !!transitData 
+      hasTransitData: !!transitData,
+      transitError 
     });
 
     return {
