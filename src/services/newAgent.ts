@@ -282,10 +282,15 @@ async function loadGrounding(state: AgentStateType): Promise<Partial<AgentStateT
     if (dataPlan.needsTransit) {
       try {
         const transitResponse = await fetchBe1Transit(kundli, new Date(), { nesting: 1 });
-        // Response has { chart: {...}, transit: {...} - extract just the transit data
+        // Response is { chart: {...}, transit: {...} } - extract transit.chart
         const transitResponseObj = transitResponse as any;
-        transitData = transitResponseObj.transit || transitResponseObj;
-        if (transitData && transitData.graha) {
+        const rawTransit = transitResponseObj.transit || transitResponseObj;
+        transitData = rawTransit.chart || rawTransit;
+        
+        console.log('[load_grounding] transitData keys:', transitData ? Object.keys(transitData) : 'null');
+        console.log('[load_grounding] transitData has graha:', !!(transitData?.graha));
+        
+        if (transitData && (transitData.graha || transitData.chart?.graha)) {
           rawPayload = { ...rawPayload, transit: transitData };
         }
       } catch (tErr) {
@@ -355,9 +360,11 @@ async function gatherData(state: AgentStateType): Promise<Partial<AgentStateType
 
 async function analyzeToolGroup(group: string, rawPayload: any, intent: any): Promise<any> {
   const isTransit = intent?.flags?.includes('transit') || intent?.primary === 'transit';
-  const transitData = rawPayload.transit;
   
   const focusArea = intent?.flags?.join(', ') || 'general analysis';
+  
+  console.log('[analyzeToolGroup] rawPayload keys:', Object.keys(rawPayload || {}));
+  console.log('[analyzeToolGroup] has transit data:', !!(rawPayload.transit));
   
   let natalChart = '';
   let transitChart = '';
@@ -366,9 +373,11 @@ async function analyzeToolGroup(group: string, rawPayload: any, intent: any): Pr
     natalChart = JSON.stringify(rawPayload.chart, null, 2).slice(0, 1500);
   }
   
-  if (isTransit && transitData) {
-    const tChart = transitData.chart || transitData;
-    transitChart = JSON.stringify(tChart, null, 2).slice(0, 1500);
+  const rawTransit = rawPayload.transit;
+  const transitGraha = rawTransit?.graha || rawTransit?.chart?.graha;
+  
+  if (isTransit && transitGraha) {
+    transitChart = JSON.stringify(rawTransit, null, 2).slice(0, 1500);
   }
 
   const chartDataPreview = isTransit && transitChart
