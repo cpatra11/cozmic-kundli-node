@@ -68,20 +68,12 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
 
 router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, res) => {
   try {
-    console.log('[billing/sync] Received sync request', {
-      userId: req.user?.uid,
-      body: req.body,
-    });
-    
     const parsed = BillingSyncSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
-      console.log('[billing/sync] Validation failed', parsed.error.flatten());
       return res.status(400).json({ error: 'Invalid billing sync payload', details: parsed.error.flatten() });
     }
 
-    console.log('[billing/sync] Parsed data', parsed.data);
     const result = await upsertSubscriptionFromSyncPayload(req.user!.uid, parsed.data);
-    console.log('[billing/sync] Upsert result', result);
     return res.json({
       ...result,
       verification: {

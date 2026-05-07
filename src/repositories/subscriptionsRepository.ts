@@ -91,12 +91,6 @@ export class SubscriptionsRepository {
       subscription.isPro !== true;
     
     if (shouldSkipUpdate) {
-      console.log('[subscriptions] Skipping update due to admin_revoke', {
-        ownerId: subscription.ownerId,
-        existingEventType,
-        newEventType: subscription.eventType,
-        iapkitValid: subscription.iapkitValid,
-      });
       return;
     }
 
