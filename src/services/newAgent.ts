@@ -173,6 +173,7 @@ async function executeFetchChartData(
       infolevels,
       nesting,
       formattedData: formatted,
+      rawPayload: apiResponse,
       rawAvailable: true,
     };
   } catch (error) {
@@ -182,7 +183,8 @@ async function executeFetchChartData(
 
 async function executeFetchTransit(
   kundli: KundliSnapshotInput | null,
-  input: Record<string, unknown>
+  input: Record<string, unknown>,
+  chartPayload?: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
   if (!kundli) {
     return { error: 'No birth details available.' };
@@ -210,7 +212,15 @@ async function executeFetchTransit(
       }
     }
 
-    return { snapshots, dates: dateStrings };
+    // Format transit data with natal-lagna-relative house positions
+    let transitText = '';
+    if (chartPayload && Object.keys(snapshots).length > 0) {
+      transitText = formatTransitSnapshots(chartPayload, snapshots);
+      const sadeSati = formatSadeSati(chartPayload, snapshots);
+      if (sadeSati) transitText += '\n' + sadeSati;
+    }
+
+    return { transitText: transitText || 'No transit data available for the requested dates.', dates: dateStrings };
   } catch (error) {
     return { error: `Failed to fetch transit data: ${String(error)}` };
   }
@@ -375,10 +385,11 @@ async function agentNode(state: AgentStateType): Promise<Partial<AgentStateType>
           break;
         }
         case 'fetch_transit': {
-          result = await executeFetchTransit(state.kundliInput, tu.input);
-          const snapshots = result.snapshots as Record<string, Record<string, unknown>> | undefined;
-          if (snapshots) {
-            collectedTransitSnapshots = { ...(collectedTransitSnapshots || {}), ...snapshots };
+          const natalPayload = collectedChartPayload?.rawPayload as Record<string, unknown> | undefined;
+          result = await executeFetchTransit(state.kundliInput, tu.input, natalPayload);
+          const transitText = result.transitText as string | undefined;
+          if (transitText) {
+            collectedTransitSnapshots = collectedTransitSnapshots || {};
           }
           break;
         }
