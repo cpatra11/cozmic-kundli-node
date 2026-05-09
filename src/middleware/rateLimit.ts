@@ -35,21 +35,21 @@ export function expensiveEndpointRateLimit(req: Request, res: Response, next: Ne
   if (!existing || existing.resetAt <= now) {
     expensiveBuckets.set(key, {
       count: 1,
-      resetAt: now + env.RATE_LIMIT_WINDOW_MS,
+      resetAt: now + env.RATE_LIMIT_CONFIG.window_ms,
     });
-    res.setHeader('X-RateLimit-Limit', String(env.RATE_LIMIT_EXPENSIVE_MAX));
-    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, env.RATE_LIMIT_EXPENSIVE_MAX - 1)));
+    res.setHeader('X-RateLimit-Limit', String(env.RATE_LIMIT_CONFIG.expensive_max));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, env.RATE_LIMIT_CONFIG.expensive_max - 1)));
     return next();
   }
 
   existing.count += 1;
   expensiveBuckets.set(key, existing);
 
-  const remaining = Math.max(0, env.RATE_LIMIT_EXPENSIVE_MAX - existing.count);
-  res.setHeader('X-RateLimit-Limit', String(env.RATE_LIMIT_EXPENSIVE_MAX));
+  const remaining = Math.max(0, env.RATE_LIMIT_CONFIG.expensive_max - existing.count);
+  res.setHeader('X-RateLimit-Limit', String(env.RATE_LIMIT_CONFIG.expensive_max));
   res.setHeader('X-RateLimit-Remaining', String(remaining));
 
-  if (existing.count > env.RATE_LIMIT_EXPENSIVE_MAX) {
+  if (existing.count > env.RATE_LIMIT_CONFIG.expensive_max) {
     const retryAfterSec = Math.max(1, Math.ceil((existing.resetAt - now) / 1000));
     res.setHeader('Retry-After', String(retryAfterSec));
     return res.status(429).json({

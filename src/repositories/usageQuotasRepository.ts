@@ -57,18 +57,19 @@ function toSafeLimit(value: number, fallback: number): number {
 }
 
 function getMonthlyQuotaLimits(isPro: boolean): MonthlyQuotaLimits {
+  const quotaConfig = env.QUOTA_CONFIG;
   if (isPro) {
     return {
-      miniChat: toSafeLimit(env.PRO_MONTHLY_MINI_REQUESTS, 50),
-      proChat: toSafeLimit(env.PRO_MONTHLY_PRO_REQUESTS, 50),
-      kundliGenerations: toSafeLimit(env.PRO_MONTHLY_KUNDLI_GENERATIONS, 10),
+      miniChat: toSafeLimit(quotaConfig.pro.mini_requests, 50),
+      proChat: toSafeLimit(quotaConfig.pro.pro_requests, 50),
+      kundliGenerations: toSafeLimit(quotaConfig.pro.kundli_generations, 10),
     };
   }
 
   return {
-    miniChat: toSafeLimit(env.NONPRO_MONTHLY_MINI_REQUESTS, 5),
-    proChat: toSafeLimit(env.NONPRO_MONTHLY_PRO_REQUESTS, 0),
-    kundliGenerations: toSafeLimit(env.NONPRO_MONTHLY_KUNDLI_GENERATIONS, 1),
+    miniChat: toSafeLimit(quotaConfig.nonpro.mini_requests, 5),
+    proChat: toSafeLimit(quotaConfig.nonpro.pro_requests, 0),
+    kundliGenerations: toSafeLimit(quotaConfig.nonpro.kundli_generations, 1),
   };
 }
 
@@ -123,7 +124,7 @@ function buildQuotaStatusSnapshot(args: {
     planTier: args.planTier,
     yearMonth: args.yearMonth,
     resetAtMs: args.resetAtMs,
-    enforcementEnabled: env.QUOTA_ENFORCEMENT_ENABLED,
+    enforcementEnabled: env.QUOTA_CONFIG.enabled,
     miniChat: toBucketStatus(args.row.mini_chat_used, args.limits.miniChat),
     proChat: toBucketStatus(args.row.pro_chat_used, args.limits.proChat),
     kundliGenerations: toBucketStatus(args.row.kundli_generate_used, args.limits.kundliGenerations),

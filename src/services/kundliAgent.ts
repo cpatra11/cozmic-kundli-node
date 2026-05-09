@@ -773,11 +773,11 @@ function buildToolAvailabilityPreflight(rawPayload: unknown, mode: AgentMode): T
 }
 
 function resolveDecisionMode(): LlmDecisionMode {
-  return (env.LLM_DECISION_MODE as LlmDecisionMode) ?? 'hybrid';
+  return (env.LLM_DECISION_CONFIG.mode as LlmDecisionMode) ?? 'hybrid';
 }
 
 function isDecisionNodeEnabled(legacyNodeFlag: boolean): boolean {
-  if (!env.LLM_DECISION_ENABLED) {
+  if (!env.LLM_DECISION_CONFIG.enabled) {
     return false;
   }
 
@@ -1017,7 +1017,7 @@ async function invokeDecisionNode<T extends Record<string, unknown>>(params: {
           model: response.model,
           decision: parsed,
         },
-        Math.max(1, env.AGENT_CACHE_TTL_SECONDS)
+        Math.max(1, env.CACHE_CONFIG.agent_ttl_seconds)
       );
     }
 
@@ -1942,7 +1942,7 @@ async function decideTemporalWindowDetailed(
 ): Promise<{ decision: TemporalWindowDecision; model: string; usedFallback: boolean; latencyMs: number }> {
   const deterministic = buildDeterministicTemporalWindow(message);
 
-  if (!isDecisionNodeEnabled(env.LLM_DECISION_TEMPORAL_ENABLED)) {
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.temporal)) {
     return {
       decision: deterministic,
       model: 'temporal-disabled',
@@ -1977,7 +1977,7 @@ async function decideScopeSelectionDetailed(
 ): Promise<{ decision: ScopeSelectionDecision; model: string; usedFallback: boolean; latencyMs: number }> {
   const deterministic = buildDeterministicScopeSelection(question, applyTemporalToIntent(intent, temporal), mode);
 
-  if (!isDecisionNodeEnabled(env.LLM_DECISION_SCOPE_SELECTOR_ENABLED)) {
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.scope_selector)) {
     return {
       decision: deterministic,
       model: 'scope-disabled',
@@ -2045,9 +2045,9 @@ async function decideUnifiedIntentScopeDetailed(
   referenceTimestamp: number = Date.now()
 ): Promise<{ decision: UnifiedIntentScopeDecision; model: string; usedFallback: boolean; latencyMs: number }> {
   const deterministic = buildDeterministicUnifiedIntentScopeDecision(question, mode);
-  const legacyIntentEnabled = isDecisionNodeEnabled(env.LLM_DECISION_INTENT_ENABLED);
-  const legacyTemporalEnabled = isDecisionNodeEnabled(env.LLM_DECISION_TEMPORAL_ENABLED);
-  const legacyScopeEnabled = isDecisionNodeEnabled(env.LLM_DECISION_SCOPE_SELECTOR_ENABLED);
+  const legacyIntentEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.intent);
+  const legacyTemporalEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.temporal);
+  const legacyScopeEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.scope_selector);
   const unifiedEnabled = legacyIntentEnabled || legacyTemporalEnabled || legacyScopeEnabled;
 
   if (!unifiedEnabled) {
@@ -2109,7 +2109,7 @@ async function decideMiniScopeDetailed(
     confidence: 0.35,
   };
 
-  if (!isDecisionNodeEnabled(env.LLM_DECISION_MINI_SCOPE_ENABLED)) {
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.mini_scope)) {
     return {
       decision: deterministicDecision,
       model: 'mini-scope-disabled',
@@ -2200,7 +2200,7 @@ async function decideFastAnswerIntentDetailed(
 ): Promise<{ decision: FastAnswerIntentDecision; model: string; usedFallback: boolean; latencyMs: number }> {
   const deterministic = deriveDeterministicFastAnswerIntent(message, route);
 
-  if (!isDecisionNodeEnabled(env.LLM_DECISION_FAST_ANSWER_ENABLED)) {
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.fast_answer)) {
     return {
       decision: deterministic,
       model: 'fast-answer-disabled',
@@ -3087,7 +3087,7 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
     await cacheSetJson(
       profileCacheKey,
       { cachedAt: Date.now(), doc: profileDoc },
-      Math.max(1, env.AGENT_CACHE_TTL_SECONDS)
+      Math.max(1, env.CACHE_CONFIG.agent_ttl_seconds)
     );
   }
 
@@ -3156,7 +3156,7 @@ async function loadCanonicalGrounding(state: AgentStateType): Promise<AgentUpdat
     await cacheSetJson(
       sourceCacheKey,
       { cachedAt: Date.now(), record: sourceDoc },
-      Math.max(1, env.AGENT_CACHE_TTL_SECONDS)
+      Math.max(1, env.CACHE_CONFIG.agent_ttl_seconds)
     );
   }
 
@@ -4344,7 +4344,7 @@ async function buildDashaToolFindingCached(input: {
       referenceBucket,
       finding,
     },
-    Math.max(300, Math.floor(Math.max(1, env.TIMING_CACHE_TTL_SECONDS) / 6))
+    Math.max(300, Math.floor(Math.max(1, env.CACHE_CONFIG.timing_ttl_seconds) / 6))
   );
 
   const decorated = cloneToolFinding(finding);
@@ -4478,9 +4478,9 @@ async function classifyIntentNode(state: AgentStateType): Promise<AgentUpdateTyp
     state.referenceTimestamp ?? Date.now()
   );
 
-  const legacyIntentEnabled = isDecisionNodeEnabled(env.LLM_DECISION_INTENT_ENABLED);
-  const legacyTemporalEnabled = isDecisionNodeEnabled(env.LLM_DECISION_TEMPORAL_ENABLED);
-  const legacyScopeEnabled = isDecisionNodeEnabled(env.LLM_DECISION_SCOPE_SELECTOR_ENABLED);
+  const legacyIntentEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.intent);
+  const legacyTemporalEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.temporal);
+  const legacyScopeEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.scope_selector);
 
   const temporalWindow: TemporalWindowDecision = {
     direction: legacyTemporalEnabled ? result.decision.timeDirection : deterministicUnified.timeDirection,
@@ -4544,7 +4544,7 @@ async function classifyIntentNode(state: AgentStateType): Promise<AgentUpdateTyp
       ? 'hybrid'
       : 'deterministic';
 
-  const shadowIntentComparison = env.LLM_DECISION_SHADOW_MODE
+  const shadowIntentComparison = env.LLM_DECISION_CONFIG.shadow_mode
     ? `deterministicPrimary=${deterministicIntentWithTemporal.primary}; llmPrimary=${result.decision.primary}; finalPrimary=${intent.primary}; match=${deterministicIntentWithTemporal.primary === intent.primary}`
     : undefined;
 
@@ -4600,7 +4600,7 @@ async function routeTopLevelNode(state: AgentStateType): Promise<AgentUpdateType
   const result = await decideTopLevelRouteDetailed(state.question, state.mode, state.conversationContext ?? []);
   const decision = result.decision;
   const deterministicRoute = decideTopLevelRouteDeterministic(state.question);
-  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+  const shadowComparison = env.LLM_DECISION_CONFIG.shadow_mode
     ? `deterministic=${deterministicRoute}; llm=${decision.topRoute}; match=${deterministicRoute === decision.topRoute}`
     : undefined;
   return {
@@ -4704,7 +4704,7 @@ async function planExecutionNode(state: AgentStateType): Promise<AgentUpdateType
   const intent = state.intent ?? classifyQuestionIntent(state.question);
   const deterministicPlan = buildDynamicExecutionPlan(state.question, intent, state.mode);
 
-  if (!isDecisionNodeEnabled(env.LLM_DECISION_PLAN_ENABLED)) {
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.plan)) {
     return {
       executionPlan: deterministicPlan,
       decisionTelemetry: appendDecisionTelemetry(state, {
@@ -4797,8 +4797,8 @@ async function planAndToolsNode(state: AgentStateType): Promise<AgentUpdateType>
   const deterministicManifestSafe = deterministicGroups.filter((group) => preflightAvailable.includes(group) && !preflightBlocked.includes(group));
   const deterministicForDecision = deterministicManifestSafe.length > 0 ? deterministicManifestSafe : deterministicGroups;
 
-  const planEnabled = isDecisionNodeEnabled(env.LLM_DECISION_PLAN_ENABLED);
-  const toolEnabled = isDecisionNodeEnabled(env.LLM_DECISION_TOOL_SELECTION_ENABLED);
+  const planEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.plan);
+  const toolEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.tool_selection);
 
   if (!planEnabled && !toolEnabled) {
     return {
@@ -4896,7 +4896,7 @@ async function planAndToolsNode(state: AgentStateType): Promise<AgentUpdateType>
     ? [...new Set([...llmSelectedToolGroups, ...deterministicForDecision])]
     : deterministicForDecision;
 
-  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+  const shadowComparison = env.LLM_DECISION_CONFIG.shadow_mode
     ? `planFamily deterministic=${deterministicPlan.family}; llm=${executionPlan.family}; tools deterministic=${deterministicForDecision.join('|')}; llm=${selectedToolGroups.join('|')}`
     : undefined;
 
@@ -5056,7 +5056,7 @@ async function selectToolGroupsNode(state: AgentStateType): Promise<AgentUpdateT
   const deterministicManifestSafe = deterministicGroups.filter((group) => preflightAvailable.includes(group) && !preflightBlocked.includes(group));
   const deterministicForDecision = deterministicManifestSafe.length > 0 ? deterministicManifestSafe : deterministicGroups;
 
-  if (!isDecisionNodeEnabled(env.LLM_DECISION_TOOL_SELECTION_ENABLED)) {
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.tool_selection)) {
     return {
       selectedToolGroups: deterministicForDecision,
       decisionBundle: mergeDecisionBundle(state, {
@@ -5114,7 +5114,7 @@ async function selectToolGroupsNode(state: AgentStateType): Promise<AgentUpdateT
   const selectedToolGroups = clampToolGroups(result.decision.selectedToolGroups, deterministicForDecision, state.mode)
     .filter((group) => preflightAvailable.includes(group) && !preflightBlocked.includes(group));
   const finalGroups = [...new Set([...selectedToolGroups, ...deterministicForDecision])];
-  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+  const shadowComparison = env.LLM_DECISION_CONFIG.shadow_mode
     ? `deterministic=${deterministicForDecision.join('|')}; llm=${finalGroups.join('|')}; match=${deterministicForDecision.join('|') === finalGroups.join('|')}`
     : undefined;
 
@@ -5427,8 +5427,8 @@ async function evidenceGateNode(state: AgentStateType): Promise<AgentUpdateType>
     factCount: finding.facts.length,
   }));
 
-  const coverageEnabled = isDecisionNodeEnabled(env.LLM_DECISION_COVERAGE_ENABLED);
-  const refinementEnabled = isDecisionNodeEnabled(env.LLM_DECISION_REFINEMENT_ROUTER_ENABLED);
+  const coverageEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.coverage);
+  const refinementEnabled = isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.refinement_router);
   if (!coverageEnabled && !refinementEnabled) {
     return {
       coverageGaps: deterministicGaps,
@@ -5480,7 +5480,7 @@ async function evidenceGateNode(state: AgentStateType): Promise<AgentUpdateType>
   const coverageGaps = clampCoverageGaps(result.decision.gapsIdentified, deterministicGaps);
   const shouldRetry = coverageGaps.length > 0 && result.decision.shouldRetry && iteration < maxIterations;
   const nextAction = shouldRetry && result.decision.nextAction === 'refine_tools' ? 'refine_tools' : 'build_prompt';
-  const shadowComparison = env.LLM_DECISION_SHADOW_MODE
+  const shadowComparison = env.LLM_DECISION_CONFIG.shadow_mode
     ? `deterministic=${deterministicAction}; llm=${nextAction}; match=${deterministicAction === nextAction}`
     : undefined;
 
@@ -6453,7 +6453,7 @@ async function responsePolicyNode(state: AgentStateType): Promise<AgentUpdateTyp
     return raw.length > maxChars || lineCount > maxLines;
   })();
 
-  if (!isDecisionNodeEnabled(env.LLM_DECISION_RESPONSE_POLICY_ENABLED)) {
+  if (!isDecisionNodeEnabled(env.LLM_DECISION_CONFIG.response_policy)) {
     return {
       responseShouldCondense: defaultShouldCondense,
       responsePolicyTone: 'balanced',
@@ -6642,7 +6642,7 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
       confidence: miniScopeResult.decision.confidence,
       usedFallback: miniScopeResult.usedFallback,
       fallbackReason: miniScopeResult.usedFallback ? 'mini scope decision fallback' : undefined,
-      shadowComparison: env.LLM_DECISION_SHADOW_MODE
+      shadowComparison: env.LLM_DECISION_CONFIG.shadow_mode
         ? `deterministicMode=${deterministicMiniScope.enforcementMode}; llmMode=${miniScopeResult.decision.enforcementMode}; deterministicAllowed=${deterministicMiniScope.allowed}; llmAllowed=${miniScopeResult.decision.allowed}`
         : undefined,
     };
@@ -6703,7 +6703,7 @@ export async function runKundliAgent(input: AgentAnswerInput): Promise<AgentAnsw
         confidence: topRouteDecision.confidence,
         usedFallback: topRouteResult.usedFallback,
         fallbackReason: topRouteResult.usedFallback ? 'route preflight fallback' : undefined,
-        shadowComparison: env.LLM_DECISION_SHADOW_MODE
+        shadowComparison: env.LLM_DECISION_CONFIG.shadow_mode
           ? `deterministic=${deterministicTopRoute}; llm=${topLevelRoute}; match=${deterministicTopRoute === topLevelRoute}`
           : undefined,
       },

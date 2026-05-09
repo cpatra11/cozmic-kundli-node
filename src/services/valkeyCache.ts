@@ -11,14 +11,14 @@ let blockedUntil = 0;
 let lastBlockReason = '';
 
 function isValkeyEnabled(): boolean {
-  return Boolean(env.VALKEY_ENABLED && env.REDIS_URL);
+  return Boolean(env.VALKEY_CONFIG.enabled && env.REDIS_URL);
 }
 
 function blockTemporarily(reason: string) {
-  blockedUntil = Date.now() + env.VALKEY_COOLDOWN_MS;
+  blockedUntil = Date.now() + env.VALKEY_CONFIG.cooldown_ms;
   lastBlockReason = reason;
   // eslint-disable-next-line no-console
-  console.warn(`[valkey] disabled for ${env.VALKEY_COOLDOWN_MS}ms: ${reason}`);
+  console.warn(`[valkey] disabled for ${env.VALKEY_CONFIG.cooldown_ms}ms: ${reason}`);
 }
 
 function isBlockedNow(): boolean {

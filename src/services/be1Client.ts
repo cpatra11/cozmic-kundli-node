@@ -33,18 +33,18 @@ export interface KundliSnapshotInput {
 }
 
 function getInternalHeaders(): Record<string, string> {
-  if (!env.BE1_INTERNAL_API_KEY) {
+  if (!env.BE1_CONFIG.internal_api_key) {
     return {};
   }
   return {
-    'X-Internal-Api-Key': env.BE1_INTERNAL_API_KEY,
+    'X-Internal-Api-Key': env.BE1_CONFIG.internal_api_key,
   };
 }
 
 function isBe1CircuitOpen(now = Date.now()): boolean {
   if (be1CircuitOpenedAt <= 0) return false;
   const elapsed = now - be1CircuitOpenedAt;
-  if (elapsed >= env.BE1_CIRCUIT_COOLDOWN_MS) {
+  if (elapsed >= env.BE1_CONFIG.circuit_cooldown_ms) {
     be1CircuitOpenedAt = 0;
     be1FailureCount = 0;
     return false;
@@ -59,18 +59,18 @@ function markBe1Success() {
 
 function markBe1Failure() {
   be1FailureCount += 1;
-  if (be1FailureCount >= env.BE1_CIRCUIT_FAIL_THRESHOLD) {
+  if (be1FailureCount >= env.BE1_CONFIG.circuit_fail_threshold) {
     be1CircuitOpenedAt = Date.now();
   }
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
   if (isBe1CircuitOpen()) {
-    throw new Error(`be1 circuit open; retry after ${env.BE1_CIRCUIT_COOLDOWN_MS}ms cooldown`);
+    throw new Error(`be1 circuit open; retry after ${env.BE1_CONFIG.circuit_cooldown_ms}ms cooldown`);
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), env.BE1_REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), env.BE1_CONFIG.request_timeout_ms);
   try {
     const response = await fetch(url, {
       ...init,
@@ -85,7 +85,7 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
   } catch (error) {
     markBe1Failure();
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`be1 request timed out after ${env.BE1_REQUEST_TIMEOUT_MS}ms`);
+      throw new Error(`be1 request timed out after ${env.BE1_CONFIG.request_timeout_ms}ms`);
     }
     throw error;
   } finally {
@@ -94,7 +94,7 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
 }
 
 function buildBe1Url(path: string, params: URLSearchParams): string {
-  const normalizedBase = env.BE1_BASE_URL.replace(/\/+$/, '');
+  const normalizedBase = env.BE1_CONFIG.base_url.replace(/\/+$/, '');
   const normalizedPath = path.replace(/^\/+/, '');
   return `${normalizedBase}/${normalizedPath}?${params.toString()}`;
 }
@@ -123,7 +123,7 @@ export async function fetchBe1Json(path: string, query: Record<string, string | 
 }
 
 export async function postBe1Json(path: string, body: Record<string, unknown>) {
-  const normalizedBase = env.BE1_BASE_URL.replace(/\/+$/, '');
+  const normalizedBase = env.BE1_CONFIG.base_url.replace(/\/+$/, '');
   const normalizedPath = path.replace(/^\/+/, '');
   const url = `${normalizedBase}/${normalizedPath}`;
   const response = await fetchWithTimeout(url, {

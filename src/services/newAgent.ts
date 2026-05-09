@@ -9,6 +9,11 @@ import { PostgresCache } from './postgresCache.js';
 import { logNodeStart, logNodeEnd, logAgentStart } from '../utils/debugLog.js';
 import type { RelevantChatMemory } from './chatMemory.js';
 
+export interface ChatHistoryMessage {
+  role: 'user' | 'assistant';
+  message: string;
+}
+
 // -- State --
 
 const AgentState = Annotation.Root({
@@ -31,6 +36,10 @@ const AgentState = Annotation.Root({
   shouldRegenerate: Annotation<boolean>,
 
   relevantMemories: Annotation<RelevantChatMemory[]>,
+
+  conversationHistory: Annotation<ChatHistoryMessage[]>,
+  needsContext: Annotation<boolean>,
+  contextMessages: Annotation<ChatHistoryMessage[]>,
 });
 
 type AgentStateType = typeof AgentState.State;
@@ -119,6 +128,101 @@ function routeAfterRoute(state: AgentStateType): string {
   switch (state.topLevelRoute) {
     case 'pipeline': return 'agent';
     default: return 'fast_answer';
+  }
+}
+
+// -- Node: classify_context (determine if follow-up context needed) --
+
+const EXPLICIT_CONTEXT_PATTERNS = [
+  /you (mentioned|said|wrote|talked|stated|indicated|replied|answered)/i,
+  /what did you mean by/i,
+  /tell me more about/i,
+  /earlier you/i,
+  /previously you/i,
+  /as you said/i,
+  /as mentioned/i,
+  /regarding (the|your|that|this)/i,
+  /go deeper into/i,
+  /explain further/i,
+  /elaborate on/i,
+];
+
+const AMBIGUOUS_CONTEXT_PATTERNS = [
+  /^(why|how|what|when|where)\b/i,
+  /^(and\b|but\b|so\b|then\b)/i,
+  /\b(it|that|this|those|these)\b/i,
+  /^(is it|are they|does it|can you|could you|would you)/i,
+];
+
+function isObviousFollowUp(question: string): boolean {
+  return EXPLICIT_CONTEXT_PATTERNS.some(p => p.test(question));
+}
+
+function isPossiblyFollowUp(question: string): boolean {
+  if (question.trim().length < 30) return true;
+  return AMBIGUOUS_CONTEXT_PATTERNS.some(p => p.test(question));
+}
+
+function getLastContextualMessages(
+  history: ChatHistoryMessage[],
+  maxTurns: number
+): ChatHistoryMessage[] {
+  const relevant: ChatHistoryMessage[] = [];
+  for (let i = history.length - 1; i >= 0 && relevant.length < maxTurns * 2; i--) {
+    relevant.unshift(history[i]);
+  }
+  return relevant;
+}
+
+async function classifyContextNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  const question = extractQuestionFromMessages(state.messages || []);
+  const history = state.conversationHistory || [];
+  logNodeStart('classify_context', { question, historyLength: history.length });
+
+  if (!question?.trim() || history.length < 2) {
+    return { needsContext: false, contextMessages: [] };
+  }
+
+  if (isObviousFollowUp(question)) {
+    const contextMessages = getLastContextualMessages(history, 2);
+    logNodeEnd('classify_context', { needsContext: true, reason: 'explicit_pattern', messages: contextMessages.length });
+    return { needsContext: true, contextMessages };
+  }
+
+  if (!isPossiblyFollowUp(question)) {
+    return { needsContext: false, contextMessages: [] };
+  }
+
+  // Ambiguous — use cheap LLM classifier
+  const lastExchange = history.slice(-2).map(m =>
+    `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.message.slice(0, 200)}`
+  ).join('\n');
+
+  try {
+    const result = await invokeDeepSeekBedrock({
+      systemPrompt: `You are a classifier. Determine if the user's new question is a follow-up to the previous conversation or a new standalone question.
+- Return "follow-up" if the question refers to or builds upon something mentioned in the previous exchange.
+- Return "new" if the question is self-contained and does not depend on prior context.
+- Return JSON: {"verdict": "follow-up" | "new"}
+No markdown. JSON only.`,
+      userPrompt: `Previous exchange:\n${lastExchange}\n\nNew question: ${question}`,
+      maxTokens: 128,
+    });
+
+    const parsed = parseJsonSafely(result.text);
+    const needsContext = parsed?.verdict === 'follow-up';
+
+    if (needsContext) {
+      const contextMessages = getLastContextualMessages(history, 2);
+      logNodeEnd('classify_context', { needsContext: true, reason: 'llm_classifier', messages: contextMessages.length });
+      return { needsContext, contextMessages };
+    }
+
+    logNodeEnd('classify_context', { needsContext: false, reason: 'llm_classifier' });
+    return { needsContext: false, contextMessages: [] };
+  } catch {
+    // On error, don't inject context
+    return { needsContext: false, contextMessages: [] };
   }
 }
 
@@ -255,11 +359,6 @@ function buildAgentSystemPrompt(state: AgentStateType, chartDataCached: boolean)
   const hasKundli = !!state.kundliInput;
   const profileNote = state.profileId ? `\nUser has a saved birth chart (profileId: ${state.profileId}).` : '';
 
-  const memoryContext = memories.length > 0
-    ? '\nPREVIOUS CONVERSATION CONTEXT (from this thread, ranked by relevance):\n' +
-      memories.slice(-5).map(m => `[${m.role === 'user' ? 'User' : 'Assistant'}] ${m.text}`).join('\n')
-    : '';
-
   const upgradeNote = state.mode === 'mini'
     ? `\nMini mode: You only have D1 (Rasi) chart data available. If user asks about other D-charts, you MUST NOT invent positions. Base answer on D1 data, suggest upgrading to Pro for full chart access.`
     : '';
@@ -279,7 +378,6 @@ ${profileNote}
 ${dataNote}
 ${upgradeNote}
 ${retryNote}
-${memoryContext}
 
 AVAILABLE TOOLS:
 1. fetch_chart_data — Fetch birth chart data. Parameters: vargas (array of chart IDs), infolevels (array of data types), nesting (1-5 dasha depth). Always include "basic" in infolevels.
@@ -294,6 +392,7 @@ INSTRUCTIONS:
 5. For Mini mode: you may NOT call fetch_chart_data with vargas other than D1. The tool will reject Mini requests for D9+.
 
 CRITICAL RULES:
+- A planet being placed in a house does NOT make it the lord of that house. The house lord is determined by the rashi sign ruling that house cusp. For example, Mercury in the 10th house does NOT make Mercury the 10th lord.
 - NEVER mention missing data, unavailable tools, or backend limitations.
 - NEVER suggest consulting a professional astrologer.
 - NEVER invent or fabricate planetary positions.
@@ -327,9 +426,17 @@ async function agentNode(state: AgentStateType): Promise<Partial<AgentStateType>
   const systemPrompt = buildAgentSystemPrompt(state, !!state.chartData);
   const maxIterations = 10;
 
-  const messages: Array<{ role: string; content: Array<Record<string, unknown>> }> = [
-    { role: 'user', content: [{ text: question }] },
-  ];
+  // Inject conversation context as actual messages for pronoun resolution
+  const messages: Array<{ role: string; content: Array<Record<string, unknown>> }> = [];
+  if (state.needsContext && state.contextMessages?.length) {
+    for (const ctx of state.contextMessages) {
+      messages.push({
+        role: ctx.role === 'assistant' ? 'assistant' : 'user',
+        content: [{ text: ctx.message }],
+      });
+    }
+  }
+  messages.push({ role: 'user', content: [{ text: question }] });
 
   let collectedChartPayload: Record<string, unknown> | null = state.chartData || null;
   let collectedTransitSnapshots: Record<string, Record<string, unknown>> | null = state.transitSnapshots || null;
@@ -534,6 +641,7 @@ CRITICAL RULES:
 function buildGraph() {
   const graph = new StateGraph(AgentState)
     .addNode('route', routeNode)
+    .addNode('classify_context', classifyContextNode)
     .addNode('fast_answer', fastAnswerNode)
     .addNode('agent', agentNode)
     .addNode('finalize', finalizeNode)
@@ -542,8 +650,9 @@ function buildGraph() {
     .addEdge(START, 'route')
     .addConditionalEdges('route', routeAfterRoute, {
       fast_answer: 'fast_answer',
-      agent: 'agent',
+      agent: 'classify_context',
     })
+    .addEdge('classify_context', 'agent')
     .addEdge('fast_answer', END)
     .addEdge('agent', 'finalize')
     .addConditionalEdges('finalize', (state) => {
@@ -568,6 +677,7 @@ export async function runKundliAgentV2(
     mode?: 'mini' | 'pro';
     sessionId?: string;
     relevantMemories?: RelevantChatMemory[];
+    conversationHistory?: ChatHistoryMessage[];
   }
 ): Promise<{ answer: string; model?: string }> {
   if (!compiledGraph) {
@@ -606,6 +716,9 @@ export async function runKundliAgentV2(
       qualityRetryCount: 0,
       topLevelRoute: null,
       relevantMemories: input.relevantMemories || [],
+      conversationHistory: input.conversationHistory || [],
+      needsContext: false,
+      contextMessages: [],
     };
 
     const thread_id = input.sessionId || `anon_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;

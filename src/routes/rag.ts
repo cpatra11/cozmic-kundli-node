@@ -259,7 +259,7 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
     }
 
     let quotaStatus: QuotaStatusSnapshot | undefined;
-    if (env.QUOTA_ENFORCEMENT_ENABLED) {
+    if (env.QUOTA_CONFIG.enabled) {
       const subscriptions = getSubscriptionsRepository();
       const usageQuotas = getUsageQuotasRepository();
       const subscription = await subscriptions.getByOwnerId(req.user!.uid);

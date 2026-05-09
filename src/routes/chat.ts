@@ -88,7 +88,7 @@ async function evaluateChatAccess(ownerId: string, mode: 'mini' | 'pro'): Promis
   const subscription = await subscriptionsRepository.getByOwnerId(ownerId);
   const hasPro = hasActiveProEntitlement(subscription);
 
-  if (!env.QUOTA_ENFORCEMENT_ENABLED) {
+  if (!env.QUOTA_CONFIG.enabled) {
     if (mode === 'pro' && !hasPro) {
       return {
         allowed: false,
@@ -320,6 +320,14 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
           topK: 6,
         });
 
+    const rawHistory = fastMessage
+      ? []
+      : await chatRepository.listSessionMessages(req.user!.uid, sessionId, 10);
+    const conversationHistory = rawHistory.map(m => ({
+      role: m.role as 'user' | 'assistant',
+      message: m.message,
+    }));
+
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
       sessionId,
@@ -350,6 +358,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       kundli: parsed.data.kundli,
       sessionId: sessionId,
       relevantMemories: fastMessage ? undefined : relevantMemories,
+      conversationHistory: fastMessage ? undefined : conversationHistory,
     });
 
     // Send answer to client immediately
@@ -464,6 +473,14 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
           topK: 6,
         });
 
+    const rawHistory = fastMessage
+      ? []
+      : await chatRepository.listSessionMessages(req.user!.uid, sessionId, 10);
+    const conversationHistory = rawHistory.map(m => ({
+      role: m.role as 'user' | 'assistant',
+      message: m.message,
+    }));
+
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
       sessionId,
@@ -486,6 +503,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       kundli: parsed.data.kundli,
       sessionId: sessionId,
       relevantMemories: fastMessage ? undefined : relevantMemories,
+      conversationHistory: fastMessage ? undefined : conversationHistory,
     });
 
     // Send answer to client immediately

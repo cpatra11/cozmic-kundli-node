@@ -356,7 +356,7 @@ function isSameUtcDay(a: Date, b: Date): boolean {
 }
 
 function resolveTransitCacheTtlSeconds(transitAt: Date, referenceTimestamp: number): number {
-  const timingTtl = Math.max(1, env.TIMING_CACHE_TTL_SECONDS);
+  const timingTtl = Math.max(1, env.CACHE_CONFIG.timing_ttl_seconds);
   const referenceDate = new Date(Number.isFinite(referenceTimestamp) ? referenceTimestamp : Date.now());
   if (isSameUtcDay(transitAt, referenceDate)) {
     return Math.max(60, Math.floor(timingTtl / 24));

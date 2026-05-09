@@ -157,8 +157,8 @@ class PostgresStore {
   constructor(databaseUrl: string) {
     this.pool = new Pool({
       connectionString: withPostgresSslOverrides(databaseUrl),
-      query_timeout: env.PG_QUERY_TIMEOUT_MS,
-      connectionTimeoutMillis: env.PG_CONNECTION_TIMEOUT_MS,
+      query_timeout: env.PG_CONFIG.query_timeout_ms,
+      connectionTimeoutMillis: env.PG_CONFIG.connection_timeout_ms,
       idleTimeoutMillis: env.PG_IDLE_TIMEOUT_MS,
       keepAlive: true,
       keepAliveInitialDelayMillis: env.PG_KEEPALIVE_INITIAL_DELAY_MS,
