@@ -119,8 +119,8 @@ router.get('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) => {
 
     // Request full chart data - use same settings as generate endpoint
     const calculated = await fetchBe1Calculate(input, {
-      varga: 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
-      infolevel: 'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
+      varga: 'D1,D2,D3,D4,D6,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
+      infolevel: 'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,arudha',
       nesting: 2,
     });
     const chartData = buildChartSnapshot(calculated);

@@ -18,6 +18,11 @@ ${'='.repeat(60)}\n`;
   fs.appendFileSync(DEBUG_FILE, logEntry);
 }
 
+export function logAgentStart(input: { message: string; mode: string; hasKundli: boolean; sessionId?: string }): void {
+  clearDebugLog();
+  appendDebugLog('AGENT', 'START', JSON.stringify(input, null, 2));
+}
+
 export function logNodeStart(nodeName: string, input: any): void {
   appendDebugLog(nodeName, 'INPUT', typeof input === 'string' ? input : JSON.stringify(input, null, 2));
 }

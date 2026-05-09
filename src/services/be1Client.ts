@@ -3,6 +3,23 @@ import { env } from '../config/env.js';
 let be1FailureCount = 0;
 let be1CircuitOpenedAt = 0;
 
+/**
+ * Convert decimal timezone offset (e.g. '5.5') to ±HH:MM format (e.g. '+05:30').
+ * The BE1 PHP calculator expects offsets like '+05:30', not decimal '5.5'.
+ */
+function toTimezoneOffset(tz: string): string {
+  // Already in ±HH:MM format — return as-is (e.g. '+05:30')
+  if (/^[+-]\d{2}:\d{2}$/.test(tz)) return tz;
+  // Named timezone like 'Asia/Tehran' — pass through
+  const num = parseFloat(tz);
+  if (isNaN(num)) return tz;
+  const sign = num >= 0 ? '+' : '-';
+  const abs = Math.abs(num);
+  const h = Math.floor(abs);
+  const m = Math.round((abs - h) * 60);
+  return `${sign}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
 export interface KundliSnapshotInput {
   latitude: number;
   longitude: number;
@@ -147,14 +164,14 @@ export async function fetchCalculatedChart(input: KundliSnapshotInput, options: 
     hour: input.hour,
     min: input.min,
     sec: input.sec ?? 0,
-    time_zone: input.time_zone,
+    time_zone: toTimezoneOffset(input.time_zone),
     dst_hour: options.dstHour ?? 0,
     dst_min: options.dstMin ?? 0,
     nesting: options.nesting ?? 1,
     ...(options.periodKey ? { period_key: options.periodKey } : {}),
     infolevel:
-      options.infolevel ?? 'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
-    varga: options.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
+      options.infolevel ?? 'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,arudha',
+    varga: options.varga ?? 'D1,D2,D3,D4,D6,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
     ...(options.ayanamsha ? { ayanamsha: options.ayanamsha } : {}),
     ...(options.nodeType ? { node_type: options.nodeType } : {}),
   });
@@ -170,7 +187,7 @@ export async function fetchKundliSnapshot(input: KundliSnapshotInput) {
     hour: input.hour,
     min: input.min,
     sec: input.sec ?? 0,
-    time_zone: input.time_zone,
+    time_zone: toTimezoneOffset(input.time_zone),
     varga: 'D1',
     infolevel: 'basic',
   });
@@ -188,7 +205,7 @@ export async function fetchTransitChart(
   return postBe1Json('transit-chart', {
     latitude: input.latitude,
     longitude: input.longitude,
-    time_zone: input.time_zone,
+    time_zone: toTimezoneOffset(input.time_zone),
     year: input.year,
     month: input.month,
     day: input.day,
@@ -232,7 +249,7 @@ export async function fetchBe1Calculate(
     hour: input.hour,
     min: input.min,
     sec: input.sec ?? 0,
-    time_zone: input.time_zone,
+    time_zone: toTimezoneOffset(input.time_zone),
     dst_hour: options.dstHour ?? 0,
     dst_min: options.dstMin ?? 0,
     nesting: options.nesting ?? 1,
@@ -258,7 +275,7 @@ export async function fetchBe1Transit(
   return postBe1Json('transit-chart', {
     latitude: input.latitude,
     longitude: input.longitude,
-    time_zone: input.time_zone,
+    time_zone: toTimezoneOffset(input.time_zone),
     year: input.year,
     month: input.month,
     day: input.day,

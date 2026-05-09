@@ -103,8 +103,8 @@ async function calculateChartPreview(parsedData: z.infer<typeof GenerateChartSch
         // Simplified infolevel for faster chart-only generation (without RAG/AI chat)
         infolevel:
           parsedData.infolevel ??
-            'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,upagraha,arudha',
-        varga: parsedData.varga ?? 'D1,D2,D3,D4,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
+            'basic,ashtakavarga,grahabala,rashibala,yogas,panchanga,dasha,ayanamsa,arudha',
+        varga: parsedData.varga ?? 'D1,D2,D3,D4,D6,D7,D9,D10,D12,D16,D20,D24,D27,D30,D40,D45,D60',
         ayanamsha: parsedData.ayanamsha,
         dstHour: parsedData.dst_hour ?? 0,
         dstMin: parsedData.dst_min ?? 0,

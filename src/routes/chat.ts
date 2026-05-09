@@ -349,8 +349,22 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
       sessionId: sessionId,
+      relevantMemories: fastMessage ? undefined : relevantMemories,
     });
 
+    // Send answer to client immediately
+    writeSseEvent(res, 'done', {
+      answer: agent.answer,
+      model: agent.model,
+      mode: requestedMode,
+      sessionId,
+      kundaliId: effectiveProfileId,
+      requestId,
+      quotaStatus: accessDecision.quotaStatus,
+    });
+
+    // Persist to DB (client already has answer, but we must complete before closing)
+    // This ensures the next request sees updated session state
     const assistantMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
       sessionId,
@@ -364,26 +378,22 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       ...buildChatMessageEmbedding(agent.answer),
     };
 
-    await chatRepository.createMessage(assistantMessage);
-
-    await chatRepository.updateSession(sessionId, req.user!.uid, {
-      updatedAt: Date.now(),
-      lastMessagePreview: parsed.data.message.slice(0, 180),
-      kundaliId: effectiveProfileId,
-    });
-
-    writeSseEvent(res, 'done', {
-      answer: agent.answer,
-      model: agent.model,
-      mode: requestedMode,
-      sessionId,
-      kundaliId: effectiveProfileId,
-      requestId,
-      quotaStatus: accessDecision.quotaStatus,
-    });
+    try {
+      await Promise.all([
+        chatRepository.createMessage(assistantMessage),
+        chatRepository.updateSession(sessionId, req.user!.uid, {
+          updatedAt: Date.now(),
+          lastMessagePreview: parsed.data.message.slice(0, 180),
+          kundaliId: effectiveProfileId,
+        }),
+      ]);
+    } catch (dbErr) {
+      console.error('[chat] DB persistence error (non-fatal):', dbErr);
+    }
 
     res.end();
   } catch (error) {
+    if (res.headersSent) return; // already sent answer to client
     const maybeError = error as { status?: unknown; code?: unknown; message?: unknown };
     const status = typeof maybeError.status === 'number' && Number.isFinite(maybeError.status)
       ? maybeError.status
@@ -399,6 +409,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
   }
 });
 
+// Non-streaming endpoint: answer before DB writes
 router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async (req, res) => {
   try {
     const parsed = SendMessageSchema.safeParse(req.body ?? {});
@@ -407,7 +418,6 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
     }
 
     const requestedMode = parsed.data.mode ?? 'mini';
-
     const chatRepository = getChatRepository();
     const ragProfilesRepository = getRagProfilesRepository();
 
@@ -475,29 +485,10 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
       sessionId: sessionId,
+      relevantMemories: fastMessage ? undefined : relevantMemories,
     });
 
-    const assistantMessage: ChatMessageDoc = {
-      ownerId: req.user!.uid,
-      sessionId,
-      role: 'assistant',
-      message: agent.answer,
-      mode: requestedMode,
-      model: agent.model,
-      requestId,
-      kundaliId: effectiveProfileId,
-      createdAt: Date.now(),
-      ...buildChatMessageEmbedding(agent.answer),
-    };
-
-    await chatRepository.createMessage(assistantMessage);
-
-    await chatRepository.updateSession(sessionId, req.user!.uid, {
-      updatedAt: Date.now(),
-      lastMessagePreview: parsed.data.message.slice(0, 180),
-      kundaliId: effectiveProfileId,
-    });
-
+    // Send answer to client immediately
     return res.json({
       answer: agent.answer,
       model: agent.model,

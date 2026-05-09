@@ -27,7 +27,7 @@ const EnvSchema = z.object({
   BE1_CIRCUIT_COOLDOWN_MS: z.coerce.number().default(30000),
   PG_QUERY_TIMEOUT_MS: z.coerce.number().default(30000),
   PG_CONNECTION_TIMEOUT_MS: z.coerce.number().default(5000),
-  PG_IDLE_TIMEOUT_MS: z.coerce.number().default(30000),
+  PG_IDLE_TIMEOUT_MS: z.coerce.number().default(120000),
   PG_KEEPALIVE_INITIAL_DELAY_MS: z.coerce.number().default(10000),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().default(60000),
   RATE_LIMIT_EXPENSIVE_MAX: z.coerce.number().default(20),
