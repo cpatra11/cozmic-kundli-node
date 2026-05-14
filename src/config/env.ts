@@ -147,6 +147,8 @@ const EnvSchema = z.object({
   EMBEDDING_DIM: z.coerce.number().default(192),
   GOOGLE_GENAI_MODEL: z.string().default('gemini-2.0-flash'),
   PRO_ENTITLEMENT_ID: z.string().default('pro'),
+  APPLE_BUNDLE_ID: z.string().optional(),
+  APPLE_APP_ID: z.string().optional(),
 });
 
 export const env = EnvSchema.parse(process.env);

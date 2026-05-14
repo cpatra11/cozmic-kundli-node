@@ -6,6 +6,8 @@ import type { UserSubscriptionDocument } from '../models/firestoreModels.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { getUsageQuotasRepository } from '../repositories/usageQuotasRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
+import { processAppleWebhook, appendLog } from '../services/appleWebhookService.js';
+import { getPostgresPool } from '../services/postgresClient.js';
 
 const router = Router();
 
@@ -22,6 +24,7 @@ const BillingSyncSchema = z.object({
   lastEventId: z.string().optional(),
   purchaseToken: z.string().optional(),
   transactionId: z.string().optional(),
+  originalTransactionId: z.string().optional(),
   iapkitState: z.string().optional(),
   iapkitValid: z.boolean().optional(),
   iapkitStore: z.enum(['apple', 'google', 'unknown']).optional(),
@@ -46,6 +49,7 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
     eventType: payload.eventType ?? 'client_sync',
     purchaseToken: payload.purchaseToken,
     transactionId: payload.transactionId,
+    originalTransactionId: payload.originalTransactionId,
     iapkitState: payload.iapkitState,
     iapkitValid: payload.iapkitValid,
     iapkitStore: payload.iapkitStore,
@@ -66,6 +70,27 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
   };
 }
 
+router.post('/v1/billing/apple-webhook', async (req, res) => {
+  try {
+    if (!req.body || typeof req.body.signedPayload !== 'string') {
+      appendLog(`${new Date().toISOString()}  WEBHOOK  -  ignored  error=missing_signedPayload`);
+      return res.status(200).json({ status: 'ignored', detail: 'missing signedPayload' });
+    }
+
+    const result = await processAppleWebhook(req.body);
+    if (!result.handled && result.error) {
+      if (result.error.startsWith('unmatched')) {
+        return res.status(200).json({ status: 'queued', detail: result.error });
+      }
+      return res.status(200).json({ status: 'ignored', detail: result.error });
+    }
+    return res.status(200).json({ status: 'ok', eventType: result.eventType });
+  } catch (error) {
+    appendLog(`${new Date().toISOString()}  WEBHOOK  -  error  error=${String(error)}`);
+    return res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
 router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, res) => {
   try {
     const parsed = BillingSyncSchema.safeParse(req.body ?? {});
@@ -74,6 +99,42 @@ router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, re
     }
 
     const result = await upsertSubscriptionFromSyncPayload(req.user!.uid, parsed.data);
+
+    const ownerId = req.user!.uid;
+    const subscriptions = getSubscriptionsRepository();
+
+    // Replay orphaned webhooks if originalTransactionId was provided
+    if (parsed.data.originalTransactionId) {
+      try {
+        const pool = getPostgresPool();
+        if (pool) {
+          const orphans = await pool.query(
+            'SELECT notification_type FROM apple_webhook_orphans WHERE original_transaction_id = $1',
+            [parsed.data.originalTransactionId]
+          );
+          for (const orphan of orphans.rows) {
+            if (['EXPIRED', 'REFUND', 'GRACE_PERIOD_EXPIRED', 'REVOKE'].includes(orphan.notification_type)) {
+              await subscriptions.updateFromAppleWebhook(ownerId, {
+                isPro: false,
+                eventType: `apple_orphan_${orphan.notification_type.toLowerCase()}`,
+              });
+              appendLog(`${new Date().toISOString()}  SYNC  ${orphan.notification_type}  replayed  ownerId=${ownerId}`);
+            }
+          }
+          if (orphans.rows.length > 0) {
+            await pool.query(
+              'DELETE FROM apple_webhook_orphans WHERE original_transaction_id = $1',
+              [parsed.data.originalTransactionId]
+            );
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }
+
+    appendLog(`${new Date().toISOString()}  SYNC  ${parsed.data.iapkitStore ?? '-'}  ok  ownerId=${ownerId}  isPro=${parsed.data.isPro}  originalTxId=${parsed.data.originalTransactionId ?? '-'}`);
+
     return res.json({
       ...result,
       verification: {
@@ -82,7 +143,7 @@ router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, re
       },
     });
   } catch (error) {
-    console.error('[billing/sync] Error', error);
+    appendLog(`${new Date().toISOString()}  SYNC  -  error  error=${String(error)}`);
     return res.status(500).json({ error: 'Failed to sync billing subscription', details: String(error) });
   }
 });

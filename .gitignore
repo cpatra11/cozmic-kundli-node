@@ -1,5 +1,39 @@
+# dependencies
 node_modules
-.env
+
+# build output
 dist
-.DS_Store
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# secrets / credentials
+firebase-service-account.json
+service-account.json
+*.pem
+*.key
+
+# logs
+*.log
 debug-log.txt
+webhook-log.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Firebase cache
+.firebase/
+
+# runtime
+.cache/

@@ -12,6 +12,7 @@ interface SubscriptionRow {
   event_type: string | null;
   purchase_token: string | null;
   transaction_id: string | null;
+  original_transaction_id: string | null;
   iapkit_state: string | null;
   iapkit_valid: boolean | null;
   iapkit_store: 'apple' | 'google' | 'unknown' | null;
@@ -32,6 +33,7 @@ function rowToDocument(row: SubscriptionRow): UserSubscriptionDocument {
     eventType: row.event_type ?? undefined,
     purchaseToken: row.purchase_token ?? undefined,
     transactionId: row.transaction_id ?? undefined,
+    originalTransactionId: row.original_transaction_id ?? undefined,
     iapkitState: row.iapkit_state ?? undefined,
     iapkitValid: typeof row.iapkit_valid === 'boolean' ? row.iapkit_valid : undefined,
     iapkitStore: row.iapkit_store ?? undefined,
@@ -57,7 +59,7 @@ export class SubscriptionsRepository {
     const pool = await this.withPool();
     const response = await pool.query<SubscriptionRow>(
       `
-      SELECT owner_id, source, entitlement_id, is_pro, store, product_id, event_type, purchase_token, transaction_id, iapkit_state, iapkit_valid, iapkit_store, expires_at_ms, updated_at, last_event_at, last_event_id
+      SELECT owner_id, source, entitlement_id, is_pro, store, product_id, event_type, purchase_token, transaction_id, original_transaction_id, iapkit_state, iapkit_valid, iapkit_store, expires_at_ms, updated_at, last_event_at, last_event_id
       FROM subscriptions
       WHERE owner_id = $1
       LIMIT 1
@@ -67,6 +69,76 @@ export class SubscriptionsRepository {
 
     const row = response.rows[0];
     return row ? rowToDocument(row) : null;
+  }
+
+  async getByOriginalTransactionId(originalTransactionId: string): Promise<UserSubscriptionDocument | null> {
+    const pool = await this.withPool();
+    const response = await pool.query<SubscriptionRow>(
+      `
+      SELECT owner_id, source, entitlement_id, is_pro, store, product_id, event_type, purchase_token, transaction_id, original_transaction_id, iapkit_state, iapkit_valid, iapkit_store, expires_at_ms, updated_at, last_event_at, last_event_id
+      FROM subscriptions
+      WHERE original_transaction_id = $1
+      LIMIT 1
+      `,
+      [originalTransactionId]
+    );
+
+    const row = response.rows[0];
+    return row ? rowToDocument(row) : null;
+  }
+
+  async updateFromAppleWebhook(ownerId: string, changes: {
+    isPro: boolean;
+    eventType: string;
+    expiresAtMs?: number;
+    transactionId?: string;
+  }): Promise<void> {
+    const pool = await this.withPool();
+
+    const existingResponse = await pool.query<{ event_type: string | null }>(
+      `SELECT event_type FROM subscriptions WHERE owner_id = $1 LIMIT 1`,
+      [ownerId]
+    );
+
+    const existingEventType = existingResponse.rows[0]?.event_type ?? null;
+    if (existingEventType === 'admin_revoke') {
+      return;
+    }
+
+    const now = Date.now();
+
+    const setClauses: string[] = [];
+    const params: (string | number | boolean | null)[] = [];
+    let paramIndex = 1;
+
+    setClauses.push(`is_pro = $${paramIndex++}`);
+    params.push(changes.isPro);
+
+    setClauses.push(`event_type = $${paramIndex++}`);
+    params.push(changes.eventType);
+
+    setClauses.push(`updated_at = $${paramIndex++}`);
+    params.push(now);
+
+    setClauses.push(`last_event_at = $${paramIndex++}`);
+    params.push(now);
+
+    if (changes.expiresAtMs !== undefined) {
+      setClauses.push(`expires_at_ms = $${paramIndex++}`);
+      params.push(changes.expiresAtMs);
+    }
+
+    if (changes.transactionId !== undefined) {
+      setClauses.push(`transaction_id = $${paramIndex++}`);
+      params.push(changes.transactionId);
+    }
+
+    params.push(ownerId);
+
+    await pool.query(
+      `UPDATE subscriptions SET ${setClauses.join(', ')} WHERE owner_id = $${paramIndex}`,
+      params
+    );
   }
 
   async upsert(subscription: UserSubscriptionDocument): Promise<void> {
@@ -83,12 +155,8 @@ export class SubscriptionsRepository {
     );
 
     const existingEventType = existingResponse.rows[0]?.event_type ?? null;
-    // Allow purchase_update and other valid events to override admin_revoke
-    // when iapkitValid is true (verified purchase) OR when isPro is true (device has active subscription)
     const shouldSkipUpdate = existingEventType === 'admin_revoke' && 
-      subscription.eventType !== 'admin_revoke' &&
-      subscription.iapkitValid !== true &&
-      subscription.isPro !== true;
+      subscription.eventType !== 'admin_revoke';
     
     if (shouldSkipUpdate) {
       return;
@@ -106,6 +174,7 @@ export class SubscriptionsRepository {
         event_type,
         purchase_token,
         transaction_id,
+        original_transaction_id,
         iapkit_state,
         iapkit_valid,
         iapkit_store,
@@ -114,7 +183,7 @@ export class SubscriptionsRepository {
         last_event_at,
         last_event_id
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
       )
       ON CONFLICT (owner_id)
       DO UPDATE SET
@@ -126,6 +195,10 @@ export class SubscriptionsRepository {
         event_type = EXCLUDED.event_type,
         purchase_token = EXCLUDED.purchase_token,
         transaction_id = EXCLUDED.transaction_id,
+        original_transaction_id = CASE
+          WHEN EXCLUDED.original_transaction_id IS NOT NULL THEN EXCLUDED.original_transaction_id
+          ELSE subscriptions.original_transaction_id
+        END,
         iapkit_state = EXCLUDED.iapkit_state,
         iapkit_valid = EXCLUDED.iapkit_valid,
         iapkit_store = EXCLUDED.iapkit_store,
@@ -144,6 +217,7 @@ export class SubscriptionsRepository {
         subscription.eventType ?? null,
         subscription.purchaseToken ?? null,
         subscription.transactionId ?? null,
+        subscription.originalTransactionId ?? null,
         subscription.iapkitState ?? null,
         typeof subscription.iapkitValid === 'boolean' ? subscription.iapkitValid : null,
         subscription.iapkitStore ?? null,

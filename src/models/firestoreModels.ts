@@ -29,6 +29,7 @@ export interface UserSubscriptionDocument {
   eventType?: string;
   purchaseToken?: string;
   transactionId?: string;
+  originalTransactionId?: string;
   iapkitState?: string;
   iapkitValid?: boolean;
   iapkitStore?: 'apple' | 'google' | 'unknown';
