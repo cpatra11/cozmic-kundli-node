@@ -1,4 +1,3 @@
-# Deploy both cozmic and be1 to EC2
 name: Deploy to EC2
 
 on:
@@ -30,7 +29,11 @@ jobs:
       - name: Install be1 dependencies
         run: |
           cd be1/api
-          composer install --no-dev --optimize-autoloader --no-interaction
+          composer install --no-dev --optimize-autoloader --no-scripts --no-interaction
+          # Create autoload_runtime.php if missing (Symfony Flex requires it)
+          if [ ! -f vendor/autoload_runtime.php ]; then
+            echo '<?php require_once __DIR__."/autoload.php";' | tee vendor/autoload_runtime.php
+          fi
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -51,7 +54,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           source: "be1/api/lib,be1/api/src,be1/api/vendor,be1/api/composer.*,be1/api/Caddyfile,be1/api/public,be1/api/swetest"
           target: "/opt/be1"
-          strip_components: 0
+          strip_components: 1
           rm: false
 
       - name: Deploy cozmic
