@@ -19,7 +19,7 @@ jobs:
           repository: cpatra11/cozmicai-kundli-be
           ref: feat/d6-shashtamsa-varga
           path: be1
-          ssh-key: ${{ secrets.EC2_SSH_KEY }}
+          token: ${{ secrets.BE1_PAT }}
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
