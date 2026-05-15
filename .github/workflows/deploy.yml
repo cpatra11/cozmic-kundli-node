@@ -60,7 +60,7 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           source: "dist,node_modules,package.json"
-          target: "/opt/cozmic/services/cozmic-rag-agents"
+          target: "/opt/cozmic"
           strip_components: 0
           rm: false
 
