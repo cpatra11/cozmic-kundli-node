@@ -13,6 +13,10 @@ const EnvSchema = z.object({
   FIREBASE_PROJECT_ID: z.string().optional(),
   FIREBASE_STORAGE_BUCKET: z.string().optional(),
   FIREBASE_SERVICE_ACCOUNT_JSON: z.string().optional(),
+  FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional(),
+
+  PG_IDLE_TIMEOUT_MS: z.coerce.number().default(30000),
+  PG_KEEPALIVE_INITIAL_DELAY_MS: z.coerce.number().default(60000),
 
   BE1_CONFIG: z
     .string()
