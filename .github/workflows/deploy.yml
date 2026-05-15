@@ -7,29 +7,75 @@ on:
 
 jobs:
   deploy:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: Deploy be1
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Clone be1
+        uses: actions/checkout@v4
+        with:
+          repository: cpatra11/cozmicai-kundli-be
+          ref: feat/d6-shashtamsa-varga
+          path: be1
+          token: ${{ secrets.BE1_PAT }}
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.3
+
+      - name: Install be1 dependencies
         run: |
-          cd /opt/be1/api
-          git fetch origin feat/d6-shashtamsa-varga
-          git reset --hard origin/feat/d6-shashtamsa-varga
+          cd be1/api
           composer install --no-dev --optimize-autoloader --no-scripts --no-interaction
           if [ ! -f vendor/autoload_runtime.php ]; then
             echo '<?php require_once __DIR__."/autoload.php";' | tee vendor/autoload_runtime.php
           fi
 
-      - name: Deploy cozmic
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Build cozmic
         run: |
-          cd /opt/cozmic
-          git fetch origin feat/conversation-memory-cleanup
-          git reset --hard origin/feat/conversation-memory-cleanup
           npm ci --legacy-peer-deps
           npm run build
 
+      - name: Deploy be1
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "be1/api/lib,be1/api/src,be1/api/vendor,be1/api/composer.*,be1/api/Caddyfile,be1/api/public,be1/api/swetest"
+          target: "/opt/be1"
+          strip_components: 1
+          rm: false
+
+      - name: Deploy cozmic
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "dist,node_modules,package.json"
+          target: "/opt/cozmic"
+          strip_components: 0
+          rm: false
+
       - name: Restart both services
-        run: |
-          sudo systemctl restart be1 cozmic
-          sleep 3
-          echo "be1: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/ping)"
-          echo "cozmic: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8787/health)"
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sudo systemctl restart be1
+            sudo systemctl restart cozmic
+            sleep 3
+            echo "be1: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/ping)"
+            echo "cozmic: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8787/health)"
