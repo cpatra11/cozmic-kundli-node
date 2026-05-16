@@ -66,6 +66,24 @@ function parseJsonSafely(text: string): any {
   }
 }
 
+function extractDashaTransitionDates(apiResponse: any): string[] {
+  const dates = new Set<string>();
+  dates.add(new Date().toISOString().slice(0, 10));
+  const dashaRoot = apiResponse?.chart?.dasha;
+  if (!dashaRoot?.periods) return Array.from(dates);
+  function walk(node: any, depth: number) {
+    if (!node?.periods || depth > 3) return;
+    for (const key of Object.keys(node.periods)) {
+      const p = node.periods[key];
+      if (p.start) dates.add(p.start.slice(0, 10));
+      if (p.end) dates.add(p.end.slice(0, 10));
+      if (depth < 2) walk(p, depth + 1);
+    }
+  }
+  walk(dashaRoot, 1);
+  return Array.from(dates).sort();
+}
+
 // -- Fast routing --
 
 function isObviousSmalltalk(q: string): boolean {
@@ -76,32 +94,7 @@ function isIdentityQuestion(q: string): boolean {
   return /\b(who are you|what are you|what can you|your name|tell me about yourself|capabilities|help)\b/i.test(q);
 }
 
-function isGeneralAstroQuestion(q: string): boolean {
-  const hasAstro = /\b(house|planet|rashi|nakshatra|dasha|yoga|varga|bhava|karaka|bala|arudha|aspect|conjunction|retrograde|exaltation|debiliation|navamsa|dasamsa|saptamsa|drekkana|hora|shashtiamsa|trimamsa|siddhamamsa|D\d+|sun|moon|mars|mercury|jupiter|venus|saturn|rahu|ketu|graha)\b/i.test(q);
-  const noPersonal = !/\b(my|mine|my\s+chart|my\s+birth|do\s+I|am\s+I|will\s+I|have\s+I|my\s+kundli)\b/i.test(q);
-  const isConceptual = /\b(what is|what does|tell me about|explain|meaning of|significance of|describe|define|how does|why does|what are)\b/i.test(q);
-  return hasAstro && noPersonal && isConceptual;
-}
-
-function shouldForcePipelineRoute(q: string): boolean {
-  const patterns = [
-    'chart', 'kundli', 'horoscope', 'astrology', 'planet', 'house', 'rashi', 'nakshatra', 'dasha', 'transit', 'birth', 'janam', 'bhav',
-    'varga', 'yoga', 'karaka', 'arudha', 'mangal', 'shani', 'guru', 'rahu', 'ketu', 'career', 'finance', 'marriage', 'health', 'education',
-    'property', 'travel', 'remedy', 'prediction', 'sarkari', 'naukri', 'upsc', 'ssc', 'banking', 'railway', 'defence', 'ias', 'ips', 'officer',
-    'jee', 'neet', 'gate', 'cat', 'entrance', 'manglik', 'kaal', 'sarp', 'pitra', 'kuja', 'upay', 'upaya', 'mantra', 'puja', 'vastu',
-    'muhurta', 'engineering', 'medical', 'doctor', 'engineer', 'videsh', 'nri', 'gemstone', 'ratna', 'stone', 'dhaiya',
-  ];
-  const phrases = [
-    '\\bD\\s*\\d+\\b', 'government\\s+job', 'civil\\s+service', 'competitive\\s+exam',
-    'love\\s+marriage', 'arranged\\s+marriage', 'intercaste', 'love\\s+match',
-    'mangal\\s+dosh', 'kaal\\s+sarp', 'pitra\\s+dosh', 'kuja\\s+dosh',
-    'shubh\\s+(?:time|samay|muhurat)', 'kundli\\s+matching', 'gun\\s+milan',
-    'business\\s+vs\\s+service', 'service\\s+or\\s+business',
-    'foreign\\s+settlement', 'abroad\\s+study', 'settle\\s+abroad',
-    'sade\\s+sati', 'shani\\s+sade', 'shani\\s+dhaiya',
-  ];
-  return new RegExp([...patterns, ...phrases].join('|'), 'i').test(q);
-}
+// (removed isGeneralAstroQuestion and shouldForcePipelineRoute — replaced by LLM classifier below)
 
 // -- Node: route --
 
@@ -115,13 +108,30 @@ async function routeNode(state: AgentStateType): Promise<Partial<AgentStateType>
 
   if (isObviousSmalltalk(question)) return { topLevelRoute: 'smalltalk' };
   if (isIdentityQuestion(question)) return { topLevelRoute: 'general_astro' };
-  if (isGeneralAstroQuestion(question)) return { topLevelRoute: 'general_astro' };
 
-  if (shouldForcePipelineRoute(question)) {
-    return { topLevelRoute: 'pipeline' };
+  // LLM classifier for remaining cases
+  try {
+    const result = await invokeDeepSeekBedrock({
+      systemPrompt: `Classify the user's astrology question into exactly one:
+- "pipeline": personal chart question (mentions "my", "mine", "will I", birth details, or any specific life area like career/marriage/health). Also route here if unsure.
+- "general_astro": conceptual question about astrology without personal reference (e.g. "what is D9", "explain manglik dosha")
+- "smalltalk": greeting, chitchat, thank you, feedback, off-topic
+
+Return JSON: {"route": "pipeline" | "general_astro" | "smalltalk"}
+No markdown. JSON only.`,
+      userPrompt: question,
+      maxTokens: 64,
+    });
+    const parsed = parseJsonSafely(result.text);
+    const route = parsed?.route;
+    if (route === 'pipeline' || route === 'general_astro') {
+      return { topLevelRoute: route };
+    }
+  } catch {
+    // fall through to default
   }
 
-  return { topLevelRoute: 'smalltalk' };
+  return { topLevelRoute: 'pipeline' };
 }
 
 function routeAfterRoute(state: AgentStateType): string {
@@ -230,23 +240,27 @@ No markdown. JSON only.`,
 
 async function fastAnswerNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
   if (state.finalAnswer) return {};
+  try {
+    const question = extractQuestionFromMessages(state.messages || []);
+    const isSmallTalk = state.topLevelRoute === 'smalltalk';
 
-  const question = extractQuestionFromMessages(state.messages || []);
-  const isSmallTalk = state.topLevelRoute === 'smalltalk';
+    if (!question?.trim()) {
+      return { finalAnswer: 'Hello! How can I help you with your chart today?' };
+    }
 
-  if (!question?.trim()) {
-    return { finalAnswer: 'Hello! How can I help you with your chart today?' };
+    const result = await invokeDeepSeekBedrock({
+      systemPrompt: isSmallTalk
+        ? 'You are Cozmic, a friendly Vedic astrology assistant. Respond naturally to casual chat. Keep it brief and warm.'
+        : 'You are Cozmic, a Vedic astrology assistant. Answer conceptual questions clearly and concisely (3-5 paragraphs max).',
+      userPrompt: question,
+      maxTokens: 1024,
+    });
+
+    return { finalAnswer: result.text };
+  } catch (error) {
+    console.error('[fastAnswerNode] failed', { message: (error as Error).message, stack: (error as Error).stack?.split('\n').slice(0, 4).join('\n') });
+    return { finalAnswer: 'I apologize, but I was unable to process your request.' };
   }
-
-  const result = await invokeDeepSeekBedrock({
-    systemPrompt: isSmallTalk
-      ? 'You are Cozmic, a friendly Vedic astrology assistant. Respond naturally to casual chat. Keep it brief and warm.'
-      : 'You are Cozmic, a Vedic astrology assistant. Answer conceptual questions clearly and concisely (3-5 paragraphs max).',
-    userPrompt: question,
-    maxTokens: 1024,
-  });
-
-  return { finalAnswer: result.text };
 }
 
 // -- Tool execution --
@@ -262,6 +276,7 @@ async function executeFetchChartData(
   const vargas = (input.vargas as string[]) || ['D1'];
   const infolevels = (input.infolevels as string[]) || ['basic'];
   const nesting = (input.nesting as number) ?? 2;
+  const autoTransit = input.autoTransit === true;
 
   try {
     const apiResponse = await fetchBe1Calculate(kundli, {
@@ -271,8 +286,7 @@ async function executeFetchChartData(
     });
 
     const formatted = formatAllChartData(apiResponse, infolevels);
-
-    return {
+    const result: Record<string, unknown> = {
       vargas,
       infolevels,
       nesting,
@@ -280,6 +294,22 @@ async function executeFetchChartData(
       rawPayload: apiResponse,
       rawAvailable: true,
     };
+
+    if (autoTransit && infolevels.includes('dasha')) {
+      const dates = extractDashaTransitionDates(apiResponse);
+      if (dates.length > 0) {
+        try {
+          const transitResult = await executeFetchTransit(kundli, { dates }, apiResponse as Record<string, unknown>);
+          if (transitResult.transitText) {
+            result.transitData = transitResult.transitText;
+          }
+        } catch {
+          // non-fatal
+        }
+      }
+    }
+
+    return result;
   } catch (error) {
     return { error: `Failed to fetch chart data: ${String(error)}` };
   }
@@ -379,24 +409,46 @@ ${dataNote}
 ${upgradeNote}
 ${retryNote}
 
-AVAILABLE TOOLS:
-1. fetch_chart_data — Fetch birth chart data. Parameters: vargas (array of chart IDs), infolevels (array of data types), nesting (1-5 dasha depth). Always include "basic" in infolevels.
-2. fetch_transit — Fetch transit positions for specific dates. Parameters: dates (array of YYYY-MM-DD strings).
-3. search_astrology — Look up general astrological concepts. Parameters: query (your question).
+AVAILABLE DATA — Choose what to fetch based on the question:
+CHARTS (vargas):
+D1(Rasi/base)  D2(wealth)  D3(siblings)  D4(property)  D5(fame)
+D6(health)  D7(children)  D8(sudden)  D9(marriage)  D10(career)
+D11(destruction)  D12(parents)  D16(travel)  D20(spirituality)
+D24(education)  D27(talent)  D30(obstacles)  D40(maternal)  D45(paternal)  D60(karma)
+
+DATA SECTIONS (infolevels):
+basic(planets/houses)  panchanga(tithi/nakshatra)  yogas(combinations)
+dasha(timing)  ashtakavarga(strength)  grahabala(shadbala)  arudha(pada)  ayanamsa
+
+DASHA NESTING (choose based on time scale):
+1=mahadasha only(~2KB, decade-level)
+2=+antardasha(~13KB, month-level) — default for most life questions
+3=+pratyantardasha(~200KB, week-level) — use for "when will X happen"
+4=+sookshmantardasha — day-level precision (large)
+5=+pranantardasha — hour-level precision (very large, rarely needed)
+
+TIMING GRANULARITY — Choose nesting based on the question's time scale:
+• Years/months ("when will I get married/get a job/buy a house") → nesting 3 (pratyantar)
+• Broad window ("will I marry in 2026") → nesting 2 (antar) is often sufficient
+• Days/weeks ("will this month be good") → nesting 4 (sookshmantar)
+• Specific days ("is next Tuesday good for trip") → nesting 5 (pranantar)
+• General reading (no timing) → nesting 2
 
 INSTRUCTIONS:
-1. PLAN: First decide what data you need based on the user's question. Think about which vargas, infolevels, and nesting depth are appropriate.
-2. FETCH: Call fetch_chart_data with your chosen parameters.
-3. REVIEW: Examine the returned chart data. If you need more detail (e.g., transit for timing), call fetch_transit or fetch_chart_data again with different params.
+1. PLAN: Decide which charts, data sections, and nesting depth are appropriate for the question.
+2. FETCH: Call fetch_chart_data with your chosen parameters. For timing questions, set autoTransit: true to auto-fetch transit for dasha period dates.
+3. REVIEW: Examine returned data. If transit is missing or you need different parameters, call again.
 4. ANALYZE: Synthesize all data into a clear answer.
 5. For Mini mode: you may NOT call fetch_chart_data with vargas other than D1. The tool will reject Mini requests for D9+.
+
+EFFICIENCY: You have 3 tool-calling rounds max. Plan all needed data before your first call. For timing questions: fetch D1+dasha+nesting 3+autoTransit:true in ONE call.
 
 CRITICAL RULES:
 - A planet being placed in a house does NOT make it the lord of that house. The house lord is determined by the rashi sign ruling that house cusp. For example, Mercury in the 10th house does NOT make Mercury the 10th lord.
 - NEVER mention missing data, unavailable tools, or backend limitations.
 - NEVER suggest consulting a professional astrologer.
 - NEVER invent or fabricate planetary positions.
-- Ground every claim in specific data from the fetched chart.
+- Ground every claim in specific data from the fetched chart. CITATION: Format as "Saturn in 10th house (Capricorn, 15°42')". Never state a position without having fetched it.
 - End with actionable insight or forward-looking guidance.
 - VARGA CHARTS: House numbers are relative to THAT varga's own lagna, NOT D1's lagna.
 - D24 = Siddhamamsa (Chaturvimsamsa, education/wisdom). D30 = Trimamsa (Trisamsa, evil/inauspicious). Do NOT confuse them.
@@ -416,121 +468,145 @@ CHART SUMMARY NOTES:
 // -- Node: agent (ReAct loop with tool calling) --
 
 async function agentNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const question = extractQuestionFromMessages(state.messages || []);
-  logNodeStart('agent', { question, mode: state.mode, hasKundli: !!state.kundliInput });
+  try {
+    const question = extractQuestionFromMessages(state.messages || []);
+    logNodeStart('agent', { question, mode: state.mode, hasKundli: !!state.kundliInput });
 
-  if (!question?.trim()) {
-    return { answer: 'Please tell me about your chart question.' };
-  }
-
-  const systemPrompt = buildAgentSystemPrompt(state, !!state.chartData);
-  const maxIterations = 10;
-
-  // Inject conversation context as actual messages for pronoun resolution
-  const messages: Array<{ role: string; content: Array<Record<string, unknown>> }> = [];
-  if (state.needsContext && state.contextMessages?.length) {
-    for (const ctx of state.contextMessages) {
-      messages.push({
-        role: ctx.role === 'assistant' ? 'assistant' : 'user',
-        content: [{ text: ctx.message }],
-      });
+    if (!question?.trim()) {
+      return { answer: 'Please tell me about your chart question.' };
     }
-  }
-  messages.push({ role: 'user', content: [{ text: question }] });
 
-  let collectedChartPayload: Record<string, unknown> | null = state.chartData || null;
-  let collectedTransitSnapshots: Record<string, Record<string, unknown>> | null = state.transitSnapshots || null;
+    const systemPrompt = buildAgentSystemPrompt(state, !!state.chartData);
+    const maxIterations = 3;
 
-  for (let iteration = 0; iteration < maxIterations; iteration++) {
-    const response = await invokeDeepSeekConversation({
-      systemPrompt,
-      messages: messages as any,
-      tools: CHART_TOOL_CONFIG,
-      maxTokens: 4096,
+    // Inject conversation context as actual messages for pronoun resolution
+    const messages: Array<{ role: string; content: Array<Record<string, unknown>> }> = [];
+    if (state.needsContext && state.contextMessages?.length) {
+      for (const ctx of state.contextMessages) {
+        messages.push({
+          role: ctx.role === 'assistant' ? 'assistant' : 'user',
+          content: [{ text: ctx.message }],
+        });
+      }
+    }
+    messages.push({ role: 'user', content: [{ text: question }] });
+
+    let collectedChartPayload: Record<string, unknown> | null = state.chartData || null;
+    let collectedTransitSnapshots: Record<string, Record<string, unknown>> | null = state.transitSnapshots || null;
+    const calledTools: Set<string> = new Set();
+
+    for (let iteration = 0; iteration < maxIterations; iteration++) {
+      const response = await invokeDeepSeekConversation({
+        systemPrompt,
+        messages: messages as any,
+        tools: CHART_TOOL_CONFIG,
+        maxTokens: 4096,
+      });
+
+      const toolUseBlocks = response.content.filter(c => c.toolUse);
+      const textBlocks = response.content.filter(c => c.text);
+
+      if (toolUseBlocks.length === 0) {
+        // LLM finished — text response is the answer
+        const answerText = textBlocks.map(c => c.text).join('').trim();
+        logNodeEnd('agent', { answerLength: answerText.length, iterations: iteration + 1 });
+        return {
+          answer: answerText,
+          chartData: collectedChartPayload,
+          transitSnapshots: collectedTransitSnapshots,
+        };
+      }
+
+      // Process tool calls
+      const assistantContent: Array<Record<string, unknown>> = [];
+      for (const block of toolUseBlocks) {
+        if (block.toolUse) {
+          assistantContent.push({ toolUse: block.toolUse });
+        }
+      }
+      if (textBlocks.length > 0) {
+        assistantContent.push({ text: textBlocks.map(c => c.text).join('') });
+      }
+
+      messages.push({ role: 'assistant', content: assistantContent });
+
+      // Execute each tool and add results
+      for (const block of toolUseBlocks) {
+        const tu = block.toolUse;
+        if (!tu) continue;
+
+        const toolSig = `${tu.name}:${JSON.stringify(tu.input)}`;
+        if (calledTools.has(toolSig)) {
+          messages.push({
+            role: 'user',
+            content: [{ toolResult: { toolUseId: tu.toolUseId, content: [{ text: 'Already fetched with identical parameters. Use existing data.' }] } }],
+          });
+          continue;
+        }
+        calledTools.add(toolSig);
+
+        let result: Record<string, unknown>;
+
+        switch (tu.name) {
+          case 'fetch_chart_data': {
+            result = await executeFetchChartData(state.kundliInput, tu.input);
+            if (result.formattedData) {
+              collectedChartPayload = { ...(collectedChartPayload || {}), ...result };
+            }
+            break;
+          }
+          case 'fetch_transit': {
+            const natalPayload = collectedChartPayload?.rawPayload as Record<string, unknown> | undefined;
+            result = await executeFetchTransit(state.kundliInput, tu.input, natalPayload);
+            const transitText = result.transitText as string | undefined;
+            if (transitText) {
+              collectedTransitSnapshots = collectedTransitSnapshots || {};
+            }
+            break;
+          }
+          case 'search_astrology': {
+            const query = typeof tu.input?.query === 'string' ? tu.input.query : JSON.stringify(tu.input);
+            result = await executeSearchAstrology(query);
+            break;
+          }
+          default: {
+            result = { error: `Unknown tool: ${tu.name}` };
+          }
+        }
+
+        messages.push({
+          role: 'user',
+          content: [{ toolResult: { toolUseId: tu.toolUseId, content: [{ json: result }] } }],
+        });
+      }
+    }
+
+    // Max iterations reached
+    const lastText = messages
+      .filter(m => m.role === 'assistant')
+      .reverse()
+      .find(m => m.content.some(c => c.text));
+    const fallback = lastText
+      ? (lastText.content.find(c => c.text)?.text as string) || ''
+      : '';
+
+    return {
+      answer: fallback || 'I apologize, but I was unable to complete the analysis within the allowed steps.',
+      chartData: collectedChartPayload,
+      transitSnapshots: collectedTransitSnapshots,
+    };
+  } catch (error) {
+    console.error('[agentNode] failed', {
+      iteration: 'unknown',
+      message: (error as Error).message,
+      stack: (error as Error).stack?.split('\n').slice(0, 6).join('\n'),
     });
-
-    const toolUseBlocks = response.content.filter(c => c.toolUse);
-    const textBlocks = response.content.filter(c => c.text);
-
-    if (toolUseBlocks.length === 0) {
-      // LLM finished — text response is the answer
-      const answerText = textBlocks.map(c => c.text).join('').trim();
-      logNodeEnd('agent', { answerLength: answerText.length, iterations: iteration + 1 });
-      return {
-        answer: answerText,
-        chartData: collectedChartPayload,
-        transitSnapshots: collectedTransitSnapshots,
-      };
-    }
-
-    // Process tool calls
-    const assistantContent: Array<Record<string, unknown>> = [];
-    for (const block of toolUseBlocks) {
-      if (block.toolUse) {
-        assistantContent.push({ toolUse: block.toolUse });
-      }
-    }
-    if (textBlocks.length > 0) {
-      assistantContent.push({ text: textBlocks.map(c => c.text).join('') });
-    }
-
-    messages.push({ role: 'assistant', content: assistantContent });
-
-    // Execute each tool and add results
-    for (const block of toolUseBlocks) {
-      const tu = block.toolUse;
-      if (!tu) continue;
-
-      let result: Record<string, unknown>;
-
-      switch (tu.name) {
-        case 'fetch_chart_data': {
-          result = await executeFetchChartData(state.kundliInput, tu.input);
-          if (result.formattedData) {
-            collectedChartPayload = { ...(collectedChartPayload || {}), ...result };
-          }
-          break;
-        }
-        case 'fetch_transit': {
-          const natalPayload = collectedChartPayload?.rawPayload as Record<string, unknown> | undefined;
-          result = await executeFetchTransit(state.kundliInput, tu.input, natalPayload);
-          const transitText = result.transitText as string | undefined;
-          if (transitText) {
-            collectedTransitSnapshots = collectedTransitSnapshots || {};
-          }
-          break;
-        }
-        case 'search_astrology': {
-          const query = typeof tu.input?.query === 'string' ? tu.input.query : JSON.stringify(tu.input);
-          result = await executeSearchAstrology(query);
-          break;
-        }
-        default: {
-          result = { error: `Unknown tool: ${tu.name}` };
-        }
-      }
-
-      messages.push({
-        role: 'user',
-        content: [{ toolResult: { toolUseId: tu.toolUseId, content: [{ json: result }] } }],
-      });
-    }
+    return {
+      answer: 'I encountered an error while analyzing your chart.',
+      chartData: state.chartData || null,
+      transitSnapshots: state.transitSnapshots || null,
+    };
   }
-
-  // Max iterations reached
-  const lastText = messages
-    .filter(m => m.role === 'assistant')
-    .reverse()
-    .find(m => m.content.some(c => c.text));
-  const fallback = lastText
-    ? (lastText.content.find(c => c.text)?.text as string) || ''
-    : '';
-
-  return {
-    answer: fallback || 'I apologize, but I was unable to complete the analysis within the allowed steps.',
-    chartData: collectedChartPayload,
-    transitSnapshots: collectedTransitSnapshots,
-  };
 }
 
 // -- Node: finalize (quality check) --
@@ -599,16 +675,17 @@ No markdown. JSON only.`,
 // -- Node: regenerate (retry with cached data) --
 
 async function regenerateNode(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  const question = extractQuestionFromMessages(state.messages || []);
-  const previousAnswer = state.answer || '';
-  const memories = state.relevantMemories || [];
+  try {
+    const question = extractQuestionFromMessages(state.messages || []);
+    const previousAnswer = state.answer || '';
+    const memories = state.relevantMemories || [];
 
-  const chartDataJson = state.chartData ? JSON.stringify(state.chartData, null, 2).slice(0, 8000) : '';
-  const transitJson = state.transitSnapshots ? JSON.stringify(state.transitSnapshots, null, 2).slice(0, 4000) : '';
+    const chartDataJson = state.chartData ? JSON.stringify(state.chartData, null, 2).slice(0, 8000) : '';
+    const transitJson = state.transitSnapshots ? JSON.stringify(state.transitSnapshots, null, 2).slice(0, 4000) : '';
 
-  const memoryContext = memories.slice(-5).map(m => `[${m.role}] ${m.text}`).join('\n');
+    const memoryContext = memories.slice(-5).map(m => `[${m.role}] ${m.text}`).join('\n');
 
-  const systemPrompt = `You are Cozmic, an expert Vedic astrologer. The previous answer was flagged as insufficient. Provide a better, more detailed answer.
+    const systemPrompt = `You are Cozmic, an expert Vedic astrologer. The previous answer was flagged as insufficient. Provide a better, more detailed answer.
 
 PREVIOUS ANSWER (needs improvement):
 ${previousAnswer.slice(0, 2000)}
@@ -627,13 +704,17 @@ CRITICAL RULES:
 - End with actionable insight.
 - Today is ${new Date().toISOString().slice(0, 10)}.`;
 
-  const result = await invokeDeepSeekBedrock({
-    systemPrompt,
-    userPrompt: `User question: ${question}\n\nProvide a comprehensive, specific answer.`,
-    maxTokens: 3000,
-  });
+    const result = await invokeDeepSeekBedrock({
+      systemPrompt,
+      userPrompt: `User question: ${question}\n\nProvide a comprehensive, specific answer.`,
+      maxTokens: 3000,
+    });
 
-  return { finalAnswer: result.text, shouldRegenerate: false };
+    return { finalAnswer: result.text, shouldRegenerate: false };
+  } catch (error) {
+    console.error('[regenerateNode] failed', { message: (error as Error).message, stack: (error as Error).stack?.split('\n').slice(0, 4).join('\n') });
+    return { finalAnswer: state.answer || 'Regeneration failed.', shouldRegenerate: false };
+  }
 }
 
 // -- Build Graph --
@@ -733,8 +814,17 @@ export async function runKundliAgentV2(
       model: 'cozmic-agent-v2',
     };
   } catch (error) {
+    const err = error as Error;
+    console.error('[runKundliAgentV2] graph execution failed', {
+      name: err.name,
+      message: err.message,
+      stack: err.stack?.split('\n').slice(0, 6).join('\n'),
+      cause: err.cause instanceof Error
+        ? { name: err.cause.name, message: err.cause.message }
+        : err.cause,
+    });
     return {
-      answer: `I encountered an error: ${(error as Error).message}`,
+      answer: `I encountered an error: ${err.message}`,
       model: 'cozmic-agent-v2',
     };
   }

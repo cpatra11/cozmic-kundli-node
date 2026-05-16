@@ -76,6 +76,22 @@ jobs:
           strip_components: 0
           rm: false
 
+      - name: Setup Firebase service account
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cat > /opt/cozmic/firebase-service-account.json << 'EOF'
+            ${{ secrets.FIREBASE_SA_JSON }}
+            EOF
+            if grep -q 'FIREBASE_SERVICE_ACCOUNT_PATH' /opt/cozmic/.env; then
+              sed -i 's|FIREBASE_SERVICE_ACCOUNT_PATH=.*|FIREBASE_SERVICE_ACCOUNT_PATH=/opt/cozmic/firebase-service-account.json|' /opt/cozmic/.env
+            else
+              echo 'FIREBASE_SERVICE_ACCOUNT_PATH=/opt/cozmic/firebase-service-account.json' >> /opt/cozmic/.env
+            fi
+
       - name: Restart both services
         uses: appleboy/ssh-action@v1.0.3
         with:

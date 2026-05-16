@@ -77,7 +77,7 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   });
 });
 
-app.listen(env.PORT, () => {
+app.listen(env.PORT, '0.0.0.0', () => {
   // eslint-disable-next-line no-console
   console.log(`cozmic-rag-agents listening on http://localhost:${env.PORT}`);
 });

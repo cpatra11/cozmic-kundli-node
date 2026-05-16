@@ -3,7 +3,7 @@ import type { ToolConfiguration } from '@aws-sdk/client-bedrock-runtime';
 const FETCH_CHART_DATA_DEF = {
   toolSpec: {
     name: 'fetch_chart_data',
-    description: `Fetch detailed birth chart data. Always start with D1 + basic + panchanga + yogas. For Pro mode, add D9 and D10 by default. Add more vargas based on the question topic.
+    description: `Fetch detailed birth chart data. Always start with D1 + basic + panchanga + yogas. For Pro mode, add D9 and D10 by default. Add more vargas based on the question topic. Tip: set autoTransit: true when including dasha infolevel to auto-fetch transit for period boundary dates.
 
 Varga guide (fetch when topic matches):
 - D2 (Hora): wealth, finance, money, income
@@ -34,11 +34,11 @@ Infolevels:
 - ayanamsa: precession info
 
 Dasha nesting:
-- 1: mahadasha only (~2KB)
-- 2: + antardasha (~13KB) — good for most questions
-- 3: + pratyantardasha (~200KB) — detailed timing
-- 4: + sookshmantardasha — precise day-level timing
-- 5: full detail (very large) — rarely needed`,
+- 1: mahadasha only (~2KB) — broad decade/year-level overview
+- 2: + antardasha (~13KB) — month-level timing, default for most life questions
+- 3: + pratyantardasha (~200KB) — week-level timing, use for "when will X happen"
+- 4: + sookshmantardasha — day-level precision (large)
+- 5: + pranantardasha — hour-level precision (very large, rarely needed)`,
     inputSchema: {
       json: {
         type: 'object',
@@ -57,6 +57,10 @@ Dasha nesting:
             type: 'number',
             description: 'Dasha nesting depth (1-5). Default: 2 for most questions.',
           },
+          autoTransit: {
+            type: 'boolean',
+            description: 'If true and dasha infolevel is included, auto-fetch transit for period boundary dates.',
+          },
         },
         required: ['vargas', 'infolevels'],
       },
@@ -67,17 +71,17 @@ Dasha nesting:
 const FETCH_TRANSIT_DEF = {
   toolSpec: {
     name: 'fetch_transit',
-    description: `Fetch current or future transit (gochar) planetary positions. Use when the question involves timing, predictions, or current planetary influences.
+    description: `Fetch transit (gochar) planetary positions for specific dates. Use for timing, predictions, and current influences.
 
-The transit shows where planets are now or at specific dates. Compare to birth chart for timing analysis.
+When the user asks about a time period (e.g. "June 2027", "next 3 months", "remaining May"), GENERATE 4-12 evenly spaced ISO dates spanning that period.
 
-Key uses:
-- Sade Sati: Saturn transiting 12th/1st/2nd from natal Moon
-- Dhaiya: Saturn transiting 4th/8th from natal Moon
-- Current planetary transits through houses
-- Dasha period analysis with transit support
+Examples:
+  "June 2027" → ["2027-06-01","2027-06-08","2027-06-15","2027-06-22","2027-06-30"]
+  "next 3 months" (from Apr 2026) → ["2026-04-17","2026-05-01","2026-05-17","2026-06-01","2026-06-17","2026-07-01"]
 
-Call this AFTER fetch_chart_data so you have birth chart for comparison.`,
+Call AFTER fetch_chart_data so you have birth chart for comparison.
+
+Key transits: Sade Sati (Saturn 12th/1st/2nd from Moon), Dhaiya (Saturn 4th/8th from Moon), house transits.`,
     inputSchema: {
       json: {
         type: 'object',
@@ -85,7 +89,7 @@ Call this AFTER fetch_chart_data so you have birth chart for comparison.`,
           dates: {
             type: 'array',
             items: { type: 'string' },
-            description: 'ISO date strings (YYYY-MM-DD) for transit positions. Include today and key dasha period dates.',
+            description: 'ISO date strings (YYYY-MM-DD) for transit positions. For time ranges, generate 4-12 evenly spaced dates.',
           },
         },
         required: ['dates'],

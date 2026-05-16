@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/db/migrations && cp src/db/migrations/*.sql dist/db/migrations/",
     "check": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "tsx scripts/migrate-db.ts",
     "db:reset:push": "tsx scripts/reset-db.ts",
