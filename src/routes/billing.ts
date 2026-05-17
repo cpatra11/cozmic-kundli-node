@@ -6,8 +6,6 @@ import type { UserSubscriptionDocument } from '../models/firestoreModels.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { getUsageQuotasRepository } from '../repositories/usageQuotasRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
-import { processAppleWebhook, appendLog } from '../services/appleWebhookService.js';
-import { getPostgresPool } from '../services/postgresClient.js';
 
 const router = Router();
 
@@ -39,11 +37,13 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
   const usageQuotas = getUsageQuotasRepository();
   const now = Date.now();
 
+  const effectiveIsPro = payload.iapkitValid === false ? false : payload.isPro;
+
   const subscriptionDoc: UserSubscriptionDocument = {
     ownerId,
     source: payload.source,
     entitlementId: payload.entitlementId,
-    isPro: payload.isPro,
+    isPro: effectiveIsPro,
     store: payload.store,
     productId: payload.productId,
     eventType: payload.eventType ?? 'client_sync',
@@ -61,35 +61,14 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
 
   await subscriptions.upsert(subscriptionDoc);
   const storedSubscription = await subscriptions.getByOwnerId(ownerId);
-  const effectiveIsPro = hasActiveProEntitlement(storedSubscription);
-  const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, effectiveIsPro);
+  const hasPro = hasActiveProEntitlement(storedSubscription);
+  const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, hasPro);
 
   return {
     subscription: storedSubscription ?? subscriptionDoc,
     quotaStatus,
   };
 }
-
-router.post('/v1/billing/apple-webhook', async (req, res) => {
-  try {
-    if (!req.body || typeof req.body.signedPayload !== 'string') {
-      appendLog(`${new Date().toISOString()}  WEBHOOK  -  ignored  error=missing_signedPayload`);
-      return res.status(200).json({ status: 'ignored', detail: 'missing signedPayload' });
-    }
-
-    const result = await processAppleWebhook(req.body);
-    if (!result.handled && result.error) {
-      if (result.error.startsWith('unmatched')) {
-        return res.status(200).json({ status: 'queued', detail: result.error });
-      }
-      return res.status(200).json({ status: 'ignored', detail: result.error });
-    }
-    return res.status(200).json({ status: 'ok', eventType: result.eventType });
-  } catch (error) {
-    appendLog(`${new Date().toISOString()}  WEBHOOK  -  error  error=${String(error)}`);
-    return res.status(500).json({ error: 'Webhook processing failed' });
-  }
-});
 
 router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, res) => {
   try {
@@ -100,41 +79,6 @@ router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, re
 
     const result = await upsertSubscriptionFromSyncPayload(req.user!.uid, parsed.data);
 
-    const ownerId = req.user!.uid;
-    const subscriptions = getSubscriptionsRepository();
-
-    // Replay orphaned webhooks if originalTransactionId was provided
-    if (parsed.data.originalTransactionId) {
-      try {
-        const pool = getPostgresPool();
-        if (pool) {
-          const orphans = await pool.query(
-            'SELECT notification_type FROM apple_webhook_orphans WHERE original_transaction_id = $1',
-            [parsed.data.originalTransactionId]
-          );
-          for (const orphan of orphans.rows) {
-            if (['EXPIRED', 'REFUND', 'GRACE_PERIOD_EXPIRED', 'REVOKE'].includes(orphan.notification_type)) {
-              await subscriptions.updateFromAppleWebhook(ownerId, {
-                isPro: false,
-                eventType: `apple_orphan_${orphan.notification_type.toLowerCase()}`,
-              });
-              appendLog(`${new Date().toISOString()}  SYNC  ${orphan.notification_type}  replayed  ownerId=${ownerId}`);
-            }
-          }
-          if (orphans.rows.length > 0) {
-            await pool.query(
-              'DELETE FROM apple_webhook_orphans WHERE original_transaction_id = $1',
-              [parsed.data.originalTransactionId]
-            );
-          }
-        }
-      } catch {
-        // non-fatal
-      }
-    }
-
-    appendLog(`${new Date().toISOString()}  SYNC  ${parsed.data.iapkitStore ?? '-'}  ok  ownerId=${ownerId}  isPro=${parsed.data.isPro}  originalTxId=${parsed.data.originalTransactionId ?? '-'}`);
-
     return res.json({
       ...result,
       verification: {
@@ -143,7 +87,6 @@ router.post('/v1/billing/subscription/sync', requireFirebaseAuth, async (req, re
       },
     });
   } catch (error) {
-    appendLog(`${new Date().toISOString()}  SYNC  -  error  error=${String(error)}`);
     return res.status(500).json({ error: 'Failed to sync billing subscription', details: String(error) });
   }
 });

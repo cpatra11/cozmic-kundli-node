@@ -3,12 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import { runKundliAgentV2 } from '../services/newAgent.js';
-import { env } from '../config/env.js';
 import { buildChatMessageEmbedding, queryRelevantSessionMemories } from '../services/chatMemory.js';
 import { getChatRepository } from '../repositories/chatRepository.js';
 import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { getUsageQuotasRepository, type QuotaStatusSnapshot } from '../repositories/usageQuotasRepository.js';
+import { env } from '../config/env.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
 
 const CreateSessionSchema = z.object({
