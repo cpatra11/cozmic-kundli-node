@@ -2,7 +2,7 @@ name: Deploy to EC2
 
 on:
   push:
-    branches: [feat/conversation-memory-cleanup]
+    branches: [feat/agent-mode-classification-guardrails]
   workflow_dispatch:
 
 jobs:
@@ -103,4 +103,4 @@ jobs:
             sudo systemctl restart cozmic
             sleep 3
             echo "be1: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/ping)"
-            echo "cozmic: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8787/health)"
+            echo "cozmic: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8789/health)"
