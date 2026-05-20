@@ -101,7 +101,7 @@ export class SubscriptionsRepository {
     );
 
     const existingEventType = existingResponse.rows[0]?.event_type ?? null;
-    if (existingEventType === 'admin_revoke') {
+    if (existingEventType === 'admin_revoke' && !changes.isPro) {
       return;
     }
 
@@ -155,8 +155,12 @@ export class SubscriptionsRepository {
     );
 
     const existingEventType = existingResponse.rows[0]?.event_type ?? null;
-    const shouldSkipUpdate = existingEventType === 'admin_revoke' && 
-      subscription.eventType !== 'admin_revoke';
+    const isTrustedEvent =
+      subscription.eventType === 'iapkit_verified' ||
+      subscription.eventType?.startsWith('webhook_');
+    const shouldSkipUpdate = existingEventType === 'admin_revoke' &&
+      subscription.eventType !== 'admin_revoke' &&
+      !isTrustedEvent;
     
     if (shouldSkipUpdate) {
       return;

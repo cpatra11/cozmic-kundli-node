@@ -1,6 +1,6 @@
 const RASHI_NAMES = ['Aries', 'Taurus', 'Gemini', 'Cancer', 'Leo', 'Virgo', 'Libra', 'Scorpio', 'Sagittarius', 'Capricorn', 'Aquarius', 'Pisces'];
 
-function getRashiName(r: number): string {
+export function getRashiName(r: number): string {
   return RASHI_NAMES[(r - 1 + 12) % 12] || `Rashi ${r}`;
 }
 
@@ -165,6 +165,12 @@ export function formatDashaTimeline(payload: any, nesting: number): string {
   if (!dashaRoot || !(dashaRoot.periods || dashaRoot.nesting)) return '';
 
   const lines: string[] = ['=== DASHA TIMELINE ==='];
+
+  const omittedCount = (dashaRoot as any)._omittedPastPeriods;
+  if (omittedCount) {
+    lines.push(`[${omittedCount} past periods omitted — older than 5 years]`);
+  }
+
   const maxDisplayDepth = 2;
   formatPeriodTree(dashaRoot, 1, Math.max(maxDisplayDepth, nesting ?? 2), '', true, lines);
   return lines.join('\n');
@@ -275,7 +281,7 @@ export function formatDoshaAnalysis(payload: any): string {
   return '=== DOSHA ANALYSIS ===\n' + lines.join('\n');
 }
 
-function computeNatalHouseMap(transitGraha: Record<string, any>, natalLagnaRashi: number): Record<string, number> {
+export function computeNatalHouseMap(transitGraha: Record<string, any>, natalLagnaRashi: number): Record<string, number> {
   const map: Record<string, number> = {};
   if (typeof natalLagnaRashi !== 'number') return map;
   for (const [planet, data] of Object.entries(transitGraha)) {
@@ -300,6 +306,8 @@ export function formatTransitSnapshots(
   const lines: string[] = ['=== GOCHAR (TRANSIT) SNAPSHOTS ==='];
   const dateKeys = Object.keys(transitSnapshots).sort();
 
+  const degFmt = (d: any): string => (typeof d === 'number' ? d.toFixed(1) + '°' : '—');
+
   for (const dateKey of dateKeys) {
     const snapData = transitSnapshots[dateKey];
     const graha = snapData?.graha as Record<string, any> | undefined;
@@ -307,12 +315,14 @@ export function formatTransitSnapshots(
 
     const isCurrent = dateKey === new Date().toISOString().slice(0, 10);
     const houseMap = computeNatalHouseMap(graha, natalLagnaRashi);
-    lines.push(`${dateKey}${isCurrent ? ' (current)' : ''}`);
+    lines.push(`**${dateKey}${isCurrent ? ' (current)' : ''}**`);
+    lines.push('| Planet | Rashi | No. | House | Degree |');
+    lines.push('|--------|-------|-----|-------|--------|');
     for (const [planet, data] of Object.entries(graha)) {
       const r = data?.rashi;
       const nh = houseMap?.[planet];
       if (r || nh) {
-        lines.push(`  ${planet}: ${r ? getRashiName(r) : '?'} House ${nh || '?'}`);
+        lines.push(`| ${planet} | ${r ? getRashiName(r) : '?'} | ${r ?? '?'} | ${nh || '?'} | ${degFmt(data?.longitude)} |`);
       }
     }
   }
@@ -350,6 +360,13 @@ export function formatSadeSati(
 
   if (!lines.length) return '';
   return `=== SADE SATI / DHAIYA ANALYSIS ===\nMoon birth rashi: ${getRashiName(moonRashi)}\n${lines.join('\n')}`;
+}
+
+export function formatAyanamsa(payload: any): string {
+  const p = getPayload(payload);
+  const ayanamsa = p?.ayanamsa;
+  if (!ayanamsa) return '';
+  return `=== AYANAMSAA ===\nAyanamsa: ${String(ayanamsa.value ?? ayanamsa)} ${ayanamsa.system || ''}`.trim();
 }
 
 export function formatAllChartData(

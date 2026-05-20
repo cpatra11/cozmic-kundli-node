@@ -323,10 +323,12 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
     const rawHistory = fastMessage
       ? []
       : await chatRepository.listSessionMessages(req.user!.uid, sessionId, 10);
-    const conversationHistory = rawHistory.map(m => ({
-      role: m.role as 'user' | 'assistant',
-      message: m.message,
-    }));
+    const conversationHistory = rawHistory
+      .filter(m => !m.message.startsWith('I encountered an error'))
+      .map(m => ({
+        role: m.role as 'user' | 'assistant',
+        message: m.message,
+      }));
 
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
@@ -476,10 +478,12 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
     const rawHistory = fastMessage
       ? []
       : await chatRepository.listSessionMessages(req.user!.uid, sessionId, 10);
-    const conversationHistory = rawHistory.map(m => ({
-      role: m.role as 'user' | 'assistant',
-      message: m.message,
-    }));
+    const conversationHistory = rawHistory
+      .filter(m => !m.message.startsWith('I encountered an error'))
+      .map(m => ({
+        role: m.role as 'user' | 'assistant',
+        message: m.message,
+      }));
 
     const userMessage: ChatMessageDoc = {
       ownerId: req.user!.uid,
