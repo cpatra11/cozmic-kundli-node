@@ -264,8 +264,9 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
       const usageQuotas = getUsageQuotasRepository();
       const subscription = await subscriptions.getByOwnerId(req.user!.uid);
       const hasPro = hasActiveProEntitlement(subscription);
+      const billingAnchorMs = subscription?.billingAnchorMs;
 
-      const consumed = await usageQuotas.consumeQuota(req.user!.uid, hasPro, 'kundli_generate');
+      const consumed = await usageQuotas.consumeQuota(req.user!.uid, hasPro, 'kundli_generate', billingAnchorMs);
       if (!consumed.allowed) {
         return res.status(429).json({
           error: 'Monthly quota exceeded',

@@ -4,8 +4,10 @@ import { env } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import type { UserSubscriptionDocument } from '../models/firestoreModels.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
-import { getUsageQuotasRepository } from '../repositories/usageQuotasRepository.js';
+import { getUsageQuotasRepository, type QuotaStatusSnapshot } from '../repositories/usageQuotasRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
+
+const BILLING_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
 const router = Router();
 
@@ -39,6 +41,9 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
 
   const effectiveIsPro = payload.iapkitValid === false ? false : payload.isPro;
 
+  const existingSubscription = await subscriptions.getByOwnerId(ownerId);
+  const billingAnchorMs = existingSubscription?.billingAnchorMs ?? (payload.expiresAtMs != null ? payload.expiresAtMs - BILLING_MONTH_MS : now);
+
   const subscriptionDoc: UserSubscriptionDocument = {
     ownerId,
     source: payload.source,
@@ -54,6 +59,7 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
     iapkitValid: payload.iapkitValid,
     iapkitStore: payload.iapkitStore,
     expiresAtMs: payload.expiresAtMs,
+    billingAnchorMs,
     updatedAt: now,
     lastEventAt: now,
     lastEventId: payload.lastEventId,
@@ -62,7 +68,7 @@ async function upsertSubscriptionFromSyncPayload(ownerId: string, payload: z.inf
   await subscriptions.upsert(subscriptionDoc);
   const storedSubscription = await subscriptions.getByOwnerId(ownerId);
   const hasPro = hasActiveProEntitlement(storedSubscription);
-  const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, hasPro);
+  const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, hasPro, billingAnchorMs);
 
   return {
     subscription: storedSubscription ?? subscriptionDoc,
@@ -98,7 +104,8 @@ router.get('/v1/billing/subscription', requireFirebaseAuth, async (req, res) => 
     const ownerId = req.user!.uid;
     const doc = await subscriptions.getByOwnerId(ownerId);
     const hasPro = hasActiveProEntitlement(doc);
-    const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, hasPro);
+    const billingAnchorMs = doc?.billingAnchorMs;
+    const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, hasPro, billingAnchorMs);
 
     if (!doc) {
       return res.json({
@@ -130,7 +137,8 @@ router.get('/v1/billing/quota-status', requireFirebaseAuth, async (req, res) => 
     const ownerId = req.user!.uid;
     const subscription = await subscriptions.getByOwnerId(ownerId);
     const hasPro = hasActiveProEntitlement(subscription);
-    const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, hasPro);
+    const billingAnchorMs = subscription?.billingAnchorMs;
+    const quotaStatus = await usageQuotas.getQuotaStatus(ownerId, hasPro, billingAnchorMs);
 
     return res.json({ quotaStatus });
   } catch (error) {

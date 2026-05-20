@@ -34,6 +34,7 @@ export interface UserSubscriptionDocument {
   iapkitValid?: boolean;
   iapkitStore?: 'apple' | 'google' | 'unknown';
   expiresAtMs?: number;
+  billingAnchorMs?: number;
   updatedAt: number;
   lastEventAt: number;
   lastEventId?: string;

@@ -29,6 +29,7 @@ const AgentState = Annotation.Root({
   profileId: Annotation<string | null>,
   mode: Annotation<'mini' | 'pro'>,
   isExplicitMode: Annotation<boolean>,
+  isPro: Annotation<boolean>,
   kundliInput: Annotation<KundliSnapshotInput | null>,
 
   topLevelRoute: Annotation<'pipeline' | 'smalltalk' | 'general_astro' | null>,
@@ -427,7 +428,7 @@ async function executeFetchSection(
   kundli: KundliSnapshotInput | null,
   section: string,
   input: Record<string, unknown>,
-  options?: { mode?: 'mini' | 'pro'; isExplicitMode?: boolean }
+  options?: { mode?: 'mini' | 'pro'; isPro?: boolean }
 ): Promise<Record<string, unknown>> {
   if (!kundli) {
     return { error: 'No birth details available. Please provide birth date, time, and place.' };
@@ -436,10 +437,12 @@ async function executeFetchSection(
   const vargas = (input.vargas as string[]) || ['D1'];
   const nesting = Math.max(1, Math.min(5, (input.nesting as number) ?? 2));
 
-  // Hard block non-D1 vargas only in explicit mini mode (caller explicitly chose mini)
-  const isHardMini = options?.mode === 'mini' && options?.isExplicitMode;
-  if (isHardMini && section === 'basic' && vargas.some(v => v !== 'D1')) {
-    return { error: 'Mini mode: D1 chart only. Upgrade to Pro for multi-varga access.' };
+  // Hard block non-D1 vargas in mini mode
+  if (options?.mode === 'mini' && vargas.some(v => v !== 'D1')) {
+    const proMessage = options?.isPro
+      ? 'Switch to Pro mode for multi-varga access.'
+      : 'Upgrade to Pro for multi-varga access.';
+    return { error: `Mini mode: D1 chart only. ${proMessage}` };
   }
 
   // lordshipVarga validation for dasha
@@ -625,7 +628,7 @@ function buildAgentSystemPrompt(state: AgentStateType, chartDataCached: boolean)
   const profileNote = state.profileId ? `\nUser has a saved birth chart (profileId: ${state.profileId}).` : '';
 
   const upgradeNote = state.mode === 'mini'
-    ? `\nMini mode: D1 (Rasi) chart data available. If the question needs divisional charts (D9, D10, etc.), work with what you have from D1 — do not mention mode limitations or suggest upgrades.`
+    ? `\nMini mode: D1 (Rasi) chart data only. If the question needs divisional charts (D9, D10, etc.), ${state.isPro ? 'mention they should switch to Pro mode for multi-varga access.' : 'briefly explain that upgrading to Pro is required for multi-varga access.'}`
     : '';
 
   const retryNote = isRetry
@@ -880,7 +883,7 @@ async function agentNode(state: AgentStateType): Promise<Partial<AgentStateType>
               const section = sectionMap[tu.name] || 'basic';
               result = await executeFetchSection(state.kundliInput, section, tu.input, {
                 mode: state.mode,
-                isExplicitMode: state.isExplicitMode,
+                isPro: state.isPro,
               });
               if (result.rawPayload) {
                 sectionRawPayloads[section] = result.rawPayload as Record<string, unknown>;
@@ -1189,6 +1192,7 @@ export async function runKundliAgentV2(
     profileId?: string;
     kundli?: KundliSnapshotInput;
     mode?: 'mini' | 'pro' | 'auto';
+    isPro?: boolean;
     sessionId?: string;
     relevantMemories?: RelevantChatMemory[];
     conversationHistory?: ChatHistoryMessage[];
@@ -1227,6 +1231,7 @@ export async function runKundliAgentV2(
       profileId: input.profileId || null,
       mode: resolvedMode,
       isExplicitMode,
+      isPro: input.isPro ?? false,
       kundliInput: input.kundli || null,
       chartData: null,
       transitSnapshots: null,

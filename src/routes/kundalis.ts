@@ -5,6 +5,7 @@ import type { RagProfileDocument } from '../models/firestoreModels.js';
 import { getRagProfilesRepository } from '../repositories/ragProfilesRepository.js';
 import { getChatRepository } from '../repositories/chatRepository.js';
 import { getUsageQuotasRepository } from '../repositories/usageQuotasRepository.js';
+import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { buildChartSnapshot } from '../services/chartSnapshot.js';
 import { fetchBe1Calculate } from '../services/be1Client.js';
 import { getPostgresPool } from '../services/postgresClient.js';
@@ -281,7 +282,11 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
       await pool.query(`DELETE FROM charts WHERE owner_id = $1 AND kundali_id = $2`, [req.user!.uid, profileDoc.profileId]);
     }
 
-    await usageQuotas.refundQuota(req.user!.uid, 'kundli_generate');
+    const subscriptions = getSubscriptionsRepository();
+    const subscription = await subscriptions.getByOwnerId(req.user!.uid);
+    const billingAnchorMs = subscription?.billingAnchorMs;
+
+    await usageQuotas.refundQuota(req.user!.uid, 'kundli_generate', billingAnchorMs);
 
     await cacheDelete(`kundali:${req.user!.uid}:${profileDoc.profileId}`);
 

@@ -7,7 +7,7 @@ export type PlanTier = 'pro' | 'free';
 
 interface MonthlyUsageCounterRow {
   owner_id: string;
-  year_month: string;
+  period_start_ms: number;
   mini_chat_used: number;
   pro_chat_used: number;
   kundli_generate_used: number;
@@ -31,6 +31,7 @@ export interface QuotaBucketStatus {
 export interface QuotaStatusSnapshot {
   ownerId: string;
   planTier: PlanTier;
+  periodStartMs: number;
   yearMonth: string;
   resetAtMs: number;
   enforcementEnabled: boolean;
@@ -44,6 +45,8 @@ export interface QuotaConsumeResult {
   quotaType: UsageQuotaType;
   status: QuotaStatusSnapshot;
 }
+
+const BILLING_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
 const QUOTA_FIELD_BY_TYPE: Record<UsageQuotaType, keyof MonthlyUsageCounterRow> = {
   mini_chat: 'mini_chat_used',
@@ -73,19 +76,26 @@ function getMonthlyQuotaLimits(isPro: boolean): MonthlyQuotaLimits {
   };
 }
 
-function resolveMonthlyWindow(nowMs: number): { yearMonth: string; resetAtMs: number } {
+export function resolveMonthlyWindow(nowMs: number, anchorDateMs?: number): { periodStartMs: number; resetAtMs: number } {
+  if (anchorDateMs !== undefined) {
+    const monthsSinceAnchor = Math.floor((nowMs - anchorDateMs) / BILLING_MONTH_MS);
+    const periodStartMs = anchorDateMs + monthsSinceAnchor * BILLING_MONTH_MS;
+    const resetAtMs = periodStartMs + BILLING_MONTH_MS;
+    return { periodStartMs, resetAtMs };
+  }
+
   const current = new Date(nowMs);
   const year = current.getUTCFullYear();
   const monthIndex = current.getUTCMonth();
-  const yearMonth = `${year}-${String(monthIndex + 1).padStart(2, '0')}`;
+  const periodStartMs = Date.UTC(year, monthIndex, 1, 0, 0, 0, 0);
   const resetAtMs = Date.UTC(year, monthIndex + 1, 1, 0, 0, 0, 0);
-  return { yearMonth, resetAtMs };
+  return { periodStartMs, resetAtMs };
 }
 
-function buildEmptyCounterRow(ownerId: string, yearMonth: string, nowMs: number): MonthlyUsageCounterRow {
+function buildEmptyCounterRow(ownerId: string, periodStartMs: number, nowMs: number): MonthlyUsageCounterRow {
   return {
     owner_id: ownerId,
-    year_month: yearMonth,
+    period_start_ms: periodStartMs,
     mini_chat_used: 0,
     pro_chat_used: 0,
     kundli_generate_used: 0,
@@ -114,15 +124,19 @@ function toPlanTier(isPro: boolean): PlanTier {
 function buildQuotaStatusSnapshot(args: {
   ownerId: string;
   planTier: PlanTier;
-  yearMonth: string;
+  periodStartMs: number;
   resetAtMs: number;
   limits: MonthlyQuotaLimits;
   row: MonthlyUsageCounterRow;
 }): QuotaStatusSnapshot {
+  const periodDate = new Date(args.periodStartMs);
+  const yearMonth = `${periodDate.getUTCFullYear()}-${String(periodDate.getUTCMonth() + 1).padStart(2, '0')}`;
+
   return {
     ownerId: args.ownerId,
     planTier: args.planTier,
-    yearMonth: args.yearMonth,
+    periodStartMs: args.periodStartMs,
+    yearMonth,
     resetAtMs: args.resetAtMs,
     enforcementEnabled: env.QUOTA_CONFIG.enabled,
     miniChat: toBucketStatus(args.row.mini_chat_used, args.limits.miniChat),
@@ -148,36 +162,36 @@ export class UsageQuotasRepository {
     return pool;
   }
 
-  async getQuotaStatus(ownerId: string, isPro: boolean, nowMs = Date.now()): Promise<QuotaStatusSnapshot> {
+  async getQuotaStatus(ownerId: string, isPro: boolean, anchorDateMs?: number, nowMs = Date.now()): Promise<QuotaStatusSnapshot> {
     const pool = await this.withPool();
-    const { yearMonth, resetAtMs } = resolveMonthlyWindow(nowMs);
+    const { periodStartMs, resetAtMs } = resolveMonthlyWindow(nowMs, anchorDateMs);
     const limits = getMonthlyQuotaLimits(isPro);
 
     const response = await pool.query<MonthlyUsageCounterRow>(
       `
-      SELECT owner_id, year_month, mini_chat_used, pro_chat_used, kundli_generate_used, created_at, updated_at
+      SELECT owner_id, period_start_ms, mini_chat_used, pro_chat_used, kundli_generate_used, created_at, updated_at
       FROM monthly_usage_counters
-      WHERE owner_id = $1 AND year_month = $2
+      WHERE owner_id = $1 AND period_start_ms = $2
       LIMIT 1
       `,
-      [ownerId, yearMonth]
+      [ownerId, periodStartMs]
     );
 
-    const row = response.rows[0] ?? buildEmptyCounterRow(ownerId, yearMonth, nowMs);
+    const row = response.rows[0] ?? buildEmptyCounterRow(ownerId, periodStartMs, nowMs);
 
     return buildQuotaStatusSnapshot({
       ownerId,
       planTier: toPlanTier(isPro),
-      yearMonth,
+      periodStartMs,
       resetAtMs,
       limits,
       row,
     });
   }
 
-  async consumeQuota(ownerId: string, isPro: boolean, quotaType: UsageQuotaType, nowMs = Date.now()): Promise<QuotaConsumeResult> {
+  async consumeQuota(ownerId: string, isPro: boolean, quotaType: UsageQuotaType, anchorDateMs?: number, nowMs = Date.now()): Promise<QuotaConsumeResult> {
     const pool = await this.withPool();
-    const { yearMonth, resetAtMs } = resolveMonthlyWindow(nowMs);
+    const { periodStartMs, resetAtMs } = resolveMonthlyWindow(nowMs, anchorDateMs);
     const limits = getMonthlyQuotaLimits(isPro);
     const planTier = toPlanTier(isPro);
     const quotaColumn = QUOTA_FIELD_BY_TYPE[quotaType];
@@ -190,35 +204,35 @@ export class UsageQuotasRepository {
         `
         INSERT INTO monthly_usage_counters (
           owner_id,
-          year_month,
+          period_start_ms,
           mini_chat_used,
           pro_chat_used,
           kundli_generate_used,
           created_at,
           updated_at
         ) VALUES ($1, $2, 0, 0, 0, $3, $3)
-        ON CONFLICT (owner_id, year_month)
+        ON CONFLICT (owner_id, period_start_ms)
         DO NOTHING
         `,
-        [ownerId, yearMonth, nowMs]
+        [ownerId, periodStartMs, nowMs]
       );
 
       const lockedRowResponse = await client.query<MonthlyUsageCounterRow>(
         `
-        SELECT owner_id, year_month, mini_chat_used, pro_chat_used, kundli_generate_used, created_at, updated_at
+        SELECT owner_id, period_start_ms, mini_chat_used, pro_chat_used, kundli_generate_used, created_at, updated_at
         FROM monthly_usage_counters
-        WHERE owner_id = $1 AND year_month = $2
+        WHERE owner_id = $1 AND period_start_ms = $2
         LIMIT 1
         FOR UPDATE
         `,
-        [ownerId, yearMonth]
+        [ownerId, periodStartMs]
       );
 
-      const lockedRow = lockedRowResponse.rows[0] ?? buildEmptyCounterRow(ownerId, yearMonth, nowMs);
+      const lockedRow = lockedRowResponse.rows[0] ?? buildEmptyCounterRow(ownerId, periodStartMs, nowMs);
       const currentStatus = buildQuotaStatusSnapshot({
         ownerId,
         planTier,
-        yearMonth,
+        periodStartMs,
         resetAtMs,
         limits,
         row: lockedRow,
@@ -238,10 +252,10 @@ export class UsageQuotasRepository {
         UPDATE monthly_usage_counters
         SET ${quotaColumn} = ${quotaColumn} + 1,
             updated_at = $3
-        WHERE owner_id = $1 AND year_month = $2
-        RETURNING owner_id, year_month, mini_chat_used, pro_chat_used, kundli_generate_used, created_at, updated_at
+        WHERE owner_id = $1 AND period_start_ms = $2
+        RETURNING owner_id, period_start_ms, mini_chat_used, pro_chat_used, kundli_generate_used, created_at, updated_at
         `,
-        [ownerId, yearMonth, nowMs]
+        [ownerId, periodStartMs, nowMs]
       );
 
       await client.query('COMMIT');
@@ -253,7 +267,7 @@ export class UsageQuotasRepository {
         status: buildQuotaStatusSnapshot({
           ownerId,
           planTier,
-          yearMonth,
+          periodStartMs,
           resetAtMs,
           limits,
           row: updatedRow,
@@ -267,17 +281,17 @@ export class UsageQuotasRepository {
     }
   }
 
-  async refundQuota(ownerId: string, quotaType: UsageQuotaType, nowMs = Date.now()): Promise<void> {
+  async refundQuota(ownerId: string, quotaType: UsageQuotaType, anchorDateMs?: number, nowMs = Date.now()): Promise<void> {
     const pool = await this.withPool();
-    const { yearMonth } = resolveMonthlyWindow(nowMs);
+    const { periodStartMs } = resolveMonthlyWindow(nowMs, anchorDateMs);
     const quotaColumn = QUOTA_FIELD_BY_TYPE[quotaType];
 
     await pool.query(
-      `UPDATE monthly_usage_counters 
+      `UPDATE monthly_usage_counters
        SET ${quotaColumn} = GREATEST(0, ${quotaColumn} - 1),
            updated_at = $3
-       WHERE owner_id = $1 AND year_month = $2`,
-      [ownerId, yearMonth, nowMs]
+       WHERE owner_id = $1 AND period_start_ms = $2`,
+      [ownerId, periodStartMs, nowMs]
     );
   }
 }

@@ -87,12 +87,16 @@ async function evaluateChatAccess(ownerId: string, mode: 'mini' | 'pro'): Promis
   const usageQuotasRepository = getUsageQuotasRepository();
   const subscription = await subscriptionsRepository.getByOwnerId(ownerId);
   const hasPro = hasActiveProEntitlement(subscription);
+  const billingAnchorMs = subscription?.billingAnchorMs;
 
   if (!env.QUOTA_CONFIG.enabled) {
+    const quotaStatus = await usageQuotasRepository.getQuotaStatus(ownerId, hasPro, billingAnchorMs);
+
     if (mode === 'pro' && !hasPro) {
       return {
         allowed: false,
         hasPro,
+        quotaStatus,
         statusCode: 402,
         payload: {
           error: 'Pro subscription required',
@@ -105,11 +109,12 @@ async function evaluateChatAccess(ownerId: string, mode: 'mini' | 'pro'): Promis
     return {
       allowed: true,
       hasPro,
+      quotaStatus,
     };
   }
 
   const quotaType = mode === 'pro' ? 'pro_chat' : 'mini_chat';
-  const consumed = await usageQuotasRepository.consumeQuota(ownerId, hasPro, quotaType);
+  const consumed = await usageQuotasRepository.consumeQuota(ownerId, hasPro, quotaType, billingAnchorMs);
 
   if (consumed.allowed) {
     return {
@@ -356,6 +361,7 @@ router.post('/v1/chat/sessions/:sessionId/messages/stream', requireFirebaseAuth,
       ownerId: req.user!.uid,
       message: parsed.data.message,
       mode: requestedMode,
+      isPro: accessDecision.hasPro,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
       sessionId: sessionId,
@@ -503,6 +509,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       ownerId: req.user!.uid,
       message: parsed.data.message,
       mode: requestedMode,
+      isPro: accessDecision.hasPro,
       profileId: effectiveProfileId,
       kundli: parsed.data.kundli,
       sessionId: sessionId,
@@ -518,6 +525,7 @@ router.post('/v1/chat/sessions/:sessionId/messages', requireFirebaseAuth, async 
       sessionId,
       kundaliId: effectiveProfileId,
       requestId,
+      quotaStatus: accessDecision.quotaStatus,
     });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to process message', details: String(error) });
