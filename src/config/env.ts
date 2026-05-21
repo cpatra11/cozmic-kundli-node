@@ -115,22 +115,6 @@ const EnvSchema = z.object({
     }),
   LLM_PROVIDER: z.enum(['gemini-adk', 'deepseek-bedrock']).default('deepseek-bedrock'),
   AWS_REGION: z.string().default('us-east-1'),
-  REDIS_URL: z.string().optional(),
-  VALKEY_CONFIG: z
-    .string()
-    .optional()
-    .transform((value) => {
-      const defaultValue = {
-        enabled: true,
-        cooldown_ms: 60000,
-      };
-      if (!value) return defaultValue;
-      try {
-        return JSON.parse(value);
-      } catch {
-        return defaultValue;
-      }
-    }),
   CACHE_CONFIG: z
     .string()
     .optional()

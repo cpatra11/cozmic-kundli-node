@@ -1,4 +1,14 @@
-import type { ToolConfiguration } from '@aws-sdk/client-bedrock-runtime';
+type ToolConfiguration = {
+  tools: Array<{
+    toolSpec: {
+      name: string;
+      description: string;
+      inputSchema: {
+        json: Record<string, unknown>;
+      };
+    };
+  }>;
+};
 
 const FETCH_PLANETS_DEF = {
   toolSpec: {

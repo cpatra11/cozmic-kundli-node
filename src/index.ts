@@ -9,8 +9,6 @@ import voiceRoutes from './routes/voice.js';
 import ragRoutes from './routes/rag.js';
 import billingRoutes from './routes/billing.js';
 import { expensiveEndpointRateLimit } from './middleware/rateLimit.js';
-import { disconnectValkey } from './services/valkeyCache.js';
-
 // Catch background Postgres connection timeouts during long LLM calls
 // These are idle connections timing out — not application errors
 process.on('uncaughtException', (error) => {
@@ -82,15 +80,10 @@ app.listen(env.PORT, '0.0.0.0', () => {
   console.log(`cozmic-rag-agents listening on http://localhost:${env.PORT}`);
 });
 
-async function shutdown() {
-  await disconnectValkey();
-  process.exit(0);
-}
-
 process.on('SIGINT', () => {
-  void shutdown();
+  process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  void shutdown();
+  process.exit(0);
 });
