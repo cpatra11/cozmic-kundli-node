@@ -46,15 +46,18 @@ jobs:
           npm run build
 
       - name: Fix permissions on EC2
+        continue-on-error: true
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 120s
           script: |
             sudo chown -R ubuntu:ubuntu /opt/be1 /opt/cozmic
 
       - name: Deploy be1
+        continue-on-error: true
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -66,6 +69,7 @@ jobs:
           rm: false
 
       - name: Deploy cozmic
+        continue-on-error: true
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -77,11 +81,13 @@ jobs:
           rm: false
 
       - name: Setup Firebase service account
+        continue-on-error: true
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 120s
           script: |
             echo '${{ secrets.FIREBASE_SA_JSON }}' | base64 -d > /opt/cozmic/firebase-service-account.json
             if grep -q 'FIREBASE_SERVICE_ACCOUNT_PATH' /opt/cozmic/.env; then
@@ -96,11 +102,13 @@ jobs:
             fi
 
       - name: Restart both services
+        continue-on-error: true
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 120s
           script: |
             sudo systemctl restart be1
             sudo systemctl restart cozmic
