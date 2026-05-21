@@ -91,11 +91,6 @@ jobs:
             else
               echo 'FIREBASE_SERVICE_ACCOUNT_PATH=/opt/cozmic/firebase-service-account.json' >> /opt/cozmic/.env
             fi
-            if grep -q 'AWS_BEARER_TOKEN_BEDROCK' /opt/cozmic/.env; then
-              sed -i 's|AWS_BEARER_TOKEN_BEDROCK=.*|AWS_BEARER_TOKEN_BEDROCK=${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}|' /opt/cozmic/.env
-            else
-              echo 'AWS_BEARER_TOKEN_BEDROCK=${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}' >> /opt/cozmic/.env
-            fi
 
       - name: Restart both services
         uses: appleboy/ssh-action@v1.0.3
