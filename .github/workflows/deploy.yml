@@ -83,9 +83,7 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            cat > /opt/cozmic/firebase-service-account.json << 'EOF'
-            ${{ secrets.FIREBASE_SA_JSON }}
-            EOF
+            echo '${{ secrets.FIREBASE_SA_JSON }}' | base64 -d > /opt/cozmic/firebase-service-account.json
             if grep -q 'FIREBASE_SERVICE_ACCOUNT_PATH' /opt/cozmic/.env; then
               sed -i 's|FIREBASE_SERVICE_ACCOUNT_PATH=.*|FIREBASE_SERVICE_ACCOUNT_PATH=/opt/cozmic/firebase-service-account.json|' /opt/cozmic/.env
             else
