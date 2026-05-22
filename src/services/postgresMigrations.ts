@@ -17,7 +17,7 @@ interface MigrationFile {
 async function listMigrationFiles(): Promise<MigrationFile[]> {
   const entries = await readdir(MIGRATIONS_DIR, { withFileTypes: true });
   const files = entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.sql'))
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.sql') && !entry.name.startsWith('.'))
     .map((entry) => entry.name)
     .sort((a, b) => a.localeCompare(b));
 

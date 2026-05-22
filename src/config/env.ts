@@ -137,6 +137,9 @@ const EnvSchema = z.object({
   PRO_ENTITLEMENT_ID: z.string().default('pro'),
   APPLE_BUNDLE_ID: z.string().optional(),
   APPLE_APP_ID: z.string().optional(),
+  CONTACT_SMTP_USER: z.string().optional(),
+  CONTACT_SMTP_PASS: z.string().optional(),
+  CONTACT_EMAIL_TO: z.string().optional(),
 });
 
 export const env = EnvSchema.parse(process.env);

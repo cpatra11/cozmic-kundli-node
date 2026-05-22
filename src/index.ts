@@ -8,6 +8,7 @@ import kundaliRoutes from './routes/kundalis.js';
 import voiceRoutes from './routes/voice.js';
 import ragRoutes from './routes/rag.js';
 import billingRoutes from './routes/billing.js';
+import contactRoutes from './routes/contact.js';
 import { expensiveEndpointRateLimit } from './middleware/rateLimit.js';
 // Catch background Postgres connection timeouts during long LLM calls
 // These are idle connections timing out — not application errors
@@ -67,6 +68,7 @@ app.use(billingRoutes);
 app.use(kundaliRoutes);
 app.use(voiceRoutes);
 app.use(ragRoutes);
+app.use(contactRoutes);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   res.status(500).json({
