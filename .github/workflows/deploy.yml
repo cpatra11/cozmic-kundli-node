@@ -2,7 +2,7 @@ name: Deploy to EC2
 
 on:
   push:
-    branches: [feat/agent-mode-classification-guardrails]
+    branches: [feat/contact-form-migration-fix]
   workflow_dispatch:
 
 jobs:
