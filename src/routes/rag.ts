@@ -298,6 +298,96 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
   }
 });
 
+const BirthDetailsSchema = z.object({
+  name: z.string().optional(),
+  latitude: z.number(),
+  longitude: z.number(),
+  year: z.number(),
+  month: z.number(),
+  day: z.number(),
+  hour: z.number(),
+  min: z.number(),
+  sec: z.number().default(0),
+  time_zone: z.string(),
+});
+
+const MatchmakingCalculateSchema = z.object({
+  boy: BirthDetailsSchema,
+  girl: BirthDetailsSchema,
+});
+
+function extractNakshatraFromChart(chart: any): { nak: number; pad: number } | null {
+  const panch = chart?.chart?.panchanga?.nakshatra;
+  if (panch) {
+    const nak = Number(panch.key);
+    const pad = Number(panch.pada);
+    if (Number.isFinite(nak) && nak > 0 && Number.isFinite(pad) && pad > 0) return { nak, pad };
+  }
+
+  const mo = chart?.chart?.graha?.Mo?.nakshatra;
+  if (mo) {
+    const nak = Number(mo.key);
+    const pad = Number(mo.pada);
+    if (Number.isFinite(nak) && nak > 0 && Number.isFinite(pad) && pad > 0) return { nak, pad };
+  }
+
+  const su = chart?.chart?.graha?.Su?.nakshatra;
+  if (su) {
+    const nak = Number(su.key);
+    const pad = Number(su.pada);
+    if (Number.isFinite(nak) && nak > 0 && Number.isFinite(pad) && pad > 0) return { nak, pad };
+  }
+
+  return null;
+}
+
+router.post('/v1/matchmaking/calculate', async (req, res) => {
+  try {
+    const parsed = MatchmakingCalculateSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid body', details: parsed.error.flatten() });
+    }
+
+    const { boy, girl } = parsed.data;
+
+    const [boyChart, girlChart] = await Promise.all([
+      fetchBe1Calculate(
+        { latitude: boy.latitude, longitude: boy.longitude, year: boy.year, month: boy.month, day: boy.day, hour: boy.hour, min: boy.min, sec: boy.sec, time_zone: boy.time_zone },
+        { nesting: 2, infolevel: 'basic,panchanga', varga: 'D1,D9' }
+      ),
+      fetchBe1Calculate(
+        { latitude: girl.latitude, longitude: girl.longitude, year: girl.year, month: girl.month, day: girl.day, hour: girl.hour, min: girl.min, sec: girl.sec, time_zone: girl.time_zone },
+        { nesting: 2, infolevel: 'basic,panchanga', varga: 'D1,D9' }
+      ),
+    ]);
+
+    const boySnapshot = buildChartSnapshot(boyChart);
+    const girlSnapshot = buildChartSnapshot(girlChart);
+
+    const boyNak = extractNakshatraFromChart(boySnapshot);
+    const girlNak = extractNakshatraFromChart(girlSnapshot);
+
+    if (!boyNak || !girlNak) {
+      return res.status(400).json({ error: 'Could not derive nakshatra/pada from one or both charts' });
+    }
+
+    const compatibility = await matchCompatibility({
+      boyNak: boyNak.nak,
+      boyPad: boyNak.pad,
+      girlNak: girlNak.nak,
+      girlPad: girlNak.pad,
+    });
+
+    return res.json({
+      ok: true,
+      inputs: { boyNak: boyNak.nak, boyPad: boyNak.pad, girlNak: girlNak.nak, girlPad: girlNak.pad },
+      compatibility,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Matchmaking calculation failed', details: String(error) });
+  }
+});
+
 router.get('/api/compatibility', async (req, res) => {
   try {
     const query = parseCompatibilityQuery(req.query as Record<string, unknown>);
