@@ -105,8 +105,10 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           command_timeout: 120s
           script: |
+            cat /opt/cozmic/.env | grep BE1_CONFIG
             sudo systemctl restart be1
             sudo systemctl restart cozmic
             sleep 3
-            echo "be1: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/ping)"
+            echo "be1 ping: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/ping)"
+            echo "be1 calculate: $(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:8080/api/calculate?latitude=20&longitude=85&year=2000&month=1&day=1&hour=10&min=0&sec=0&time_zone=%2B05:30&nesting=1&infolevel=basic')"
             echo "cozmic: $(curl -s -o /dev/null -w '%{http_code}' http://localhost:8789/health)"
