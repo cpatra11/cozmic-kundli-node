@@ -10,7 +10,7 @@ import { buildChartSnapshot, extractChartSchemaInfo } from '../services/chartSna
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { getUsageQuotasRepository, type QuotaStatusSnapshot } from '../repositories/usageQuotasRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
-import { parseCompatibilityQuery } from '../services/compatibility.js';
+import { matchCompatibility, parseCompatibilityQuery } from '../services/compatibility.js';
 
 const router = Router();
 
