@@ -10,6 +10,7 @@ import { buildChartSnapshot, extractChartSchemaInfo } from '../services/chartSna
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { getUsageQuotasRepository, type QuotaStatusSnapshot } from '../repositories/usageQuotasRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
+import { matchCompatibility, parseCompatibilityQuery } from '../services/compatibility.js';
 
 const router = Router();
 
@@ -297,9 +298,14 @@ router.post('/v1/chart/generate', requireFirebaseAuth, async (req, res) => {
   }
 });
 
-router.get('/api/compatibility', (_req, res) => {
-  // Compatibility endpoint disabled - use agent for compatibility questions
-  return res.status(501).json({ error: 'Compatibility endpoint deprecated. Use /v1/rag/agent instead.' });
+router.get('/api/compatibility', async (req, res) => {
+  try {
+    const query = parseCompatibilityQuery(req.query as Record<string, unknown>);
+    const result = await matchCompatibility(query);
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ error: 'Compatibility calculation failed', details: String(error) });
+  }
 });
 
 router.post('/v1/transit-chart', requireFirebaseAuth, async (req, res) => {
