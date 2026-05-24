@@ -77,7 +77,7 @@ jobs:
           strip_components: 0
           rm: false
 
-      - name: Setup Firebase service account & env
+      - name: Setup Firebase service account
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -90,11 +90,6 @@ jobs:
               sed -i 's|FIREBASE_SERVICE_ACCOUNT_PATH=.*|FIREBASE_SERVICE_ACCOUNT_PATH=/opt/cozmic/firebase-service-account.json|' /opt/cozmic/.env
             else
               echo 'FIREBASE_SERVICE_ACCOUNT_PATH=/opt/cozmic/firebase-service-account.json' >> /opt/cozmic/.env
-            fi
-            if grep -q 'BE1_CONFIG' /opt/cozmic/.env; then
-              sed -i 's|BE1_CONFIG=.*|BE1_CONFIG={"base_url":"http://localhost:8080/api"}|' /opt/cozmic/.env
-            else
-              echo 'BE1_CONFIG={"base_url":"http://localhost:8080/api"}' >> /opt/cozmic/.env
             fi
 
       - name: Restart both services

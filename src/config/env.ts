@@ -31,7 +31,7 @@ const EnvSchema = z.object({
       };
       if (!value) return defaultValue;
       try {
-        return JSON.parse(value);
+        return { ...defaultValue, ...JSON.parse(value) };
       } catch {
         return defaultValue;
       }
