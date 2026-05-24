@@ -100,7 +100,10 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           command_timeout: 120s
           script: |
-            cat /opt/cozmic/.env | grep BE1_CONFIG
+            # swetest binary in repo is ARM; EC2 is x86_64 — replace with correct arch
+            if file /opt/be1/api/swetest/src/swetest 2>/dev/null | grep -q aarch64; then
+              sudo cp /usr/local/bin/swetest /opt/be1/api/swetest/src/swetest
+            fi
             sudo systemctl restart be1
             sudo systemctl restart cozmic
             sleep 3
