@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
-import { fetchBe1Calculate, fetchTransitChart } from '../services/be1Client.js';
+import { fetchBe1Calculate, fetchBe1Json, fetchTransitChart } from '../services/be1Client.js';
 
 import { ingestKundliForProfile } from '../services/ragPipeline.js';
 import { stableHash } from '../services/hash.js';
@@ -371,11 +371,11 @@ router.post('/v1/matchmaking/calculate', async (req, res) => {
       return res.status(400).json({ error: 'Could not derive nakshatra/pada from one or both charts' });
     }
 
-    const compatibility = await matchCompatibility({
-      boyNak: boyNak.nak,
-      boyPad: boyNak.pad,
-      girlNak: girlNak.nak,
-      girlPad: girlNak.pad,
+    const compatibility = await fetchBe1Json('compatibility', {
+      boy_nak: boyNak.nak,
+      boy_pad: boyNak.pad,
+      girl_nak: girlNak.nak,
+      girl_pad: girlNak.pad,
     });
 
     return res.json({
