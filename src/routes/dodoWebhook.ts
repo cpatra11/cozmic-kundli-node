@@ -10,19 +10,21 @@ const router = Router();
 
 const BILLING_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
-// Plan ID → DodoPayments price ID mapping
 const DODO_PRICE_MAP: Record<string, string | undefined> = {
   cozmic_pro_monthly: env.DODOPAYMENTS_PRICE_MONTHLY,
   cozmic_pro_yearly: env.DODOPAYMENTS_PRICE_YEARLY,
 };
 
-// Plan duration mapping (in ms)
 const PLAN_DURATIONS: Record<string, number> = {
   cozmic_pro_monthly: 30 * 24 * 60 * 60 * 1000,
   cozmic_pro_yearly: 365 * 24 * 60 * 60 * 1000,
 };
 
-// Create a DodoPayments checkout session
+const REVERSE_PRICE_MAP: Record<string, string> = {};
+for (const [planId, priceId] of Object.entries(DODO_PRICE_MAP)) {
+  if (priceId) REVERSE_PRICE_MAP[priceId] = planId;
+}
+
 router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) => {
   try {
     const { planId } = z.object({ planId: z.string().min(1) }).parse(req.body);
@@ -73,7 +75,6 @@ router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) =
   }
 });
 
-// DodoPayments webhook — processes checkout.completed events
 router.post('/v1/billing/dodo-webhook', async (req, res) => {
   try {
     const signature = req.headers['x-dodopayments-signature'] as string | undefined;
@@ -103,48 +104,213 @@ router.post('/v1/billing/dodo-webhook', async (req, res) => {
     }
 
     const event = JSON.parse(rawBody.toString('utf8'));
-    if (event.type !== 'checkout.session.completed') {
-      return res.json({ received: true });
+    const eventType: string = event.event_type || event.type || '';
+    const data = event.data || {};
+
+    switch (eventType) {
+      case 'checkout.session.completed':
+        await handleCheckoutCompleted(data);
+        break;
+      case 'subscription.active':
+      case 'subscription.renewed':
+        await handleSubscriptionActive(data);
+        break;
+      case 'subscription.cancelled':
+        await handleSubscriptionCancelled(data);
+        break;
+      case 'subscription.expired':
+        await handleSubscriptionExpired(data);
+        break;
+      case 'subscription.failed':
+        await handleSubscriptionFailed(data);
+        break;
+      case 'subscription.updated':
+        await handleSubscriptionUpdated(data);
+        break;
+      default:
+        break;
     }
-
-    const session = event.data;
-    const ownerId = session.metadata?.ownerId;
-    const planId = session.metadata?.planId;
-
-    if (!ownerId) {
-      return res.status(400).json({ error: 'Missing ownerId in session metadata' });
-    }
-
-    const duration = planId && PLAN_DURATIONS[planId] ? PLAN_DURATIONS[planId] : BILLING_MONTH_MS;
-    const now = Date.now();
-    const subscriptions = getSubscriptionsRepository();
-    const usageQuotas = getUsageQuotasRepository();
-    const billingAnchorMs = now - (now % BILLING_MONTH_MS);
-
-    const subscriptionDoc = {
-      ownerId,
-      source: 'dodopayments' as const,
-      entitlementId: env.PRO_ENTITLEMENT_ID,
-      isPro: true,
-      productId: planId || env.DODOPAYMENTS_PRICE_MONTHLY,
-      eventType: 'checkout.session.completed',
-      expiresAtMs: now + duration,
-      billingAnchorMs,
-      updatedAt: now,
-      lastEventAt: now,
-      lastEventId: session.id,
-    };
-
-    await subscriptions.upsert(subscriptionDoc);
-    const storedSubscription = await subscriptions.getByOwnerId(ownerId);
-    const hasPro = hasActiveProEntitlement(storedSubscription);
-    await usageQuotas.getQuotaStatus(ownerId, hasPro, billingAnchorMs);
 
     return res.json({ received: true });
   } catch (error) {
     return res.status(500).json({ error: 'Webhook processing failed', details: String(error) });
   }
 });
+
+async function upsertFromDodoData(data: {
+  ownerId: string;
+  planId?: string;
+  isPro: boolean;
+  expiresAtMs: number;
+  eventType: string;
+  lastEventId: string;
+  subscriptionId?: string;
+  customerId?: string;
+  priceId?: string;
+}) {
+  const now = Date.now();
+  const subscriptions = getSubscriptionsRepository();
+  const usageQuotas = getUsageQuotasRepository();
+  const billingAnchorMs = now - (now % BILLING_MONTH_MS);
+
+  const subscriptionDoc = {
+    ownerId: data.ownerId,
+    source: 'dodopayments' as const,
+    entitlementId: env.PRO_ENTITLEMENT_ID,
+    isPro: data.isPro,
+    store: 'dodopayments',
+    productId: data.priceId || data.planId || env.DODOPAYMENTS_PRICE_MONTHLY,
+    eventType: data.eventType,
+    transactionId: data.subscriptionId,
+    purchaseToken: data.customerId,
+    expiresAtMs: data.expiresAtMs,
+    billingAnchorMs,
+    updatedAt: now,
+    lastEventAt: now,
+    lastEventId: data.lastEventId,
+  };
+
+  await subscriptions.upsert(subscriptionDoc);
+  const storedSubscription = await subscriptions.getByOwnerId(data.ownerId);
+  const hasPro = hasActiveProEntitlement(storedSubscription);
+  await usageQuotas.getQuotaStatus(data.ownerId, hasPro, billingAnchorMs);
+}
+
+async function handleCheckoutCompleted(data: any) {
+  const ownerId = data.metadata?.ownerId;
+  const planId = data.metadata?.planId;
+
+  if (!ownerId) {
+    return;
+  }
+
+  const duration = planId && PLAN_DURATIONS[planId] ? PLAN_DURATIONS[planId] : BILLING_MONTH_MS;
+  const now = Date.now();
+
+  await upsertFromDodoData({
+    ownerId,
+    planId,
+    isPro: true,
+    expiresAtMs: now + duration,
+    eventType: 'checkout.session.completed',
+    lastEventId: data.id || data.subscription_id || '',
+    subscriptionId: data.subscription_id,
+    customerId: data.customer_id,
+    priceId: data.price_id,
+  });
+}
+
+async function handleSubscriptionActive(data: any) {
+  const ownerId = data.metadata?.ownerId;
+  if (!ownerId) {
+    return;
+  }
+
+  const periodEndMs = data.current_period_end
+    ? typeof data.current_period_end === 'number'
+      ? data.current_period_end * 1000
+      : new Date(data.current_period_end).getTime()
+    : Date.now() + BILLING_MONTH_MS;
+
+  await upsertFromDodoData({
+    ownerId,
+    isPro: true,
+    expiresAtMs: periodEndMs,
+    eventType: 'subscription.active',
+    lastEventId: data.id || '',
+    subscriptionId: data.id,
+    customerId: data.customer_id,
+    priceId: data.price_id,
+  });
+}
+
+async function handleSubscriptionCancelled(data: any) {
+  const ownerId = data.metadata?.ownerId;
+  if (!ownerId) {
+    return;
+  }
+
+  const periodEndMs = data.current_period_end
+    ? typeof data.current_period_end === 'number'
+      ? data.current_period_end * 1000
+      : new Date(data.current_period_end).getTime()
+    : Date.now();
+
+  await upsertFromDodoData({
+    ownerId,
+    isPro: true,
+    expiresAtMs: periodEndMs,
+    eventType: 'subscription.cancelled',
+    lastEventId: data.id || '',
+    subscriptionId: data.id,
+    customerId: data.customer_id,
+    priceId: data.price_id,
+  });
+}
+
+async function handleSubscriptionExpired(data: any) {
+  const ownerId = data.metadata?.ownerId;
+  if (!ownerId) {
+    return;
+  }
+
+  const now = Date.now();
+
+  await upsertFromDodoData({
+    ownerId,
+    isPro: false,
+    expiresAtMs: now,
+    eventType: 'subscription.expired',
+    lastEventId: data.id || '',
+    subscriptionId: data.id,
+    customerId: data.customer_id,
+    priceId: data.price_id,
+  });
+}
+
+async function handleSubscriptionFailed(data: any) {
+  const ownerId = data.metadata?.ownerId;
+  if (!ownerId) {
+    return;
+  }
+
+  await upsertFromDodoData({
+    ownerId,
+    isPro: false,
+    expiresAtMs: Date.now(),
+    eventType: 'subscription.failed',
+    lastEventId: data.id || '',
+    subscriptionId: data.id,
+    customerId: data.customer_id,
+    priceId: data.price_id,
+  });
+}
+
+async function handleSubscriptionUpdated(data: any) {
+  const ownerId = data.metadata?.ownerId;
+  if (!ownerId) {
+    return;
+  }
+
+  const periodEndMs = data.current_period_end
+    ? typeof data.current_period_end === 'number'
+      ? data.current_period_end * 1000
+      : new Date(data.current_period_end).getTime()
+    : undefined;
+
+  const isActive = data.status === 'active' || data.status === 'trialing';
+
+  await upsertFromDodoData({
+    ownerId,
+    isPro: isActive,
+    expiresAtMs: periodEndMs || Date.now() + BILLING_MONTH_MS,
+    eventType: 'subscription.updated',
+    lastEventId: data.id || '',
+    subscriptionId: data.id,
+    customerId: data.customer_id,
+    priceId: data.price_id,
+  });
+}
 
 function hexToBytes(hex: string): Buffer {
   const bytes = Buffer.alloc(hex.length / 2);
