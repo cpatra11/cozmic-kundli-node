@@ -10,6 +10,12 @@ const router = Router();
 
 const BILLING_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
+// Plan ID → DodoPayments price ID mapping
+const DODO_PRICE_MAP: Record<string, string | undefined> = {
+  cozmic_pro_monthly: env.DODOPAYMENTS_PRICE_MONTHLY,
+  cozmic_pro_yearly: env.DODOPAYMENTS_PRICE_YEARLY,
+};
+
 // Plan duration mapping (in ms)
 const PLAN_DURATIONS: Record<string, number> = {
   cozmic_pro_monthly: 30 * 24 * 60 * 60 * 1000,
@@ -26,7 +32,8 @@ router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) =
       return res.status(500).json({ error: 'DodoPayments API key not configured' });
     }
 
-    if (!PLAN_DURATIONS[planId]) {
+    const dodoPriceId = DODO_PRICE_MAP[planId];
+    if (!dodoPriceId) {
       return res.status(400).json({ error: 'Invalid plan ID' });
     }
 
@@ -41,7 +48,7 @@ router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) =
         Authorization: `Bearer ${env.DODOPAYMENTS_API_KEY}`,
       },
       body: JSON.stringify({
-        price_id: planId,
+        price_id: dodoPriceId,
         success_url: `${baseUrl}/pro-success`,
         cancel_url: `${baseUrl}/post-kundli-paywall`,
         metadata: {
@@ -119,7 +126,7 @@ router.post('/v1/billing/dodo-webhook', async (req, res) => {
       source: 'dodopayments' as const,
       entitlementId: env.PRO_ENTITLEMENT_ID,
       isPro: true,
-      productId: planId || env.DODOPAYMENTS_PRICE_ID,
+      productId: planId || env.DODOPAYMENTS_PRICE_MONTHLY,
       eventType: 'checkout.session.completed',
       expiresAtMs: now + duration,
       billingAnchorMs,
