@@ -69,6 +69,7 @@ app.use(healthRoutes);
 app.use(chatRoutes);
 app.use(meRoutes);
 app.use(billingRoutes);
+app.use(dodoWebhookRoutes);
 app.use(kundaliRoutes);
 app.use(voiceRoutes);
 app.use(ragRoutes);
