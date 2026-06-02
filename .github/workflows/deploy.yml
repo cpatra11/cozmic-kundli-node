@@ -2,7 +2,7 @@ name: Deploy to EC2
 
 on:
   push:
-    branches: [feat/contact-form-migration-fix]
+    branches: [feat/contact-form-migration-fix, feat/web-app-pivot]
   workflow_dispatch:
 
 jobs:
