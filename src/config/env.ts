@@ -143,7 +143,8 @@ const EnvSchema = z.object({
 
   DODOPAYMENTS_API_KEY: z.string().optional(),
   DODOPAYMENTS_WEBHOOK_SECRET: z.string().optional(),
-  DODOPAYMENTS_PRICE_ID: z.string().default('price_pro_monthly'),
+  DODOPAYMENTS_PRICE_MONTHLY: z.string().default('cozmic_pro_monthly'),
+  DODOPAYMENTS_PRICE_YEARLY: z.string().default('cozmic_pro_yearly'),
 });
 
 export const env = EnvSchema.parse(process.env);
