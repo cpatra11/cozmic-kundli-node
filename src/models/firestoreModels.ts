@@ -21,7 +21,7 @@ export interface AuthUserDocument {
 
 export interface UserSubscriptionDocument {
   ownerId: string;
-  source: 'iapkit' | 'app_store' | 'play_store';
+  source: 'iapkit' | 'app_store' | 'play_store' | 'dodopayments';
   entitlementId: string;
   isPro: boolean;
   store?: string;

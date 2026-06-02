@@ -11,7 +11,7 @@ const BILLING_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
 const router = Router();
 
-const BillingSourceSchema = z.enum(['iapkit', 'app_store', 'play_store']);
+const BillingSourceSchema = z.enum(['iapkit', 'app_store', 'play_store', 'dodopayments']);
 
 const BillingSyncSchema = z.object({
   source: BillingSourceSchema.default('iapkit'),

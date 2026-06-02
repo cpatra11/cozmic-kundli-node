@@ -140,6 +140,10 @@ const EnvSchema = z.object({
   CONTACT_SMTP_USER: z.string().optional(),
   CONTACT_SMTP_PASS: z.string().optional(),
   CONTACT_EMAIL_TO: z.string().optional(),
+
+  DODOPAYMENTS_API_KEY: z.string().optional(),
+  DODOPAYMENTS_WEBHOOK_SECRET: z.string().optional(),
+  DODOPAYMENTS_PRICE_ID: z.string().default('price_pro_monthly'),
 });
 
 export const env = EnvSchema.parse(process.env);

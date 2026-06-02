@@ -9,6 +9,7 @@ import voiceRoutes from './routes/voice.js';
 import ragRoutes from './routes/rag.js';
 import billingRoutes from './routes/billing.js';
 import contactRoutes from './routes/contact.js';
+import dodoWebhookRoutes from './routes/dodoWebhook.js';
 import { expensiveEndpointRateLimit } from './middleware/rateLimit.js';
 // Catch background Postgres connection timeouts during long LLM calls
 // These are idle connections timing out — not application errors
@@ -43,6 +44,9 @@ app.use(
     },
   })
 );
+
+// DodoPayments webhook needs raw body for signature verification
+app.use('/v1/billing/dodo-webhook', express.raw({ type: 'application/json' }));
 
 app.use(express.json({ limit: '8mb' }));
 
