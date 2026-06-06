@@ -292,6 +292,7 @@ router.delete('/v1/kundalis/:kundaliId', requireFirebaseAuth, async (req, res) =
 
     return res.status(204).send();
   } catch (error) {
+    console.error('[DeleteKundali] Error:', error);
     return res.status(500).json({ error: 'Failed to delete kundali', details: String(error) });
   }
 });
