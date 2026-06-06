@@ -42,10 +42,12 @@ router.get('/v1/billing/prices', async (_req, res) => {
         if (!response.ok) return null;
 
         const product = await response.json();
-        const priceCents = product.price_detail?.price ?? product.price;
-        const currency = product.price_detail?.currency ?? product.currency ?? 'USD';
-        const frequency = product.price_detail?.payment_frequency_interval?.toLowerCase() ?? 'month';
-        const discount = product.price_detail?.discount ?? 0;
+        const priceObj = product.price_detail ?? product.price;
+        const priceCents = typeof priceObj === 'object' ? priceObj.price : priceObj;
+        const currency = typeof priceObj === 'object' ? priceObj.currency : (product.currency ?? 'USD');
+        const frequencyRaw = typeof priceObj === 'object' ? (priceObj.payment_frequency_interval ?? '') : '';
+        const frequency = frequencyRaw.toLowerCase() || 'month';
+        const discount = typeof priceObj === 'object' ? (priceObj.discount ?? 0) : 0;
 
         return {
           identifier: plan.identifier,
