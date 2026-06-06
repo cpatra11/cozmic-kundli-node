@@ -159,7 +159,8 @@ export class SubscriptionsRepository {
     const existingEventType = existingResponse.rows[0]?.event_type ?? null;
     const isTrustedEvent =
       subscription.eventType === 'iapkit_verified' ||
-      subscription.eventType?.startsWith('webhook_');
+      subscription.eventType?.startsWith('webhook_') ||
+      subscription.source === 'dodopayments';
     const shouldSkipUpdate = existingEventType === 'admin_revoke' &&
       subscription.eventType !== 'admin_revoke' &&
       !isTrustedEvent;
