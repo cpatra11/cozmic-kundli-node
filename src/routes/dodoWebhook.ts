@@ -132,6 +132,8 @@ router.post('/v1/billing/dodo-webhook', async (req, res) => {
     const eventType: string = event.type || event.event_type || '';
     const data = event.data || {};
 
+    console.log('[dodo-webhook] event_type=%s ownerId=%s topKeys=%j', eventType, data.metadata?.ownerId, Object.keys(event).slice(0, 10));
+
     switch (eventType) {
       case 'payment.succeeded':
         await handleCheckoutCompleted(data);
@@ -195,9 +197,11 @@ async function upsertFromDodoData(data: {
     lastEventId: data.lastEventId,
   };
 
+  console.log('[dodo-webhook] upsert: ownerId=%s isPro=%s expiresAtMs=%s', data.ownerId, data.isPro, data.expiresAtMs);
   await subscriptions.upsert(subscriptionDoc);
   const storedSubscription = await subscriptions.getByOwnerId(data.ownerId);
   const hasPro = hasActiveProEntitlement(storedSubscription);
+  console.log('[dodo-webhook] upsert done: ownerId=%s hasPro=%s', data.ownerId, hasPro);
   await usageQuotas.getQuotaStatus(data.ownerId, hasPro, billingAnchorMs);
 }
 
@@ -206,12 +210,14 @@ async function handleCheckoutCompleted(data: any) {
   const planId = data.metadata?.planId;
 
   if (!ownerId) {
+    console.log('[dodo-webhook] handleCheckoutCompleted: no ownerId in metadata, dataKeys=%j', Object.keys(data));
     return;
   }
 
   const duration = planId && PLAN_DURATIONS[planId] ? PLAN_DURATIONS[planId] : BILLING_MONTH_MS;
   const now = Date.now();
 
+  console.log('[dodo-webhook] handleCheckoutCompleted: ownerId=%s planId=%s', ownerId, planId);
   await upsertFromDodoData({
     ownerId,
     planId,
