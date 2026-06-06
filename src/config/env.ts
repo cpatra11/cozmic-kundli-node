@@ -6,7 +6,7 @@ dotenv.config();
 const EnvSchema = z.object({
   PORT: z.coerce.number().default(8787),
   NODE_ENV: z.string().default('development'),
-  ALLOWED_ORIGINS: z.string().default('http://localhost:8081,http://localhost:19006'),
+  ALLOWED_ORIGINS: z.string().default('http://localhost:8081,http://localhost:19006,https://cozmicastro.one'),
   DATABASE_URL: z.string().optional(),
   DATABASE_SSL_CA_PATH: z.string().optional(),
   DATABASE_SSL_REJECT_UNAUTHORIZED: z.string().optional(),
@@ -141,6 +141,7 @@ const EnvSchema = z.object({
   CONTACT_SMTP_PASS: z.string().optional(),
   CONTACT_EMAIL_TO: z.string().optional(),
 
+  GOOGLE_API_KEY: z.string().optional(),
   DODOPAYMENTS_API_KEY: z.string().optional(),
   DODOPAYMENTS_WEBHOOK_SECRET: z.string().optional(),
   DODOPAYMENTS_PRICE_MONTHLY: z.string().default('cozmic_pro_monthly'),
