@@ -130,9 +130,14 @@ router.post('/v1/billing/dodo-webhook', async (req, res) => {
 
     const event = JSON.parse(rawBody.toString('utf8'));
     const eventType: string = event.type || event.event_type || '';
-    const data = event.data || {};
 
-    console.log('[dodo-webhook] event_type=%s ownerId=%s topKeys=%j', eventType, data.metadata?.ownerId, Object.keys(event).slice(0, 10));
+    // Dodo sends data at top level (flat), not wrapped in { type, data }
+    // If event.data exists and has keys, use it; otherwise treat event itself as data
+    const data = event.data && typeof event.data === 'object' && Object.keys(event.data).length > 0
+      ? event.data
+      : event;
+
+    console.log('[dodo-webhook] event_type=%s ownerId=%s dataKeys=%j topKeys=%j', eventType, data.metadata?.ownerId, Object.keys(data).slice(0, 10), Object.keys(event).slice(0, 10));
 
     switch (eventType) {
       case 'payment.succeeded':
