@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { env, dodoApiBaseUrl } from '../config/env.js';
+import { createHmac, timingSafeEqual } from 'crypto';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
@@ -82,9 +83,18 @@ router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) =
 
 router.post('/v1/billing/dodo-webhook', async (req, res) => {
   try {
-    const signature = req.headers['x-dodopayments-signature'] as string | undefined;
-    if (!signature) {
-      return res.status(401).json({ error: 'Missing webhook signature' });
+    const webhookId = req.headers['webhook-id'] as string | undefined;
+    const webhookTimestamp = req.headers['webhook-timestamp'] as string | undefined;
+    const webhookSignature = req.headers['webhook-signature'] as string | undefined;
+
+    if (!webhookId || !webhookTimestamp || !webhookSignature) {
+      return res.status(401).json({ error: 'Missing webhook headers' });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const ts = parseInt(webhookTimestamp, 10);
+    if (isNaN(ts) || Math.abs(now - ts) > 300) {
+      return res.status(401).json({ error: 'Webhook timestamp out of range' });
     }
 
     const secret = env.DODOPAYMENTS_WEBHOOK_SECRET;
@@ -93,27 +103,37 @@ router.post('/v1/billing/dodo-webhook', async (req, res) => {
     }
 
     const rawBody = req.body instanceof Buffer ? req.body : Buffer.from(JSON.stringify(req.body));
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['verify']
-    );
-    const sigBytes = hexToBytes(signature) as unknown as BufferSource;
-    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, rawBody as unknown as BufferSource);
+    const signedContent = `${webhookId}.${webhookTimestamp}.${rawBody.toString('utf8')}`;
+
+    const rawSecret = secret.startsWith('whsec_') ? secret.slice(6) : secret;
+    const keyBytes = Buffer.from(rawSecret, 'base64');
+
+    const signatures = webhookSignature.split(' ').map(s => {
+      const sep = s.indexOf(',');
+      if (sep === -1) return null;
+      return { version: s.slice(0, sep), value: s.slice(sep + 1) };
+    }).filter(Boolean) as { version: string; value: string }[];
+
+    let valid = false;
+    for (const sig of signatures) {
+      if (sig.version !== 'v1') continue;
+      const expected = createHmac('sha256', keyBytes).update(signedContent).digest('base64');
+      if (constantTimeEqual(expected, sig.value)) {
+        valid = true;
+        break;
+      }
+    }
 
     if (!valid) {
       return res.status(401).json({ error: 'Invalid webhook signature' });
     }
 
     const event = JSON.parse(rawBody.toString('utf8'));
-    const eventType: string = event.event_type || event.type || '';
+    const eventType: string = event.type || event.event_type || '';
     const data = event.data || {};
 
     switch (eventType) {
-      case 'checkout.session.completed':
+      case 'payment.succeeded':
         await handleCheckoutCompleted(data);
         break;
       case 'subscription.active':
@@ -197,7 +217,7 @@ async function handleCheckoutCompleted(data: any) {
     planId,
     isPro: true,
     expiresAtMs: now + duration,
-    eventType: 'checkout.session.completed',
+    eventType: 'payment.succeeded',
     lastEventId: data.id || data.subscription_id || '',
     subscriptionId: data.subscription_id,
     customerId: data.customer_id,
@@ -317,12 +337,14 @@ async function handleSubscriptionUpdated(data: any) {
   });
 }
 
-function hexToBytes(hex: string): Buffer {
-  const bytes = Buffer.alloc(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+function constantTimeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    timingSafeEqual(bufA, bufA);
+    return false;
   }
-  return bytes;
+  return timingSafeEqual(bufA, bufB);
 }
 
 export default router;
