@@ -11,6 +11,7 @@ import billingRoutes from './routes/billing.js';
 import contactRoutes from './routes/contact.js';
 import dodoWebhookRoutes from './routes/dodoWebhook.js';
 import dodoPortalRoutes from './routes/dodoPortal.js';
+import dodoPricesRoutes from './routes/dodoPrices.js';
 import { expensiveEndpointRateLimit } from './middleware/rateLimit.js';
 // Catch background Postgres connection timeouts during long LLM calls
 // These are idle connections timing out — not application errors
@@ -72,6 +73,7 @@ app.use(meRoutes);
 app.use(billingRoutes);
 app.use(dodoWebhookRoutes);
 app.use(dodoPortalRoutes);
+app.use(dodoPricesRoutes);
 app.use(kundaliRoutes);
 app.use(voiceRoutes);
 app.use(ragRoutes);
