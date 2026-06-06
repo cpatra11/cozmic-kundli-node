@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { env } from '../config/env.js';
+import { env, dodoApiBaseUrl } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 
@@ -26,16 +26,13 @@ router.post('/v1/billing/dodo-portal', requireFirebaseAuth, async (req, res) => 
       ? 'https://cozmicastro.one'
       : 'http://localhost:8081';
 
-    const response = await fetch('https://api.dodopayments.com/v1/customer_portal', {
+    const params = new URLSearchParams({ return_url: `${baseUrl}/(tabs)/profile` });
+    const response = await fetch(`${dodoApiBaseUrl()}/customers/${encodeURIComponent(customerId)}/customer-portal/session?${params}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${env.DODOPAYMENTS_API_KEY}`,
       },
-      body: JSON.stringify({
-        customer_id: customerId,
-        return_url: `${baseUrl}/(tabs)/profile`,
-      }),
     });
 
     if (!response.ok) {
@@ -44,7 +41,7 @@ router.post('/v1/billing/dodo-portal', requireFirebaseAuth, async (req, res) => 
     }
 
     const portal = await response.json();
-    return res.json({ url: portal.url });
+    return res.json({ url: portal.link });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to create customer portal', details: String(error) });
   }

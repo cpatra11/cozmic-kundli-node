@@ -112,7 +112,7 @@ router.get('/v1/billing/subscription', requireFirebaseAuth, async (req, res) => 
         subscription: {
           isPro: false,
           entitlementId: getDefaultProEntitlementId(),
-          source: 'iapkit' as const,
+          source: 'dodopayments' as const,
         },
         quotaStatus,
       });

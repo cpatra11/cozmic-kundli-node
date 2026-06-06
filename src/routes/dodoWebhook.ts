@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { env } from '../config/env.js';
+import { env, dodoApiBaseUrl } from '../config/env.js';
 import { requireFirebaseAuth } from '../middleware/auth.js';
 import { getSubscriptionsRepository } from '../repositories/subscriptionsRepository.js';
 import { hasActiveProEntitlement } from '../services/subscriptionAccess.js';
@@ -10,7 +10,7 @@ const router = Router();
 
 const BILLING_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
 
-const DODO_PRICE_MAP: Record<string, string | undefined> = {
+const DODO_PRODUCT_MAP: Record<string, string | undefined> = {
   cozmic_pro_monthly: env.DODOPAYMENTS_PRICE_MONTHLY,
   cozmic_pro_yearly: env.DODOPAYMENTS_PRICE_YEARLY,
 };
@@ -21,7 +21,7 @@ const PLAN_DURATIONS: Record<string, number> = {
 };
 
 const REVERSE_PRICE_MAP: Record<string, string> = {};
-for (const [planId, priceId] of Object.entries(DODO_PRICE_MAP)) {
+for (const [planId, priceId] of Object.entries(DODO_PRODUCT_MAP)) {
   if (priceId) REVERSE_PRICE_MAP[priceId] = planId;
 }
 
@@ -34,8 +34,8 @@ router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) =
       return res.status(500).json({ error: 'DodoPayments API key not configured' });
     }
 
-    const dodoPriceId = DODO_PRICE_MAP[planId];
-    if (!dodoPriceId) {
+    const dodoProductId = DODO_PRODUCT_MAP[planId];
+    if (!dodoProductId) {
       return res.status(400).json({ error: 'Invalid plan ID' });
     }
 
@@ -43,15 +43,20 @@ router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) =
       ? 'https://cozmicastro.one'
       : 'http://localhost:8081';
 
-    const response = await fetch('https://api.dodopayments.com/v1/checkout_sessions', {
+    const response = await fetch(`${dodoApiBaseUrl()}/checkouts`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${env.DODOPAYMENTS_API_KEY}`,
       },
       body: JSON.stringify({
-        price_id: dodoPriceId,
-        success_url: `${baseUrl}/pro-success`,
+        product_cart: [
+          {
+            product_id: dodoProductId,
+            quantity: 1,
+          },
+        ],
+        return_url: `${baseUrl}/pro-success`,
         cancel_url: `${baseUrl}/post-kundli-paywall`,
         metadata: {
           ownerId,
@@ -66,7 +71,7 @@ router.post('/v1/billing/dodo-checkout', requireFirebaseAuth, async (req, res) =
     }
 
     const session = await response.json();
-    return res.json({ url: session.url });
+    return res.json({ url: session.checkout_url });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: 'Invalid request', details: error.flatten() });

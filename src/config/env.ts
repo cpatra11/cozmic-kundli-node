@@ -145,9 +145,19 @@ const EnvSchema = z.object({
   DODOPAYMENTS_WEBHOOK_SECRET: z.string().optional(),
   DODOPAYMENTS_PRICE_MONTHLY: z.string().default('cozmic_pro_monthly'),
   DODOPAYMENTS_PRICE_YEARLY: z.string().default('cozmic_pro_yearly'),
+  DODOPAYMENTS_LIVE_MODE: z
+    .string()
+    .transform((v) => v === 'true')
+    .default('false'),
 });
 
 export const env = EnvSchema.parse(process.env);
+
+export function dodoApiBaseUrl(): string {
+  return env.DODOPAYMENTS_LIVE_MODE
+    ? 'https://live.dodopayments.com'
+    : 'https://test.dodopayments.com';
+}
 
 export const allowedOrigins = env.ALLOWED_ORIGINS.split(',')
   .map((item) => item.trim())
